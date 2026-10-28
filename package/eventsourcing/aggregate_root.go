@@ -8,10 +8,13 @@ import (
 )
 
 var (
-	ErrAggExisted = errors.New("can't not set ID to aggregate already got an ID")
-	ErrIDEmpty    = errors.New("aggregate id cant be empty")
+	ErrAggExisted = errors.New("aggregate already has an ID")
+	ErrIDEmpty    = errors.New("aggregate id is empty")
 )
 
+// AggregateRoot tracks persisted version and events waiting to be saved.
+// version and baseVersion are the last version committed to the store.
+// Update clears pending events after that commit succeeds.
 type AggregateRoot struct {
 	aggregateID   string
 	aggregateType string
@@ -24,13 +27,13 @@ func (ar *AggregateRoot) SetID(id string) error {
 	if id == "" {
 		return ErrIDEmpty
 	}
-
-	if id == ar.aggregateID {
+	if ar.aggregateID == id {
+		return nil
+	}
+	if ar.aggregateID != "" {
 		return ErrAggExisted
 	}
-
 	ar.aggregateID = id
-
 	return nil
 }
 
@@ -50,16 +53,14 @@ func (ar *AggregateRoot) Root() *AggregateRoot {
 	return ar
 }
 
-// Version is the version of aggregate not stored
+// Version includes pending events. BaseVersion is the last persisted version.
 func (ar *AggregateRoot) Version() int {
 	if len(ar.events) > 0 {
 		return ar.events[len(ar.events)-1].Version
 	}
-
 	return ar.version
 }
 
-// BaseVersion is the version of current aggregate in database
 func (ar *AggregateRoot) BaseVersion() int {
 	return ar.baseVersion
 }
@@ -68,11 +69,9 @@ func (ar *AggregateRoot) Events() []Event {
 	return ar.events
 }
 
-// CloneEvents return new slice of events
 func (ar *AggregateRoot) CloneEvents() []Event {
 	evs := make([]Event, len(ar.events))
 	copy(evs, ar.events)
-
 	return evs
 }
 
@@ -80,17 +79,18 @@ func (ar *AggregateRoot) IsUnsaved() bool {
 	return len(ar.events) > 0
 }
 
-// ApplyChange apply data change on aggregate
 func (ar *AggregateRoot) ApplyChange(agg Aggregate, data interface{}) error {
 	return ar.ApplyChangeWithMetadata(agg, data, nil)
 }
 
 func (ar *AggregateRoot) ApplyChangeWithMetadata(agg Aggregate, data interface{}, metadata map[string]interface{}) error {
 	if ar.aggregateID == "" {
-		return fmt.Errorf("missing aggregate_id, aggregate_type=%s", ar.aggregateType)
+		return fmt.Errorf("missing aggregate id, aggregate_type=%s", ar.aggregateType)
 	}
-
-	eventType := reflect.TypeOf(data).Elem().Name()
+	eventType, err := eventTypeName(data)
+	if err != nil {
+		return err
+	}
 	event := Event{
 		AggregateID: ar.aggregateID,
 		Version:     ar.nextVersion(),
@@ -99,39 +99,62 @@ func (ar *AggregateRoot) ApplyChangeWithMetadata(agg Aggregate, data interface{}
 		Data:        data,
 		Metadata:    metadata,
 	}
-
+	if err := agg.Transition(event); err != nil {
+		return err
+	}
 	ar.events = append(ar.events, event)
-
-	return agg.Transition(event)
+	return nil
 }
 
-// LoadFromHistory build aggregate from list event
-func (ar *AggregateRoot) LoadFromHistory(agg Aggregate, events []Event) {
+// LoadFromHistory replays committed events. baseVersion is the version already applied,
+// including a restored snapshot, so the next event must be baseVersion+1.
+func (ar *AggregateRoot) LoadFromHistory(agg Aggregate, events []Event) error {
 	for _, e := range events {
-		_ = agg.Transition(e)
-		ar.aggregateID = e.AggregateID
+		if ar.aggregateID == "" {
+			ar.aggregateID = e.AggregateID
+		} else if e.AggregateID != ar.aggregateID {
+			return fmt.Errorf("event aggregate id %s, expected %s", e.AggregateID, ar.aggregateID)
+		}
+		if e.Version != ar.baseVersion+1 {
+			return fmt.Errorf("event version %d, expected %d", e.Version, ar.baseVersion+1)
+		}
+		if err := agg.Transition(e); err != nil {
+			return err
+		}
 		ar.version = e.Version
 		ar.baseVersion = e.Version
 	}
+	return nil
 }
 
-// update update version
 func (ar *AggregateRoot) Update() {
-	if len(ar.events) > 0 {
-		lastEvent := ar.events[len(ar.events)-1]
-		ar.version = lastEvent.Version
-		ar.baseVersion = lastEvent.Version
+	if len(ar.events) == 0 {
+		return
 	}
+	last := ar.events[len(ar.events)-1]
+	ar.version = last.Version
+	ar.baseVersion = last.Version
+	ar.events = nil
 }
 
-// setInternal set common data to AggregateRoot
 func (ar *AggregateRoot) SetInternal(id string, baseVersion, version int) {
 	ar.aggregateID = id
 	ar.baseVersion = baseVersion
 	ar.version = version
-	ar.events = []Event{}
+	ar.events = nil
 }
 
 func (ar *AggregateRoot) nextVersion() int {
+	if n := len(ar.events); n > 0 {
+		return ar.events[n-1].Version + 1
+	}
 	return ar.version + 1
+}
+
+func eventTypeName(data interface{}) (string, error) {
+	typ := reflect.TypeOf(data)
+	if typ == nil || typ.Kind() != reflect.Ptr || typ.Elem().Name() == "" || reflect.ValueOf(data).IsNil() {
+		return "", errors.New("event data must be a non-nil pointer to a named type")
+	}
+	return typ.Elem().Name(), nil
 }

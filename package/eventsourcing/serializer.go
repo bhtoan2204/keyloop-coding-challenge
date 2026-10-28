@@ -8,15 +8,13 @@ import (
 )
 
 type eventFunc = func() interface{}
+
 type RegisterEventsFunc = func(events ...interface{}) error
 
 var _ Serializer = (*serializer)(nil)
 
 type Serializer interface {
-	ToEventsFunc(events ...interface{}) []eventFunc
 	RegisterAggregate(agg BaseAggregate) error
-	Register(agg Aggregate, eventsFunc []eventFunc) error
-	RegisterTypes(agg Aggregate, eventsFunc ...eventFunc) error
 	Type(typ, name string) (eventFunc, bool)
 	Marshal(v interface{}) ([]byte, error)
 	Unmarshal(data []byte, v interface{}) error
@@ -27,67 +25,29 @@ type serializer struct {
 }
 
 func NewSerializer() Serializer {
-	return &serializer{
-		eventRegister: make(map[string]func() interface{}),
-	}
-}
-
-func (s *serializer) ToEventsFunc(events ...interface{}) []eventFunc {
-	res := make([]eventFunc, 0, len(events))
-	for _, item := range events {
-		res = append(res, eventToFunc(item))
-	}
-
-	return res
+	return &serializer{eventRegister: make(map[string]eventFunc)}
 }
 
 func (s *serializer) RegisterAggregate(agg BaseAggregate) error {
-	typ := reflect.TypeOf(agg).Elem().Name()
-	if typ == "" {
-		return fmt.Errorf("not found aggregate")
+	name, err := aggregateName(agg)
+	if err != nil {
+		return err
 	}
-
-	fu := func(events ...interface{}) error {
-		listF := s.ToEventsFunc(events...)
-		for _, f := range listF {
-			event := f()
-
-			eName := reflect.TypeOf(event).Elem().Name()
-			if eName == "" {
-				return errors.New("name of event is missing")
+	return agg.RegisterEvents(func(events ...interface{}) error {
+		for _, item := range events {
+			factory, err := newEventFunc(item)
+			if err != nil {
+				return err
 			}
-
-			s.eventRegister[typ+"_"+eName] = f
+			eventName := reflect.TypeOf(factory()).Elem().Name()
+			key := name + "_" + eventName
+			if _, ok := s.eventRegister[key]; ok {
+				return fmt.Errorf("event %s is already registered", key)
+			}
+			s.eventRegister[key] = factory
 		}
-
 		return nil
-	}
-
-	return agg.RegisterEvents(fu)
-}
-
-func (s *serializer) Register(agg Aggregate, eventsFunc []eventFunc) error {
-	typ := reflect.TypeOf(agg).Elem().Name()
-	if typ == "" {
-		return errors.New("not found aggregate")
-	}
-
-	for _, f := range eventsFunc {
-		event := f()
-
-		eName := reflect.TypeOf(event).Elem().Name()
-		if eName == "" {
-			return errors.New("event name is missing")
-		}
-
-		s.eventRegister[typ+"_"+eName] = f
-	}
-
-	return nil
-}
-
-func (s *serializer) RegisterTypes(agg Aggregate, eventsFunc ...eventFunc) error {
-	return s.Register(agg, eventsFunc)
+	})
 }
 
 func (s *serializer) Type(typ, name string) (eventFunc, bool) {
@@ -103,10 +63,25 @@ func (s *serializer) Unmarshal(data []byte, v interface{}) error {
 	return json.Unmarshal(data, v)
 }
 
-func eventToFunc(e interface{}) eventFunc {
-	typ := reflect.TypeOf(e).Elem()
-
-	return func() interface{} {
-		return reflect.New(typ).Interface()
+func aggregateName(agg BaseAggregate) (string, error) {
+	if agg == nil {
+		return "", errors.New("aggregate is nil")
 	}
+	value := reflect.ValueOf(agg)
+	typ := value.Type()
+	if typ.Kind() != reflect.Ptr || value.IsNil() || typ.Elem().Kind() != reflect.Struct || typ.Elem().Name() == "" {
+		return "", errors.New("aggregate must be a non-nil pointer to a named struct")
+	}
+	return typ.Elem().Name(), nil
+}
+
+func newEventFunc(event interface{}) (eventFunc, error) {
+	typ := reflect.TypeOf(event)
+	if typ == nil || typ.Kind() != reflect.Ptr || reflect.ValueOf(event).IsNil() || typ.Elem().Name() == "" {
+		return nil, errors.New("event must be a non-nil pointer to a named type")
+	}
+	elem := typ.Elem()
+	return func() interface{} {
+		return reflect.New(elem).Interface()
+	}, nil
 }

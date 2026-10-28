@@ -8,19 +8,17 @@ import (
 	"gorm.io/gorm"
 )
 
-var (
-	_ EventStore = (*eventStore)(nil)
-)
+var _ EventStore = (*eventStore)(nil)
 
 type EventStore interface {
 	Get(ctx context.Context, aggregateID string, fromVersion, toVersion int, agg eventsourcing.Aggregate) error
 	Append(context.Context, eventsourcing.Event) error
-
 	CreateIfNotExist(ctx context.Context, id, typ string) error
-	CheckAndUpdateVersion(ctx context.Context, agg eventsourcing.Aggregate) bool
+	CheckAndUpdateVersion(ctx context.Context, agg eventsourcing.Aggregate) error
 	CreateSnapshot(ctx context.Context, agg eventsourcing.Aggregate) error
-	ReadSnapshot(ctx context.Context, aggregateID string, version int, agg eventsourcing.Aggregate) bool
-	WithTransaction(ctx context.Context, fn func(EventStore) error) (err error)
+	ReadSnapshot(ctx context.Context, aggregateID string, agg eventsourcing.Aggregate) (bool, error)
+	FindAggregate(ctx context.Context, id string) (version int, aggregateType string, err error)
+	WithTransaction(ctx context.Context, fn func(EventStore) error) error
 }
 
 type eventStore struct {
@@ -41,7 +39,6 @@ func NewEventStore(db *gorm.DB, s eventsourcing.Serializer) EventStore {
 
 func (r *eventStore) WithTransaction(ctx context.Context, fn func(txStore EventStore) error) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		txStore := NewEventStore(tx, r.serializer)
-		return fn(txStore)
+		return fn(NewEventStore(tx, r.serializer))
 	})
 }

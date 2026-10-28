@@ -2,6 +2,7 @@ package repos
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"keyloop-coding-challenge/package/eventsourcing"
@@ -15,22 +16,25 @@ type eventRepo struct {
 }
 
 func newEventRepo(db *gorm.DB, s eventsourcing.Serializer) *eventRepo {
-	return &eventRepo{
-		db:        db,
-		serialize: s,
-	}
+	return &eventRepo{db: db, serialize: s}
 }
 
 func (r *eventRepo) Get(ctx context.Context, aggregateID string, fromVersion, toVersion int, agg eventsourcing.Aggregate) error {
 	root := agg.Root()
+	if root.AggregateType() == "" {
+		return fmt.Errorf("aggregate type is empty")
+	}
+	if toVersion <= fromVersion {
+		return nil
+	}
 
 	rows, err := r.db.WithContext(ctx).Raw(`
-			SELECT id, aggregate_id, event_type, version, data
-			FROM es_event
-			WHERE aggregate_id = ?
-				AND (? = 0 OR version > ?)
-				AND (? = 0 OR version <= ?)
-			ORDER BY version ASC`, aggregateID, fromVersion, fromVersion, toVersion, toVersion).Rows()
+		SELECT id, aggregate_id, event_type, version, data, metadata, created_at
+		FROM es_event
+		WHERE aggregate_id = ?
+			AND version > ?
+			AND version <= ?
+		ORDER BY version ASC`, aggregateID, fromVersion, toVersion).Rows()
 	if err != nil {
 		return err
 	}
@@ -38,54 +42,57 @@ func (r *eventRepo) Get(ctx context.Context, aggregateID string, fromVersion, to
 
 	for rows.Next() {
 		var (
-			evt  eventsourcing.Event
-			data string
+			evt      eventsourcing.Event
+			data     string
+			metadata sql.NullString
 		)
-		if err := rows.Scan(&evt.ID, &evt.AggregateID, &evt.EventType, &evt.Version, &data); err != nil {
+		if err := rows.Scan(&evt.ID, &evt.AggregateID, &evt.EventType, &evt.Version, &data, &metadata, &evt.CreatedAt); err != nil {
 			return err
 		}
-
-		f, ok := r.serialize.Type(root.AggregateType(), evt.EventType)
+		factory, ok := r.serialize.Type(root.AggregateType(), evt.EventType)
 		if !ok {
-			return fmt.Errorf("cant serialize event with type: %s_%s", root.AggregateType(), evt.EventType)
+			return fmt.Errorf("unknown event type %s_%s", root.AggregateType(), evt.EventType)
 		}
-
-		eventData := f()
-
-		err := r.serialize.Unmarshal([]byte(data), &eventData)
-		if err != nil {
-			return fmt.Errorf("unmarshal event failed with err=%w", err)
+		eventData := factory()
+		if err := r.serialize.Unmarshal([]byte(data), eventData); err != nil {
+			return fmt.Errorf("unmarshal event: %w", err)
 		}
-
 		evt.Data = eventData
-		root.LoadFromHistory(agg, []eventsourcing.Event{evt})
+		if metadata.Valid && metadata.String != "" {
+			var decoded interface{}
+			if err := r.serialize.Unmarshal([]byte(metadata.String), &decoded); err != nil {
+				return fmt.Errorf("unmarshal event metadata: %w", err)
+			}
+			evt.Metadata = decoded
+		}
+		if err := root.LoadFromHistory(agg, []eventsourcing.Event{evt}); err != nil {
+			return fmt.Errorf("apply %s version %d: %w", evt.EventType, evt.Version, err)
+		}
 	}
-
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("Get event rows.err err=%w", err)
+		return fmt.Errorf("read events: %w", err)
 	}
-
 	return nil
 }
 
 func (r *eventRepo) Append(ctx context.Context, e eventsourcing.Event) error {
 	eData, err := r.serialize.Marshal(e.Data)
 	if err != nil {
-		return fmt.Errorf("serilize e.Data err=%w", err)
+		return fmt.Errorf("serialize event data: %w", err)
 	}
-
 	eMetadata, err := r.serialize.Marshal(e.Metadata)
 	if err != nil {
-		return fmt.Errorf("serilize e.Data err=%w", err)
+		return fmt.Errorf("serialize event metadata: %w", err)
 	}
-
 	err = r.db.WithContext(ctx).Exec(`
 		INSERT INTO es_event(aggregate_id, event_type, version, data, metadata, created_at)
 		VALUES(?, ?, ?, ?, ?, ?)`,
 		e.AggregateID, e.EventType, e.Version, eData, eMetadata, e.CreatedAt).Error
 	if err != nil {
-		return fmt.Errorf("append event err=%w", err)
+		if isDuplicateKey(err) {
+			return fmt.Errorf("%w: aggregate %s version %d: %w", ErrDuplicateEvent, e.AggregateID, e.Version, err)
+		}
+		return fmt.Errorf("append event: %w", err)
 	}
-
 	return nil
 }
