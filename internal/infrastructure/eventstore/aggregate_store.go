@@ -18,7 +18,18 @@ var (
 	ErrAggregateNotFound     = repos.ErrAggregateNotFound
 	ErrAggregateTypeMismatch = repos.ErrAggregateTypeMismatch
 	ErrDuplicateEvent        = repos.ErrDuplicateEvent
+	ErrRetryable             = repos.ErrRetryable
+
+	ErrUnsupportedSchemaVersion = repos.ErrUnsupportedSchemaVersion
 )
+
+// IsRetryable reports whether a failed Save may succeed if the caller reloads the
+// aggregate, re-runs the command against the fresh state and saves again. The store
+// never retries by itself: after a conflict the pending events were decided on stale
+// state and must be recomputed, not re-sent.
+func IsRetryable(err error) bool {
+	return errors.Is(err, ErrConcurrencyConflict) || errors.Is(err, ErrRetryable)
+}
 
 const defaultSnapshotInterval = 10
 
@@ -96,6 +107,9 @@ func (as *aggregateStore) Save(ctx context.Context, agg eventsourcing.Aggregate)
 		return nil
 	}
 	events := root.CloneEvents()
+	for i := range events {
+		events[i].AggregateType = root.AggregateType()
+	}
 	baseVersion := root.BaseVersion()
 	currentVersion := root.Version()
 

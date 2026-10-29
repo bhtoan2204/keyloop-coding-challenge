@@ -39,3 +39,30 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
   - `go test -count=1 ./...` and `go test -race -count=1 ./...`: all packages pass, with 38 top-level tests and 100 subtests passing (`-v` count)
   - **Mutation checks** on a scratch copy, each expected to fail: aging `>`→`>=` (TestIsAging, TestProposeAction failed); dropped sale/active-action consistency check (replay tests failed); snapshot dropping `soldOn` (TestSnapshotJSONRoundTrip failed); propose ignoring an active action (TestProposeAction, TestSnapshotThroughAggregateStore failed); stocking twice allowed (TestStock, TestCommandsAfterSale, replay tests failed)
 - **Process note:** the AI ran `git add -N` to show new files in `git diff --stat`, then undid it with `git reset -q -- internal/domain`. The index was left as found, and nothing was committed.
+
+## 2026-10-29 — Phase 2: MySQL event store (existing framework extended)
+
+- **Delegated:** MySQL 8.4 support for the existing GORM event store, versioned additive migrations, error classification, CDC-ready columns, real-MySQL integration tests, a local Compose setup, restricted grants. The developer approved the plan (Q1–Q7) before implementation.
+- **Environment:** MySQL 8.4.13 in podman-compose (`docker compose` is the podman wrapper here), bound to 127.0.0.1. The root password was random, kept in the session scratchpad and passed through the environment. No credentials were written to the repo, and the hook blocks edits to `.env`. `.env` (empty) was untracked with `git rm --cached .env` after checking it was 0 bytes; the local file remains.
+- **Baseline before changes:** the 10 existing `AggregateStore` tests were pointed at MySQL through a small test-helper change. All passed unmodified.
+- **Hypothesis H1 tested before touching code. Confirmed.** The new concurrency tests showed `Error 1213 Deadlock` (6/16 writers from the same version, 1/16 on concurrent creation). InnoDB's deadlock report showed both transactions holding S record locks on the `es_aggregate` row and waiting for X. Fix: `INSERT IGNORE` → `INSERT … ON DUPLICATE KEY UPDATE id = id`, a one-statement change. After the fix, 3 runs × 10 rounds × 16 writers gave exactly 1 winner, the rest `ErrConcurrencyConflict`, and 0 other errors.
+- **Error classification:** typed `*mysql.MySQLError` (1062 → duplicate; 1213/1205 → new `ErrRetryable`), plus `eventstore.IsRetryable`. No retry loop in the store. 1205 was verified with a real held row lock and `innodb_lock_wait_timeout=1`.
+- **Migrations:** `repos.Migrate` became a small versioned migrator. v1 is the original DDL unchanged; v2 adds `es_event.aggregate_type` (backfilled) and `schema_version`. Each step is idempotent, and concurrent callers are serialised with a MySQL `GET_LOCK`. Tests cover a fresh database, an upgrade from a frozen copy of the original schema with rows written the original way, resuming after a partial run, and 4 concurrent migrators. All run on SQLite and MySQL.
+- **Framework change (approved Q1):** `eventsourcing.Event` gained `AggregateType` and `SchemaVersion` (additive), plus `DefaultSchemaVersion`. No existing API changed.
+- **AI mistakes caught and corrected during the phase:**
+  - (1) A test file was first written referencing helpers that did not exist (`newStoreFor`, `qtyStore`, a wrong register-func type); `go vet` caught it before any run.
+  - (2) The first mutation harness compared each file with itself (`git -C <repo> diff --no-index` resolves relative paths against the repo), so it reported every mutation as "not applied". Fixed with `cmp`.
+  - (3) Two mutants were invalid: a `sed` delimiter clash, and a "missing return" build failure. They had looked like survivors because the filter only matched `--- FAIL`. They were redone as compiling mutants with build status shown, and both were then caught.
+- **Developer edit observed:** the explanatory comment the AI wrote above the new `ON DUPLICATE KEY UPDATE` statement was removed in the working tree by someone other than the AI. It was not re-added; the rationale lives in `docs/04` §5.
+- **Verified:** `make check` (gofmt, vet incl. `-tags integration`, test, race) passes. `make test-integration` passes 24 + 2 tests on MySQL 8.4.13 (28 + 2 after the review fixes below). The integration suite also passes under `-race`. Mutation checks caught all 6 valid mutants. 0 leftover test databases or users after the runs.
+- **Not verified:** `make mysql-grants` end to end (the same `grants.sql` is applied by the integration test), MySQL behaviour under real network failures, and any Debezium behaviour (not in scope).
+- **Independent review** (read-only `event-sourcing-reviewer` subagent; it could read code and run SQLite tests but not MySQL): no Critical findings.
+  - Its Major 2 ("MySQL behaviour unverified") was outdated: the MySQL suite had already been run, see above.
+  - **Accepted and fixed, each with a test that a mutation check confirmed would fail:**
+    - `schema_version` was read but never checked (Major 1) → `ErrUnsupportedSchemaVersion`;
+    - `Append` accepted an empty `aggregate_type`, and the event-level type check was untested → type now required, mismatch tested;
+    - the migration lock name could exceed 64 characters → `MD5(DATABASE())`;
+    - the migrator accepted a schema newer than the code → now fails;
+    - the `IsRetryable` comment was inconsistent → reworded.
+  - **Documented:** the new locking order, the backfill as a one-off history edit, and the missing snapshot format version.
+  - **Not changed:** the 1213 mapping, because a real 1213 was observed in this session.

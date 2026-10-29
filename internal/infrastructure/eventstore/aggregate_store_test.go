@@ -181,7 +181,7 @@ func TestDatabaseErrorIsNotConcurrencyConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = store.Save(context.Background(), agg)
-	if err == nil || errors.Is(err, eventstore.ErrConcurrencyConflict) {
+	if err == nil || errors.Is(err, eventstore.ErrConcurrencyConflict) || eventstore.IsRetryable(err) {
 		t.Fatalf("got %v", err)
 	}
 	if !agg.IsUnsaved() {
@@ -388,13 +388,13 @@ func TestDuplicateEventVersion(t *testing.T) {
 	mustSave(t, store, agg)
 
 	es := repos.New(db, serializer).EventStore()
-	duplicate := eventsourcing.Event{AggregateID: "inv", Version: 1, EventType: "qtyEvent", Data: &qtyEvent{Delta: 9}, CreatedAt: 1}
+	duplicate := eventsourcing.Event{AggregateID: "inv", AggregateType: "qtyAggregate", Version: 1, EventType: "qtyEvent", Data: &qtyEvent{Delta: 9}, CreatedAt: 1}
 	if err := es.Append(context.Background(), duplicate); !errors.Is(err, eventstore.ErrDuplicateEvent) {
 		t.Fatalf("duplicate: %v", err)
 	}
 
 	err := es.WithTransaction(context.Background(), func(tx repos.EventStore) error {
-		next := eventsourcing.Event{AggregateID: "inv", Version: 2, EventType: "qtyEvent", Data: &qtyEvent{Delta: 1}, CreatedAt: 1}
+		next := eventsourcing.Event{AggregateID: "inv", AggregateType: "qtyAggregate", Version: 2, EventType: "qtyEvent", Data: &qtyEvent{Delta: 1}, CreatedAt: 1}
 		if err := tx.Append(context.Background(), next); err != nil {
 			return err
 		}
@@ -419,7 +419,12 @@ func newStore(t *testing.T, interval int) (*gorm.DB, eventsourcing.Serializer, e
 	return db, serializer, store
 }
 
-func openDB(t *testing.T) *gorm.DB {
+// openDB returns a migrated database for one test. The default is in-memory SQLite;
+// building with -tags integration switches it to a throwaway MySQL database
+// (see mysql_integration_test.go), so the same tests verify both engines.
+var openDB = openSQLiteDB
+
+func openSQLiteDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	name := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
 	dsn := "file:" + name + "?mode=memory&cache=shared"

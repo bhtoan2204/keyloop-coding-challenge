@@ -38,7 +38,7 @@ func (r *aggregateRepo) CreateIfNotExist(ctx context.Context, id, typ string) er
 func (r *aggregateRepo) insertAggregate(ctx context.Context, id, typ string) error {
 	stmt := `INSERT INTO es_aggregate(id, version, aggregate_type) VALUES(?, 0, ?) ON CONFLICT(id) DO NOTHING`
 	if r.db.Dialector.Name() == "mysql" {
-		stmt = `INSERT IGNORE INTO es_aggregate(id, version, aggregate_type) VALUES(?, 0, ?)`
+		stmt = `INSERT INTO es_aggregate(id, version, aggregate_type) VALUES(?, 0, ?) ON DUPLICATE KEY UPDATE id = id`
 	}
 	return r.db.WithContext(ctx).Exec(stmt, id, typ).Error
 }

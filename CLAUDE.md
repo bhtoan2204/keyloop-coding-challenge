@@ -20,14 +20,16 @@ If a doc disagrees with the code, trust the code. Report the mismatch and do not
 Implemented and tested:
 - `package/eventsourcing`: `AggregateRoot` (versions, pending events, `ApplyChange`, `LoadFromHistory`), `Event`, serializer registry.
 - `internal/infrastructure/eventstore`: `AggregateStore` (Get/Save in one tx: create-if-missing → CAS on
-  `es_aggregate.version` → append `es_event` → optional snapshot), `repos` (GORM, raw SQL), `Migrate`.
-  **Tested on SQLite only.** MySQL behaviour is unverified (hypothesis H1 in `docs/04-event-store.md` §5).
+  `es_aggregate.version` → append `es_event` → optional snapshot), `repos` (GORM, raw SQL), versioned `Migrate`
+  (v1 original DDL, v2 `es_event.aggregate_type`/`schema_version`). **Verified on SQLite and MySQL 8.4**
+  (`docs/04` §8): concurrency, migrations/upgrade, error classes (`ErrConcurrencyConflict`, `ErrRetryable`,
+  `IsRetryable`), restricted app user (`deploy/mysql/grants.sql`).
 - `internal/domain`: `VehicleInventoryAggregate` (state, commands Stock/ProposeAction/ReviseAction/
   CancelAction/Sell, appliers, snapshot JSON), typed events, `Date`, `AgeInDays`, `IsAging`, domain errors.
 
-Not implemented yet: MySQL driver and tests, versioned migrations, `es_event.aggregate_type`/`schema_version`,
-`internal/application/{command,query,messaging}`, `internal/presentation`, Postgres `viewstore`, projector,
-Kafka/Debezium, `cmd/main.go` subcommands. `Dockerfile`, `Makefile`, `docker-compose.yaml` and `.env` are empty files.
+Not implemented yet: `internal/application/{command,query,messaging}` (incl. the reload-and-retry loop),
+`internal/presentation`, Postgres `viewstore`, projector, Kafka/Debezium, `cmd/main.go` subcommands, `Dockerfile`.
+`docker-compose.yaml` has MySQL only. `.env` is git-ignored; copy `.env.example`.
 
 ## Reuse map (extend these; do not build parallel versions)
 | Need | Use |
@@ -69,9 +71,11 @@ gofmt -l .                     # must print nothing
 go vet ./...
 go test -count=1 ./...         # unit + SQLite-backed store tests (needs cgo for go-sqlite3)
 go test -race -count=1 ./...
-# planned (Phase 2+): go test -tags integration ./...  with MYSQL_TEST_DSN / PG_TEST_DSN
+make mysql-up && make test-integration   # real MySQL 8.4; needs MYSQL_TEST_DSN (admin DSN, no db name)
+make check                                # fmt-check, vet (incl. -tags integration), test, test-race
 ```
-The dev machine uses rootless Podman (`docker` CLI is Podman); testcontainers is not set up.
+Integration tests fail (never skip) without `MYSQL_TEST_DSN`. The dev machine uses rootless Podman
+(`docker compose` → podman-compose); Testcontainers is not used.
 
 ## Workflow (one phase at a time, see `docs/07-implementation-plan.md`)
 1. `/keyloop-plan` → inspect `git status` and code, write the minimal-change plan, wait for approval.

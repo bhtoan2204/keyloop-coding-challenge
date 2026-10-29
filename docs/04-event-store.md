@@ -1,12 +1,14 @@
 # 04 — Event Store
 
-Sections 2, 3 and 7 describe **current code** (`internal/infrastructure/eventstore`). Sections 4–6 are **proposed** changes, all additive.
+**Status: Phase 2 implemented and verified on MySQL 8.4.13 (2026-10-29).** Sections 1–5 and 7 describe the current code. Section 6 lists optional extensions that are still open. Verification commands and results: section 8.
 
-## 1. MySQL server configuration *(to add, Compose)*
+## 1. MySQL server configuration (implemented: `docker-compose.yaml`)
 
-`binlog_format=ROW`, `binlog_row_image=FULL`, `gtid_mode=ON`, `enforce_gtid_consistency=ON`, unique `server_id`, `binlog_expire_logs_seconds` ≥ 3 days. Default isolation is `REPEATABLE READ`.
+Service `mysql` (`docker.io/library/mysql:8.4`), bound to `127.0.0.1:${MYSQL_PORT}`. Credentials come only from `.env`, which is git-ignored (template: `.env.example`). Binlog settings for later Debezium: `--server-id=1 --gtid-mode=ON --enforce-gtid-consistency=ON --binlog-row-image=FULL --binlog-expire-logs-seconds=259200` (ROW format and the binary log are the 8.4 defaults). Verified on the running container: `8.4.13 · gtid_mode=ON · binlog_format=ROW · binlog_row_image=FULL · log_bin=1 · REPEATABLE-READ`.
 
-## 2. Current schema (`repos/schema.sql`, applied by `repos.Migrate`)
+Local workflow: `cp .env.example .env` (set the passwords) → `make mysql-up` → `make test-integration`. Migrations run with an admin account. `make mysql-grants` then creates the restricted application user (§4.3).
+
+## 2. Original schema = migration version 1 (`repos/schema.sql`, unchanged)
 
 ```sql
 CREATE TABLE IF NOT EXISTS es_aggregate (
@@ -54,84 +56,123 @@ Mapping to the brief's event-store requirements:
 
 ```
 BEGIN (gorm Transaction)
-  CreateIfNotExist: INSERT IGNORE es_aggregate(id, 0, type); SELECT type → mismatch ⇒ ErrAggregateTypeMismatch
+  CreateIfNotExist: INSERT es_aggregate(id, 0, type) ON DUPLICATE KEY UPDATE id = id   (was INSERT IGNORE, see §5)
+                    SELECT type → mismatch ⇒ ErrAggregateTypeMismatch
   CheckAndUpdateVersion: UPDATE es_aggregate SET version=:new WHERE id=:id AND version=:base
                          0 rows ⇒ ErrConcurrencyConflict
-  for each pending event: INSERT es_event(...)      duplicate (aggregate_id,version) ⇒ ErrDuplicateEvent
+  for each pending event: INSERT es_event(..., aggregate_type, schema_version)   duplicate ⇒ ErrDuplicateEvent
   if interval crossed: INSERT es_aggregate_snapshot
 COMMIT → root.Update() clears pending events (only on success; tested)
+any error → rollback; MySQL 1213/1205 wrapped as ErrRetryable (repos.WithTransaction)
 ```
 
 Load (`AggregateStore.Get`): `FindAggregate` (version + type check) → optional `ReadSnapshot` → `Get` events `(from, version]` → `LoadFromHistory` (contiguity check) → assert the replayed version equals the stored version.
 
-## 4. Proposed additive changes (Phase 1)
+## 4. Schema evolution (implemented)
 
-### 4.1 Columns
+### 4.1 Version 2: `es_event.aggregate_type`, `es_event.schema_version`
 
-```sql
-ALTER TABLE es_event
-  ADD COLUMN aggregate_type VARCHAR(255) NOT NULL DEFAULT 'VehicleInventoryAggregate',
-  ADD COLUMN schema_version SMALLINT NOT NULL DEFAULT 1;
-```
+| Column | MySQL type | Existing rows | New rows |
+|---|---|---|---|
+| `aggregate_type` | `VARCHAR(255) NOT NULL DEFAULT ''` | backfilled from `es_aggregate.aggregate_type` | set by `AggregateStore.Save` from the aggregate (`VehicleInventoryAggregate`) |
+| `schema_version` | `INT NOT NULL DEFAULT 1` | 1 | `Event.SchemaVersion`, where 0 means `eventsourcing.DefaultSchemaVersion` (1) |
 
-- `aggregate_type` on the event row lets the projector decode a CDC message on its own through the existing serializer key `<aggregate_type>_<event_type>`, without a join to `es_aggregate`. Debezium only sees the row. `Append` writes the value from the aggregate. The default covers any pre-existing rows (only one aggregate type exists).
-- `schema_version` supports payload evolution (03 §5). The default of 1 keeps old rows valid, and `Event.SchemaVersion == 0` is treated as 1.
-- **Not changed:** `data`/`metadata` stay `TEXT` (Debezium emits them as strings either way). `created_at` stays unix seconds (R14). `es_event.id` stays the event ID, so no UUID column is needed.
+- `eventsourcing.Event` gained the matching `AggregateType` and `SchemaVersion` fields (additive, `omitempty`). `eventRepo.Get` reads both back. A non-empty `aggregate_type` that differs from the aggregate being loaded fails with `ErrAggregateTypeMismatch`. An empty value is tolerated for rows appended directly through the repository without a type.
+- **Not changed:** stored event-type names (Go struct names), `data`/`metadata` as `TEXT` JSON, `created_at` (unix seconds), `es_event.id`. **No event UUID (decision Q2):** `(aggregate_id, version)` is the stable per-stream identity that consumers use for idempotency. `es_event.id` stays the database-generated surrogate.
+- In MySQL 8, `ADD COLUMN … DEFAULT` on InnoDB is an instant metadata change, so there is no table rebuild.
+- **Read guard:** `eventRepo.Get` refuses any `schema_version` other than 1 with `ErrUnsupportedSchemaVersion`. Decoding a newer payload with today's struct could silently drop fields, for example during a rollback. When an event type first changes shape, add an upcaster at that point instead of the refusal.
+- **Write guard:** `eventRepo.Append` requires `aggregate_type`. The backfill ran once, so an untyped row written later would stay undecodable for CDC. `AggregateStore.Save` always sets it.
+- **Backfill is a one-off admin edit of history:** an exception to append-only, done by the migration, never by the application. If Debezium were attached before it ran, it would emit `u` (update) events, which the projector must ignore: it accepts only `op ∈ {c, r}`.
 
-### 4.2 Migration compatibility (D13)
+### 4.2 Versioned migrator (inside the existing `repos.Migrate`)
 
-Today `repos.Migrate` runs `CREATE TABLE IF NOT EXISTS` on every start, which can create tables but cannot evolve them. MySQL 8 has no `ADD COLUMN IF NOT EXISTS`. The minimal refactor:
+- Each applied version is recorded in `es_schema_migrations(version, name, applied_at)`.
+- **Version 1** is the original `CREATE TABLE IF NOT EXISTS` DDL, unchanged. A database created by the old unversioned `Migrate` is therefore adopted without error.
+- **Version 2** is the columns above.
+- **Partial runs:** MySQL DDL is not transactional, so each step is idempotent. A column is added only if `information_schema.COLUMNS` (or SQLite's `pragma_table_info`) shows it missing, and the backfill only touches rows `WHERE aggregate_type = ''`. A run that stopped after the first `ALTER` completes on the next run (tested).
+- **Concurrent migrators:** on MySQL they are serialised with `GET_LOCK(CONCAT('es_migrate:', MD5(DATABASE())))` on one pinned connection (`db.Connection`). The name is hashed because lock names are limited to 64 characters. Tested with 4 parallel callers.
+- **Newer schema:** if `es_schema_migrations` holds a version above the newest this build knows, `Migrate` fails, so an older release doesn't run against a schema it doesn't understand (tested).
+- The signature `repos.Migrate(db *gorm.DB) error` is unchanged. All existing callers and tests keep working.
 
-1. Keep `repos.Migrate(db)` as the single entry point and its dialect switch.
-2. Replace the single embedded script with numbered embedded scripts per dialect (`migrations/mysql/0001_*.sql`, …) and a `schema_migrations(version, applied_at)` table.
-3. `0001` = today's DDL verbatim (with `IF NOT EXISTS`). A database created by the current code is therefore adopted without error, and `0001` is recorded as applied.
-4. `0002` = the `ALTER TABLE` above (SQLite: two `ALTER TABLE … ADD COLUMN … DEFAULT` statements, which SQLite supports).
-5. MySQL DDL is not transactional. Each script is applied, then recorded. A failure leaves a clear "version N not recorded" state to fix manually. This is acceptable for a take-home and documented.
+### 4.3 Append-only enforcement (implemented: `deploy/mysql/grants.sql`)
 
-The existing SQLite tests keep calling `repos.Migrate` unchanged.
+The restricted application user (`{{app_user}}`, applied after migrations) gets:
+- `SELECT, INSERT, UPDATE` on `es_aggregate`: version CAS, plus `ON DUPLICATE KEY UPDATE`, which needs UPDATE;
+- `SELECT, INSERT` on `es_event` and `es_aggregate_snapshot`;
+- `SELECT` on `es_schema_migrations`.
 
-### 4.3 Append-only enforcement *(to add)*
+There is **no UPDATE/DELETE on `es_event`**. Verified by `TestMySQLAppUserCannotRewriteHistory`: the user can save and load, including writing snapshots. `UPDATE`/`DELETE`/`TRUNCATE es_event`, `DELETE es_aggregate`, `ALTER` and `DROP` all fail with MySQL error 1142. Migrations and the tests that deliberately corrupt rows use the privileged test connection. Triggers were not added (O1).
 
-- **Grants:** the application user gets `SELECT, INSERT` on `es_event`, `SELECT, INSERT, UPDATE` on `es_aggregate` (CAS), and `SELECT, INSERT` on `es_aggregate_snapshot`. It has no `UPDATE`/`DELETE` on `es_event`. The Debezium user gets `SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT`.
-- **MySQL triggers (optional, open decision O1):** `BEFORE UPDATE` / `BEFORE DELETE ON es_event` → `SIGNAL SQLSTATE '45000'`. Each trigger is a single statement, so it is compatible with the existing `splitSQL` (split on `;`). Triggers would also block the existing tests that `UPDATE`/`DELETE es_event` to simulate corruption once those tests run on MySQL. Phase 1 therefore enforces append-only by **grants only**.
+### 4.4 CDC readiness (Debezium not implemented yet)
 
-### 4.4 Debezium compatibility
+- Each `es_event` row is self-describing: `aggregate_id`, `aggregate_type`, `event_type`, `version`, `schema_version`, `data`, `metadata`, `created_at`. A consumer can decode it with the serializer key `<aggregate_type>_<event_type>` without joining `es_aggregate`.
+- Rows are insert-only (grants), so Debezium only needs `op ∈ {c, r}`. Capture `es_event` only, and set `message.key.columns=<db>.es_event:aggregate_id` so one aggregate maps to one partition.
+- **Ordering contract:** consumers order and deduplicate by `(aggregate_id, version)`. `es_event.id` (AUTO_INCREMENT) is allocated at insert time, **not** commit time, so global `id` order must not be treated as commit order. Within one aggregate, the CAS serialises writers, so `id` order matches `version` order there.
+- Projection idempotency: apply only when `version == last_applied + 1`, as in 05 §4.
 
-- Capture **only** `es_event` (`table.include.list`). Writes to `es_aggregate` and snapshots stay on the write side.
-- `es_event` has a primary key (`id`), which Debezium requires. Override the message key to `aggregate_id` (R1).
-- Column mapping: `id`/`version`/`created_at`/`schema_version` → numbers; `aggregate_id`/`aggregate_type`/`event_type` → strings; `data`/`metadata` → strings that contain JSON. There are no temporal or binary types, so there are no conversion pitfalls.
-- Rows are insert-only (grants + triggers), so the projector accepts only `op ∈ {c, r}`.
+## 5. Concurrency, retries, duplicates (verified on MySQL)
 
-## 5. Concurrency, retries, duplicates
+OCC is unchanged: **CAS on `es_aggregate.version` inside the save transaction**, with the unique `(aggregate_id, version)` as a second guard.
 
-The OCC mechanism stays as implemented (D15): **CAS on `es_aggregate.version` inside the save transaction**, with the unique `(aggregate_id, version)` as a second, independent guard.
+**H1 confirmed and fixed.** Before any change, `TestMySQLConcurrentWritersSameExpectedVersion` (16 writers from the same version) gave `ok=1 conflicts=9 other=6`. The 6 others were `Error 1213: Deadlock found`. The creation test gave 1 deadlock out of 16. InnoDB's `LATEST DETECTED DEADLOCK` showed both transactions **holding `lock mode S locks rec but not gap`** on the `es_aggregate` PRIMARY row and **waiting for `lock_mode X`**. `INSERT IGNORE` takes a shared lock on the duplicate row, and the CAS `UPDATE` then needs an exclusive one: a classic S→X upgrade deadlock.
+- **Fix (one statement, MySQL only):** `INSERT … ON DUPLICATE KEY UPDATE id = id`. It takes an **exclusive** lock on the existing row, so the second writer waits at the insert and then fails the CAS cleanly. It also stops `IGNORE` from downgrading other errors (such as truncation) into warnings. SQLite keeps `ON CONFLICT DO NOTHING`.
+- **New locking order:** writers to the same aggregate now queue at `CreateIfNotExist`, at the start of Save, instead of meeting at the CAS. Under REPEATABLE READ, the following type `SELECT` is the transaction's first consistent read, taken after the lock wait, so it sees the committed row.
+- **1213 stays mapped as retryable.** It was really observed in this session (pre-fix run). Other deadlock paths can still occur, for example once a transaction touches several aggregates, and InnoDB rolls the transaction back in every such case.
+- **After the fix** (run 3× in a row): 10 rounds × 16 writers give exactly 1 success and 15 `ErrConcurrencyConflict`, with 0 other errors and versions `[1, 2]`. The same holds for concurrent creation of a new aggregate. 16 independent aggregates all succeed.
+- **No lost updates:** 16 writers that reload and re-run on `IsRetryable` end at version 17 with every event present.
+- **Mutation check:** restoring `INSERT IGNORE` makes both concurrency tests fail again.
 
-On MySQL (InnoDB, REPEATABLE READ), two concurrent saves from base version 3 behave like this. Both execute `UPDATE … WHERE version = 3`. The second blocks on the row lock until the first commits, then re-evaluates against the latest committed row, matches 0 rows, and fails with `ErrConcurrencyConflict`. **This is expected behaviour; it has not yet been verified on MySQL.** The existing `TestOptimisticConcurrency` runs sequentially on SQLite.
+**Error classification** (`repos/errors.go`, typed `*mysql.MySQLError`):
 
-**H1 (to verify in Phase 1):** `CreateIfNotExist` runs `INSERT IGNORE` on every save. On a duplicate key, InnoDB takes a **shared** lock on the existing row. Two concurrent transactions holding S locks that both then `UPDATE` (needing X) can deadlock, so one gets **1213** instead of a clean 0-row CAS. Today 1213 is not mapped and would surface as a generic error. Candidate fixes, applied only if the test confirms H1:
-- skip `CreateIfNotExist` when `BaseVersion() > 0` (the aggregate is known to exist)
-- map 1213 and 1205 → `ErrConcurrencyConflict` (retryable)
+| Situation | Returned | `IsRetryable` |
+|---|---|---|
+| CAS matched 0 rows | `ErrConcurrencyConflict` | yes: reload and re-run the command |
+| 1062 on `es_event (aggregate_id, version)` | `ErrDuplicateEvent` | no (indicates inconsistent store state) |
+| 1213 deadlock, 1205 lock wait timeout | `ErrRetryable` wrapping the MySQL error | yes: reload and re-run the command |
+| context cancelled / deadline | `context.Canceled` / `DeadlineExceeded` | no |
+| connection closed, other SQL errors | unchanged | no |
+| domain rule violation | domain errors, raised before Save | no |
 
-| Scenario | Behaviour (application layer, Phase 2) |
+- 1205 is **verified with a real lock wait**. An admin transaction holds `SELECT … FOR UPDATE` and the store uses `innodb_lock_wait_timeout=1`. The failed save keeps its pending events, and the **same** save succeeds after the lock is released, since nothing was persisted.
+- **The store never retries.** Re-saving stale pending events would be wrong. The application layer (Phase 3) must reload the aggregate, re-run the command against fresh state, and save, with a bounded retry count.
+- **Duplicate detection** checks the typed MySQL error number first, then the gorm sentinel, then a text match. The text match is kept for SQLite, which would otherwise require importing the cgo driver into production code.
+
+| Scenario | Behaviour |
 |---|---|
-| Two managers propose concurrently, no `If-Match` | The loser gets `ErrConcurrencyConflict`, then the command handler re-loads, re-runs the command method (max 3 attempts, jittered) and now sees the active action → `409 ACTION_ALREADY_ACTIVE` |
-| Two revisions, no `If-Match` | Both apply in order; both are in history |
-| Two revisions with `If-Match` | The handler compares the loaded version with `If-Match` before the command → `412` |
-| Client retry after a timeout, no key | Caught by domain rules (propose → 409, sell → 409, identical revise → no-op 200) |
-| Client retry with `Idempotency-Key` | **Optional** (§6) |
-| MySQL down | `503`; the tx guarantees no partial state |
-
-Retry always re-loads and re-validates. A failed insert is never retried blindly.
+| Two managers propose concurrently | Loser gets `ErrConcurrencyConflict`. The Phase 3 handler reloads, re-runs, sees the active action, and returns `409 ACTION_ALREADY_ACTIVE`. |
+| Two revisions with `If-Match` | Handler compares versions before the command and returns `412` |
+| Retry without an idempotency key | Caught by domain rules (04 §6 for the optional key store) |
+| MySQL down / connection lost | Non-retryable infrastructure error. The transaction guarantees no partial state. |
 
 ## 6. Optional extensions (time permitting, see 07 cut list)
 
 - **VIN reservation (D4):** a `vin_reservation(vin PK, vehicle_id UNIQUE)` table written inside the same `WithTransaction` as the stock/sell events. This would be a narrow hook in `Save`, or an application-level `WithTransaction` callback.
 - **Idempotency-Key store:** an `idempotency_key(actor_id, key PK, fingerprint, response)` table, inserted in the same tx. Without it, domain rules still give natural idempotency.
 
-## 7. Snapshots (existing; disabled for vehicles)
+## 7. Snapshots (capability kept; disabled for vehicles at runtime)
 
-Current behaviour: when a save crosses a multiple of the interval (default 10 in `NewAggregateStore`), `CreateSnapshot` stores `serializer.Marshal(agg)`. `Get` restores the newest snapshot ≤ the aggregate version with `Unmarshal`, then replays only the later events. The existing tests pass because their test aggregate implements `MarshalJSON`/`UnmarshalJSON`.
+- **Capability:** when a save crosses a multiple of the interval, the store writes `serializer.Marshal(agg)`. `Get` restores the newest snapshot and replays only the later events. That is unchanged, and all existing snapshot tests now also pass on MySQL.
+- **Vehicle snapshots work:** `VehicleInventoryAggregate` implements `MarshalJSON`/`UnmarshalJSON` (Phase 1). `TestVehicleSnapshotRestoreThenAppend` (SQLite and MySQL, interval 2) deletes the events covered by the snapshot, restores the full state from the snapshot, sells the vehicle, appends and reloads. Snapshots are written at versions 2 and 4.
+- **Runtime decision (Q6): interval 0 for vehicles.** Use `NewAggregateStoreWithSnapshotInterval(repos, 0)` when wiring the application in Phase 3.
+  - Why: a vehicle stream is short (stock, a few action changes, sale; typically < 10 events), so a full replay is a single indexed range read.
+  - Snapshots would add a write every N events plus stored JSON that must stay schema-compatible, for no measurable read saving.
+  - `TestVehicleLifecycleReplayFromStore` runs with interval 0 and asserts that no snapshot row is written.
+- **Snapshot JSON has no format version** (existing schema). If the aggregate's state shape changes, old snapshots must be cleared or ignored, or they'll decode silently. Low risk while vehicles run at interval 0.
+- **History:** the Phase 0 probe found that an aggregate with unexported state and no custom JSON is snapshotted as `{}`. `ReadSnapshot` still only rejects an empty string, not `{}`. That gap is harmless for vehicles, which have custom JSON and run at interval 0, and is documented as a risk for any future aggregate.
 
-**Verified hazard (probe run 2026-10-29 on a scratch copy, not committed):** an aggregate that keeps state in unexported fields and has no custom JSON is snapshotted as `{}`. On load the snapshot "restores" nothing and the earlier events are skipped. The reloaded aggregate had the right version (3) but empty state (`vin=""`, counter 0 instead of 3). `ReadSnapshot` only guards against an empty string, not `{}`. `VehicleInventoryAggregate` (03 §2) has exactly this shape.
+## 8. Phase 2 verification (2026-10-29, MySQL 8.4.13 via podman-compose)
 
-Decision (D2): construct the vehicle store with `NewAggregateStoreWithSnapshotInterval(repos, 0)`, which is already supported and disables snapshots. Vehicle streams are short (typically < 10 events), so snapshots bring no measurable benefit. Re-enabling requires (a) `MarshalJSON`/`UnmarshalJSON` on the aggregate and (b) a test that compares the snapshot-restored state with the replayed state.
+| Command | Result |
+|---|---|
+| `make check` (gofmt, `go vet` with and without `-tags integration`, `go test -count=1 ./...`, `go test -race -count=1 ./...`) | all pass |
+| `make test-integration` (`MYSQL_TEST_DSN` set) | 28 tests in `eventstore` + 2 in `repos`, all pass (after the review fixes) |
+| `go test -tags integration -race -count=1 ./internal/infrastructure/eventstore/...` | pass |
+
+- Each integration test gets its own `es_it_<random>` database, dropped at cleanup. After the runs: 0 leftover databases and 0 leftover `es_app_*` users.
+- **Mutation checks** (scratch copies, MySQL), each caught by the tests targeting it:
+  - `INSERT IGNORE` restored → both concurrency tests fail;
+  - classifier never marks 1213/1205 → `TestClassifyTxError`, lock-wait test fail;
+  - backfill matches nothing → upgrade and resume tests fail;
+  - column-exists check removed → resume test fails;
+  - `aggregate_type` not stamped → fresh-migration and vehicle tests fail.
+- `make mysql-grants` (the `sed` substitution into the running container) was **not** executed end to end. The same `grants.sql` is applied by the integration test.

@@ -1,6 +1,6 @@
 # Design & Plan — Intelligent Inventory Dashboard (Scenario B, backend)
 
-Status: **Phase 1 (Vehicle Inventory domain) committed in `ac84073`. Claude Code workflow configured (`CLAUDE.md`, `.claude/`). Next: Phase 2 (MySQL write side), not started.**
+Status: **Phase 2 (MySQL event store) implemented and verified on MySQL 8.4 — uncommitted, awaiting developer review (see `04-event-store.md` §8). Next: Phase 3 (application commands + write API).**
 Target completion of all deliverables: **Wednesday 4 November 2026.**
 
 > Sources: `KeyloopCodingChallange.pdf` (Scenario B, Part 1/2, deliverables, evaluation framework) and the

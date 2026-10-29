@@ -1,0 +1,29 @@
+# Local infrastructure. Phase 2: MySQL event store only; Debezium, Kafka and Postgres
+# are added in later phases. Configuration comes from .env (see .env.example).
+name: keyloop
+
+services:
+  mysql:
+    image: docker.io/library/mysql:8.4
+    command:
+      # Binary log settings required later by Debezium (ROW format is the 8.4 default).
+      - --server-id=1
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-row-image=FULL
+      - --binlog-expire-logs-seconds=259200
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env (see .env.example)}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-inventory}
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+volumes:
+  mysql-data:

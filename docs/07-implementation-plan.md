@@ -40,6 +40,9 @@ Tests: the existing tests stay as they are. MySQL/Postgres integration tests sit
 
 ## 2. Phases
 
+> **Actual sequencing (2026-10-29):** Phase 1 delivered the domain only (`ac84073`). The MySQL write side below was
+> delivered as Phase 2 (see `04-event-store.md` §8). Later phases shift by one number; dates unchanged.
+
 ### Phase 1 — Write side on MySQL + domain · Thu 29 – Fri 30 Oct
 Scope (only what the brief's Phase 1 lists):
 1. Add `gorm.io/driver/mysql`. Compose service `mysql` only (binlog settings already present for later CDC). Makefile targets `test`, `test-integration`, `mysql-up`.

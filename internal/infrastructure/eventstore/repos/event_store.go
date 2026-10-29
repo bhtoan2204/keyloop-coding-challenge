@@ -38,7 +38,8 @@ func NewEventStore(db *gorm.DB, s eventsourcing.Serializer) EventStore {
 }
 
 func (r *eventStore) WithTransaction(ctx context.Context, fn func(txStore EventStore) error) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		return fn(NewEventStore(tx, r.serializer))
 	})
+	return classifyTxError(err)
 }
