@@ -1,8 +1,7 @@
-package presentation
+package commands
 
 // vehicleResponse is the committed write-side state after a command. age_days and
-// is_aging are derived at the dealership business date (business_date) and are not
-// stored anywhere.
+// is_aging are derived at business_date and never stored.
 type vehicleResponse struct {
 	VehicleID     string          `json:"vehicle_id"`
 	DealershipID  string          `json:"dealership_id"`

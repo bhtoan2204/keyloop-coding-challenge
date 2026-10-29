@@ -1,29 +1,30 @@
-package presentation
+package commands
 
 import (
 	"net/http"
 
 	"keyloop-coding-challenge/internal/application/command"
+	"keyloop-coding-challenge/internal/presentation/httpkit"
 )
 
-func (a *api) stockVehicle(w http.ResponseWriter, r *http.Request) {
+func (h *handlers) stockVehicle(w http.ResponseWriter, r *http.Request) {
 	meta, err := commandMeta(r)
 	if err != nil {
-		writeError(w, r, a.log, err)
+		httpkit.WriteError(w, r, h.log, err)
 		return
 	}
 	var req stockVehicleRequest
-	if err := decodeJSON(w, r, &req, false); err != nil {
-		writeError(w, r, a.log, err)
+	if err := httpkit.DecodeJSON(w, r, &req, false); err != nil {
+		httpkit.WriteError(w, r, h.log, err)
 		return
 	}
-	if req.VehicleID != "" && !safeID.MatchString(req.VehicleID) {
-		writeError(w, r, a.log, invalidField("vehicle_id", "must be 1-128 characters of A-Z a-z 0-9 . _ : @ -"))
+	if req.VehicleID != "" && !httpkit.IsSafeID(req.VehicleID) {
+		httpkit.WriteError(w, r, h.log, httpkit.InvalidField("vehicle_id", "must be 1-128 characters of A-Z a-z 0-9 . _ : @ -"))
 		return
 	}
-	stockedOn, err := parseDate("stocked_on", req.StockedOn)
+	stockedOn, err := httpkit.ParseDate("stocked_on", req.StockedOn)
 	if err != nil {
-		writeError(w, r, a.log, err)
+		httpkit.WriteError(w, r, h.log, err)
 		return
 	}
 	cmd := command.StockVehicle{
@@ -35,9 +36,9 @@ func (a *api) stockVehicle(w http.ResponseWriter, r *http.Request) {
 		ModelYear:    req.ModelYear,
 		StockedOn:    stockedOn,
 	}
-	res, err := a.commands.StockVehicle(r.Context(), cmd, meta)
+	res, err := h.service.StockVehicle(r.Context(), cmd, meta)
 	if err != nil {
-		writeError(w, r, a.log, err)
+		httpkit.WriteError(w, r, h.log, err)
 		return
 	}
 	location := "/v1/dealerships/" + res.Vehicle.DealershipID() + "/vehicles/" + res.Vehicle.VehicleID()

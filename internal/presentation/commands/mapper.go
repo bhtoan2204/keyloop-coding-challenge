@@ -1,14 +1,13 @@
-package presentation
+package commands
 
 import (
 	"net/http"
 	"strconv"
 
 	"keyloop-coding-challenge/internal/application/command"
+	"keyloop-coding-challenge/internal/presentation/httpkit"
 )
 
-// toVehicleResponse maps the committed aggregate state. age_days and is_aging are
-// derived at the business date and never stored.
 func toVehicleResponse(res *command.Result) vehicleResponse {
 	v := res.Vehicle
 	out := vehicleResponse{
@@ -42,5 +41,5 @@ func toVehicleResponse(res *command.Result) vehicleResponse {
 // writeVehicle answers with the committed state; the ETag is the aggregate version.
 func writeVehicle(w http.ResponseWriter, status int, res *command.Result) {
 	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(res.Vehicle.Version())))
-	writeJSON(w, status, "application/json", toVehicleResponse(res))
+	httpkit.WriteJSON(w, status, toVehicleResponse(res))
 }

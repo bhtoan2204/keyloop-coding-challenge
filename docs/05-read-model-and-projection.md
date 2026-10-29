@@ -228,7 +228,7 @@ sequenceDiagram
   | `internal/infrastructure/projection` | `Projection` pipeline, `Runner` |
   | `projection/projectors` | `VehicleProjector`, whose state transition `ProjectVehicle` is a pure function |
   | `internal/application/query` | query service and `ReadModel` port |
-  | `internal/presentation` | one `*_handler.go` per query, `read_model_responses.go` (DTOs), `read_model_mappers.go`, `query_params.go` |
+  | `internal/presentation/queries` | one file per query endpoint, `responses.go` (DTOs), `mapper.go`; query-string parsing in `presentation/httpkit` |
   | `cmd/projections.go`, `cmd/postgres.go` | projection commands, PG configuration |
 
 ### 6.2 Schema (deviations from §1)
@@ -332,7 +332,7 @@ API ──commands──► MySQL es_event ──binlog──► Debezium (Kafka
 | Kafka transport | `internal/infrastructure/kafka` | franz-go v1.22.0 consumer group (`messaging.Transport`); joins the group on its first poll |
 | Projection adapter | `internal/infrastructure/projection/consumer_adapter.go` | existing `Projection`, `Runner` and `repos.EventStore` behind the consumer's ports, errors translated (like `commandstore`) |
 | Gap-repair read | `repos.EventStore.ReadStream` (`repos/event_stream.go`) | one aggregate's version range, decoded like `ReadAll` |
-| Process | `cmd/projector.go` (`main projector`, `make run-projector`) | probes `/healthz`, `/readyz`, `/status` on `PROJECTOR_HTTP_ADDR` (`presentation/probe_router.go`); a probe server that cannot start stops the process |
+| Process | `cmd/projector.go` (`main projector`, `make run-projector`) | probes `/healthz`, `/readyz`, `/status` on `PROJECTOR_HTTP_ADDR` (`presentation/probes`, composed by `presentation.NewProbeHandler`); a probe server that cannot start stops the process |
 
 The projection framework is unchanged: the consumer calls the existing `Projection.Apply`, so state, history and the applied version still commit in one PostgreSQL transaction under the shared projection lock and the per-aggregate lock (§6.3).
 

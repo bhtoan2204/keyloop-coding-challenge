@@ -1,4 +1,4 @@
-package presentation
+package commands
 
 import (
 	"net/http"
@@ -7,26 +7,24 @@ import (
 	"strings"
 
 	"keyloop-coding-challenge/internal/application/command"
+	"keyloop-coding-challenge/internal/presentation/httpkit"
 )
 
-var (
-	safeID      = regexp.MustCompile(`^[A-Za-z0-9._:@-]{1,128}$`)
-	traceParent = regexp.MustCompile(`^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`)
-)
+var traceParent = regexp.MustCompile(`^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$`)
 
 // commandMeta builds command metadata. X-Actor-Id is an UNAUTHENTICATED, demo-only
 // identity: it is recorded for audit but never used for authorization.
 func commandMeta(r *http.Request) (command.Meta, error) {
 	actor := r.Header.Get("X-Actor-Id")
 	if actor == "" {
-		return command.Meta{}, badRequest("ACTOR_REQUIRED", "X-Actor-Id header is required on commands")
+		return command.Meta{}, httpkit.BadRequest("ACTOR_REQUIRED", "X-Actor-Id header is required on commands")
 	}
-	if !safeID.MatchString(actor) {
-		return command.Meta{}, badRequest("INVALID_ACTOR", "X-Actor-Id must be 1-128 characters of A-Z a-z 0-9 . _ : @ -")
+	if !httpkit.IsSafeID(actor) {
+		return command.Meta{}, httpkit.BadRequest("INVALID_ACTOR", "X-Actor-Id must be 1-128 characters of A-Z a-z 0-9 . _ : @ -")
 	}
 	meta := command.Meta{
 		ActorID:       actor,
-		CorrelationID: requestIDFrom(r.Context()),
+		CorrelationID: httpkit.RequestID(r.Context()),
 	}
 	if tp := r.Header.Get("traceparent"); traceParent.MatchString(tp) {
 		meta.TraceParent = tp
@@ -46,7 +44,7 @@ func expectedVersion(r *http.Request) (*int, error) {
 	}
 	v, err := strconv.Atoi(unquoted)
 	if err != nil || v < 1 || strings.HasPrefix(raw, "W/") {
-		return nil, badRequest("INVALID_IF_MATCH", `If-Match must be a strong ETag such as "3"`)
+		return nil, httpkit.BadRequest("INVALID_IF_MATCH", `If-Match must be a strong ETag such as "3"`)
 	}
 	return &v, nil
 }

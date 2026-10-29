@@ -1,8 +1,9 @@
-package presentation
+package httpkit
 
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"runtime/debug"
 	"time"
@@ -18,7 +19,8 @@ type ctxKey int
 
 const requestIDKey ctxKey = iota
 
-func requestIDFrom(ctx context.Context) string {
+// RequestID returns the request's correlation ID (set by WithRequestContext).
+func RequestID(ctx context.Context) string {
 	id, _ := ctx.Value(requestIDKey).(string)
 	return id
 }
@@ -36,45 +38,56 @@ func (s *statusRecorder) WriteHeader(code int) {
 // Unwrap lets http.ResponseController reach the underlying writer.
 func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
-// withRequestContext assigns the request ID (a valid inbound X-Request-Id is kept so
-// callers can correlate), echoes it, and writes one structured access-log line.
-func (a *api) withRequestContext(next http.Handler) http.Handler {
+// WithRequestContext assigns the request ID (a valid inbound X-Request-Id is kept so
+// callers can correlate), echoes it, applies the request timeout and writes one
+// structured access-log line.
+func WithRequestContext(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		id := r.Header.Get("X-Request-Id")
-		if !safeID.MatchString(id) {
+		if !IsSafeID(id) {
 			id = uuid.Must(uuid.NewV7()).String()
 		}
 		w.Header().Set("X-Request-Id", id)
 		ctx, cancel := context.WithTimeout(context.WithValue(r.Context(), requestIDKey, id), requestTimeout)
 		defer cancel()
 		r = r.WithContext(ctx)
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		rec := &statusRecorder{
+			ResponseWriter: w,
+			status:         http.StatusOK,
+		}
 		next.ServeHTTP(rec, r)
-		a.log.InfoContext(r.Context(), "http request",
-			"request_id", id, "method", r.Method, "route", r.Pattern, "path", r.URL.Path,
-			"status", rec.status, "duration_ms", time.Since(start).Milliseconds(),
+		log.InfoContext(r.Context(), "http request",
+			"request_id", id,
+			"method", r.Method,
+			"route", r.Pattern,
+			"path", r.URL.Path,
+			"status", rec.status,
+			"duration_ms", time.Since(start).Milliseconds(),
 			"actor_id", sanitizedActor(r))
 	})
 }
 
-func (a *api) withRecovery(next http.Handler) http.Handler {
+// WithRecovery turns a panic into a logged 500 problem response. http.ErrAbortHandler
+// is re-raised: it is net/http's signal to abort the response.
+func WithRecovery(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if v := recover(); v != nil {
 				if v == http.ErrAbortHandler {
 					panic(v)
 				}
-				a.log.ErrorContext(r.Context(), "panic", "panic", v, "stack", string(debug.Stack()))
-				writeError(w, r, a.log, errors.New("panic"))
+				log.ErrorContext(r.Context(), "panic", "panic", v, "stack", string(debug.Stack()))
+				WriteError(w, r, log, errors.New("panic"))
 			}
 		}()
 		next.ServeHTTP(w, r)
 	})
 }
 
+// sanitizedActor keeps an unvalidated header out of the logs unless it is a safe ID.
 func sanitizedActor(r *http.Request) string {
-	if actor := r.Header.Get("X-Actor-Id"); safeID.MatchString(actor) {
+	if actor := r.Header.Get("X-Actor-Id"); IsSafeID(actor) {
 		return actor
 	}
 	return ""

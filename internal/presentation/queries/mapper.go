@@ -1,4 +1,4 @@
-package presentation
+package queries
 
 import (
 	"keyloop-coding-challenge/internal/application/query"

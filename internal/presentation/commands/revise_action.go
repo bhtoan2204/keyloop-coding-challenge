@@ -1,21 +1,22 @@
-package presentation
+package commands
 
 import (
 	"net/http"
 
 	"keyloop-coding-challenge/internal/application/command"
 	"keyloop-coding-challenge/internal/domain"
+	"keyloop-coding-challenge/internal/presentation/httpkit"
 )
 
-func (a *api) reviseAction(w http.ResponseWriter, r *http.Request) {
+func (h *handlers) reviseAction(w http.ResponseWriter, r *http.Request) {
 	meta, t, err := commandInputs(r)
 	if err != nil {
-		writeError(w, r, a.log, err)
+		httpkit.WriteError(w, r, h.log, err)
 		return
 	}
 	var req actionRequest
-	if err := decodeJSON(w, r, &req, false); err != nil {
-		writeError(w, r, a.log, err)
+	if err := httpkit.DecodeJSON(w, r, &req, false); err != nil {
+		httpkit.WriteError(w, r, h.log, err)
 		return
 	}
 	cmd := command.ReviseAction{
@@ -24,9 +25,9 @@ func (a *api) reviseAction(w http.ResponseWriter, r *http.Request) {
 		ActionType: domain.ActionType(req.ActionType),
 		Note:       req.Note,
 	}
-	res, err := a.commands.ReviseAction(r.Context(), cmd, meta)
+	res, err := h.service.ReviseAction(r.Context(), cmd, meta)
 	if err != nil {
-		writeError(w, r, a.log, err)
+		httpkit.WriteError(w, r, h.log, err)
 		return
 	}
 	writeVehicle(w, http.StatusOK, res)

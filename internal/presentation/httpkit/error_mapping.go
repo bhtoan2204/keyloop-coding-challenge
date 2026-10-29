@@ -1,4 +1,4 @@
-package presentation
+package httpkit
 
 import (
 	"context"
@@ -35,9 +35,8 @@ var domainErrors = []struct {
 	{domain.ErrActionNotActive, http.StatusConflict, "ACTION_NOT_ACTIVE", "Action is not active"},
 }
 
-// problemFor classifies err into status, code, title and client-safe detail.
 func problemFor(err error) problem {
-	var apiErr *apiError
+	var apiErr *Error
 	var validation *domain.ValidationError
 	switch {
 	case errors.As(err, &apiErr):

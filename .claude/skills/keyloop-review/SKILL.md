@@ -27,7 +27,11 @@ Base: `$ARGUMENTS` (if empty, use `HEAD`). Read-only: do not edit, stage, commit
   responsibility per file; handlers, DTOs, mappers, parsing, middleware and error mapping kept
   apart; no catch-all files; files near 250–300 lines and functions near 40–60 lines justified;
   multiline struct literals one field per line; guard clauses instead of nesting; comments explain
-  why. For structural refactors, confirm no behaviour change (same exported API, events, SQL, HTTP
+  why; comments only where the code cannot speak (no narration or name repetition).
+  **Package organization:** no flat directory of unrelated features; no package per file;
+  children never import the parent, shared helpers never import features, no sideways
+  imports; small exported APIs; public entry points kept stable (aliases/facades).
+  For structural refactors, confirm no behaviour change (same exported API, events, SQL, HTTP
   contracts, tests and assertions).
 - **Tests:** do new behaviours have failing-without-change tests? Were any assertions weakened?
 - **Docs:** deviations from `docs/` recorded; `docs/ai-log.md` factual.

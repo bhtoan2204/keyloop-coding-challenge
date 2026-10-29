@@ -1,9 +1,13 @@
-package presentation
+package httpkit
 
 import (
 	"encoding/json"
 	"net/http"
 )
+
+func WriteJSON(w http.ResponseWriter, status int, body interface{}) {
+	writeJSON(w, status, "application/json", body)
+}
 
 func writeJSON(w http.ResponseWriter, status int, contentType string, body interface{}) {
 	w.Header().Set("Content-Type", contentType)

@@ -259,3 +259,39 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
   - the hypothesis that the ~0.5 s lag floor is Debezium's `poll.interval.ms`.
 - **Environment note:** `docker compose up -d kafka connect` (podman-compose) recreated the running MySQL container. Its data volume persisted.
 - **Not done by the AI:** no commit or push. The project `keyloop-test`, `keyloop-review` and `keyloop-security` skills were run after this entry was written (they block edits); their findings are in the phase report, not here.
+
+## 2026-10-29 — Phase 5.5: presentation subpackages and comment quality (behaviour-preserving)
+
+- **Delegated:** split the flat `internal/presentation` (29 files) into packages, add permanent package-organization, comment and readability rules, and trim redundant comments in the touched files.
+  - **`httpkit`** (shared transport): middleware, request ID, safe-ID rule, problem+json, error mapping, strict JSON and query-string parsing.
+  - **`commands`:** five write handlers, request/response DTOs, mapper, command metadata.
+  - **`queries`:** four read handlers, response DTOs, mapper.
+  - **`probes`:** `/healthz`, `/readyz`, `/status`.
+  - **Root:** `router.go` holds `NewHandler` and `NewProbeHandler`. `application_ports.go` keeps `CommandService`, `QueryService`, `ReadinessCheck` and `ConsumerStatus` as type aliases of the feature packages' ports, so callers in `cmd/` and the tests compile unchanged.
+  - **Dependencies:** each feature package receives only its own service; the shared `api` struct is gone.
+- **Rules updated:** `.claude/rules/source-organization.md` (package organization, comments, readability), `.claude/rules/architecture.md`, `CLAUDE.md`, and the `keyloop-review` checklist. `docs/05` file references were updated.
+- **Method:** in the requested order (httpkit → commands → queries → probes → root → comments → rules), with a build and the presentation tests after each step. Files were moved with their code unchanged except package-qualified names (`writeError` → `httpkit.WriteError`, `apiError` → `httpkit.Error`, …).
+- **Comment changes:**
+  - removed comments that restated `problemFor` and `WriteJSON`, and a duplicated "age is never stored" note;
+  - updated a stale "until the next sync" (pre-Phase 5) on the read-model ETag;
+  - documented `IntOrZero` and `OptionalBool`;
+  - comments about transactions, the Kafka consumer, the event store and Debezium were not touched.
+- **Added tests:**
+  - `TestPresentationPackageDependencies` (`go/build`; no new dependency): child packages may import only `httpkit`, and `httpkit` no presentation package. Verified that it fails on an injected `queries` → `commands` import.
+  - `httpkit` unit tests for the error mapping, including VERSION_MISMATCH taking precedence over a conflict, hidden 500 details, and Retry-After.
+  - `probe_router_test.go` was renamed to `probe_handler_test.go`; its content is unchanged.
+- **Errors made by the AI:**
+  - (1) a text replacement missed a gofmt-aligned struct field; the build caught it and it was fixed by hand;
+  - (2) `git rm` refused files carrying the AI's own step-1 edits, so they were force-removed after checking that the copies existed in the new package;
+  - (3) to view a rename-aware diff, the AI ran `git add -N` and then `git reset -q -- internal/presentation`. No working-tree file changed, but the staged deletions and the test rename were unstaged, which also breaks the project's no-`git reset` rule. The index was restored with `git rm --cached` and `git add`.
+- **Verified (this session):**
+  - **Formatting and unit tests:** `gofmt` clean, `go vet ./...` clean, `make check` exit 0.
+  - **Integration and pipeline:** `make test-integration` exit 0 (158 top-level PASS, 0 FAIL/SKIP); `make test-pipeline` 9/9 PASS.
+  - **Test lists:** identical to the baseline for all three tag sets, plus the 3 new tests; none removed.
+  - **Public API:** `go doc` differs only in parameter names (`cmds`, `qs`) and the four types becoming aliases.
+  - **Routes:** the registered route patterns are identical.
+  - **Black-box comparison:** the baseline binary (built from `53462bc`) and the refactored binary ran against the same databases.
+    - 20 read requests and 30 command requests (every validation and error class, ETag, Location, If-Match, 404/409/412/413/415, Retry-After) gave identical status, headers and bodies.
+    - The projector probe servers gave identical `/healthz`, `/readyz`, 404 and `/status` shape.
+    - The access-log and error-log lines were identical.
+- **Not changed:** business behaviour, events, SQL, schemas, dependencies, `cmd/`.

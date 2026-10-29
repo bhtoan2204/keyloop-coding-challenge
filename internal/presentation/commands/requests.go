@@ -1,4 +1,4 @@
-package presentation
+package commands
 
 type stockVehicleRequest struct {
 	VehicleID string `json:"vehicle_id"`

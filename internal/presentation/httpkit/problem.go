@@ -1,4 +1,4 @@
-package presentation
+package httpkit
 
 import (
 	"context"
@@ -24,23 +24,29 @@ type fieldError struct {
 	Message string `json:"message"`
 }
 
-// apiError is a request-level error raised by the HTTP layer itself (bad JSON,
-// missing header, ...). Its detail is safe to show to the client.
-type apiError struct {
+// Error is a request-level error raised by the HTTP layer itself (bad JSON, missing
+// header, ...). Its detail is safe to show to the client.
+type Error struct {
 	status int
 	code   string
 	detail string
 	fields []fieldError
 }
 
-func (e *apiError) Error() string { return e.code + ": " + e.detail }
+func (e *Error) Error() string { return e.code + ": " + e.detail }
 
-func badRequest(code, detail string) *apiError {
-	return &apiError{status: http.StatusBadRequest, code: code, detail: detail}
+// BadRequest is a 400 with the given code and client-safe detail.
+func BadRequest(code, detail string) *Error {
+	return &Error{
+		status: http.StatusBadRequest,
+		code:   code,
+		detail: detail,
+	}
 }
 
-func invalidField(field, message string) *apiError {
-	return &apiError{
+// InvalidField is a 400 VALIDATION_ERROR naming one request field.
+func InvalidField(field, message string) *Error {
+	return &Error{
 		status: http.StatusBadRequest,
 		code:   "VALIDATION_ERROR",
 		detail: "request validation failed",
@@ -48,12 +54,23 @@ func invalidField(field, message string) *apiError {
 	}
 }
 
-// writeError maps err to a problem response. Unexpected errors are logged in full and
+// NotFound answers every request with a 404 NOT_FOUND problem (the routers' catch-all).
+func NotFound(log *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		WriteError(w, r, log, &Error{
+			status: http.StatusNotFound,
+			code:   "NOT_FOUND",
+			detail: "no such endpoint",
+		})
+	}
+}
+
+// WriteError maps err to a problem response. Unexpected errors are logged in full and
 // answered with a generic message: no SQL or internal detail reaches the client.
-func writeError(w http.ResponseWriter, r *http.Request, log *slog.Logger, err error) {
+func WriteError(w http.ResponseWriter, r *http.Request, log *slog.Logger, err error) {
 	p := problemFor(err)
 	p.Instance = r.URL.Path
-	p.RequestID = requestIDFrom(r.Context())
+	p.RequestID = RequestID(r.Context())
 	p.Type = "https://errors.inventory.local/" + p.Code
 	if p.Code == codeUnavailable {
 		w.Header().Set("Retry-After", "1")

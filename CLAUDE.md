@@ -34,7 +34,7 @@ Implemented and tested:
 
 - Read side (Phase 4): `internal/infrastructure/viewstore` (PostgreSQL 17 read model + migrations),
   `internal/infrastructure/projection` (`Projection.Apply`, `VehicleProjector`, `Runner` sync/rebuild from one
-  consistent MySQL snapshot via `repos.EventStore.ReadAll`), `internal/application/query`, `presentation/*_handler.go`
+  consistent MySQL snapshot via `repos.EventStore.ReadAll`), `internal/application/query`, `presentation/queries`
   (4 GET endpoints). `cmd`: `sync-projections`, `rebuild-projections` (now bootstrap/recovery tools).
 - Live change feed (Phase 5, `docs/05` §7): Compose `kafka` (KRaft) + `connect` (Debezium 3.6.2, connector
   `deploy/debezium/es-event-connector.json`, account `deploy/mysql/debezium-grants.sql`);
@@ -60,16 +60,25 @@ Not implemented yet: `Dockerfile` (Go processes run on the host), Idempotency-Ke
 | Leave unwired, do not delete | `projectors/projector_outbox.go`, `internal/infrastructure/cache`, `package/redis` |
 
 ## Source organization
-Follow `.claude/rules/source-organization.md`: one responsibility per file, one business operation per file
-when operations evolve independently, no catch-all `commands.go`/`queries.go`/`utils.go`, one field per line
-in multiline struct literals, guard clauses, comments that explain *why*. Files near 250–300 lines and
-functions near 40–60 lines are review triggers, not limits.
+Follow `.claude/rules/source-organization.md`:
+- Files: one responsibility per file, one business operation per file when operations evolve independently,
+  no catch-all `commands.go`/`queries.go`/`utils.go`. Files near 250–300 lines and functions near 40–60 lines
+  are review triggers, not limits.
+- Packages: group related files into cohesive packages (no flat directories of unrelated features, no package
+  per file). Children never import the parent; shared helpers never import features; no sideways imports.
+  Small exported APIs; keep public entry points stable via aliases/facades.
+- Comments only where the code cannot speak (invariants, transactions, concurrency, replay/schema, Kafka
+  offsets and idempotency, security, trade-offs, workarounds, non-obvious contracts); drop narration.
+- Readability: one field per line in multiline struct literals, readable long calls, guard clauses;
+  `gofmt` + `goimports -local keyloop-coding-challenge`.
 
 ## Package boundaries
 - `internal/domain/**`: no I/O, no SQL, no HTTP, no `time.Now()`. The business date is passed in by the caller.
 - `internal/domain/events` may import `internal/domain` only. `aggregates` imports `domain`, `events`, `package/eventsourcing`.
 - `internal/application` orchestrates (load → command → save, retries, business date). Infrastructure implements its interfaces.
-- `internal/presentation` → `internal/application` only. No domain logic in handlers or SQL.
+- `internal/presentation` → `internal/application` only. No domain logic in handlers or SQL. Layout: root
+  `router.go` composes `commands` (write endpoints), `queries` (read endpoints) and `probes` (healthz/readyz/
+  status) over the shared transport `httpkit`; `application_ports.go` keeps the public type names as aliases.
 - Add an interface only where there is a second implementation (real DB + test fake). No generic frameworks.
 
 ## Event Sourcing / CQRS here
