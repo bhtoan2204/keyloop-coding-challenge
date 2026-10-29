@@ -1,6 +1,6 @@
 # Design & Plan — Intelligent Inventory Dashboard (Scenario B, backend)
 
-Status: **Phase 2 (MySQL event store) implemented and verified on MySQL 8.4 — uncommitted, awaiting developer review (see `04-event-store.md` §8). Next: Phase 3 (application commands + write API).**
+Status: **Phase 3 (application command layer + REST write API) implemented and verified on MySQL 8.4 — uncommitted, awaiting developer review. Phases 1 (domain, `ac84073`) and 2 (MySQL event store, `82826e4`) are committed. Next: PostgreSQL read model + query API.**
 Target completion of all deliverables: **Wednesday 4 November 2026.**
 
 > Sources: `KeyloopCodingChallange.pdf` (Scenario B, Part 1/2, deliverables, evaluation framework) and the

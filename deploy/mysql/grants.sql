@@ -14,3 +14,6 @@ GRANT SELECT, INSERT ON `{{database}}`.`es_event` TO '{{app_user}}'@'%';
 
 GRANT SELECT, INSERT ON `{{database}}`.`es_aggregate_snapshot` TO '{{app_user}}'@'%';
 GRANT SELECT ON `{{database}}`.`es_schema_migrations` TO '{{app_user}}'@'%';
+
+-- Dealership reference data (read-only for the application).
+GRANT SELECT ON `{{database}}`.`dealership` TO '{{app_user}}'@'%';

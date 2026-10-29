@@ -31,11 +31,16 @@ func IsRetryable(err error) bool {
 	return errors.Is(err, ErrConcurrencyConflict) || errors.Is(err, ErrRetryable)
 }
 
+// IsUnavailable reports a database that is down or a connection that broke; see
+// repos.IsUnavailable.
+func IsUnavailable(err error) bool { return repos.IsUnavailable(err) }
+
 const defaultSnapshotInterval = 10
 
 type AggregateStore interface {
 	Get(ctx context.Context, aggregateID string, agg eventsourcing.Aggregate) error
 	Save(ctx context.Context, agg eventsourcing.Aggregate) error
+	SaveWithMetadata(ctx context.Context, agg eventsourcing.Aggregate, metadata map[string]interface{}) error
 }
 
 type aggregateStore struct {
@@ -94,6 +99,10 @@ func (as *aggregateStore) Get(ctx context.Context, aggregateID string, agg event
 }
 
 func (as *aggregateStore) Save(ctx context.Context, agg eventsourcing.Aggregate) error {
+	return as.SaveWithMetadata(ctx, agg, nil)
+}
+
+func (as *aggregateStore) SaveWithMetadata(ctx context.Context, agg eventsourcing.Aggregate, metadata map[string]interface{}) error {
 	if err := validateAggregate(agg); err != nil {
 		return err
 	}
@@ -109,6 +118,7 @@ func (as *aggregateStore) Save(ctx context.Context, agg eventsourcing.Aggregate)
 	events := root.CloneEvents()
 	for i := range events {
 		events[i].AggregateType = root.AggregateType()
+		events[i].Metadata = mergeMetadata(events[i].Metadata, metadata)
 	}
 	baseVersion := root.BaseVersion()
 	currentVersion := root.Version()
@@ -153,6 +163,31 @@ func (as *aggregateStore) replay(ctx context.Context, aggregateID string, from, 
 
 func (as *aggregateStore) shouldCreateSnapshot(baseVersion, currentVersion int) bool {
 	return as.snapshotInterval > 0 && currentVersion/as.snapshotInterval > baseVersion/as.snapshotInterval
+}
+
+// mergeMetadata returns a new map with the command metadata plus the event's own keys
+// (which win). The aggregate's pending events are not modified: Save works on clones.
+// Metadata that is not a map is left unchanged.
+func mergeMetadata(own interface{}, command map[string]interface{}) interface{} {
+	if len(command) == 0 {
+		return own
+	}
+	var eventKeys map[string]interface{}
+	switch m := own.(type) {
+	case nil:
+	case map[string]interface{}:
+		eventKeys = m
+	default:
+		return own
+	}
+	merged := make(map[string]interface{}, len(command)+len(eventKeys))
+	for k, v := range command {
+		merged[k] = v
+	}
+	for k, v := range eventKeys {
+		merged[k] = v
+	}
+	return merged
 }
 
 func validateAggregate(agg eventsourcing.Aggregate) error {

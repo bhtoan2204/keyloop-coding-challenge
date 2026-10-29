@@ -40,8 +40,16 @@ Tests: the existing tests stay as they are. MySQL/Postgres integration tests sit
 
 ## 2. Phases
 
-> **Actual sequencing (2026-10-29):** Phase 1 delivered the domain only (`ac84073`). The MySQL write side below was
-> delivered as Phase 2 (see `04-event-store.md` §8). Later phases shift by one number; dates unchanged.
+> **Actual sequencing (2026-10-29):**
+>
+> | Delivered as | Content | State |
+> |---|---|---|
+> | Phase 1 | Domain only | committed `ac84073` |
+> | Phase 2 | MySQL event store: migrations, OCC fix, error classes, grants (`04-event-store.md` §8) | committed `82826e4` |
+> | Phase 3 | Application command layer, REST write API, `cmd api|migrate`, dealership reference data, metadata (`06-api-contracts.md` "Phase 3") | uncommitted |
+> | Next | PostgreSQL read model + query endpoints, then CDC (Debezium/Kafka) | not started |
+>
+> Phase numbers below are the original plan. Dates are unchanged.
 
 ### Phase 1 — Write side on MySQL + domain · Thu 29 – Fri 30 Oct
 Scope (only what the brief's Phase 1 lists):

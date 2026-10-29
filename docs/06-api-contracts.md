@@ -115,3 +115,61 @@ All command endpoints may also return: `400 VALIDATION_ERROR`, `404 VEHICLE_NOT_
 ```
 
 Domain errors are typed sentinels in `domain`. They are mapped to HTTP **only** in the HTTP layer, through one table. Unexpected errors return `500` with no internal detail in the body. Full detail and the trace ID go to the log.
+
+## Phase 3 — write API as implemented (2026-10-29)
+
+Implemented in `internal/presentation` (stdlib `net/http` routing) on top of `internal/application/command`. Query endpoints (GET list, detail, history, summary) come with the PostgreSQL read model in the next phase.
+
+| Method & path | Success | Notes |
+|---|---|---|
+| `POST /v1/dealerships/{d}/vehicles` | `201`, `Location: /v1/dealerships/{d}/vehicles/{id}`, `ETag: "1"` | Body `{vehicle_id?, vin, make, model, model_year, stocked_on}`. `vehicle_id` is optional (UUIDv7 generated), 1–128 chars `[A-Za-z0-9._:@-]`. The `Location` target (GET) arrives with the read model. |
+| `POST …/vehicles/{v}/actions` | `201`, `Location: …/actions/{actionId}`, `ETag` | Body `{action_type, note}`. `action_id` is generated and returned in `current_action`. |
+| `PUT …/vehicles/{v}/actions/{actionId}` | `200` + `ETag` | Identical values are a no-op: `200`, same version, no event |
+| `POST …/vehicles/{v}/actions/{actionId}/cancel` | `200` + `ETag` | Body `{reason?}`. An empty body is allowed. |
+| `POST …/vehicles/{v}/sale` | `200` + `ETag` | Body `{sold_on}` |
+| `GET /healthz` / `GET /readyz` | `200` / `200` or `503` | Readiness pings MySQL (2 s timeout) and doesn't reveal why it failed. |
+
+### Response body
+
+Every command responds with the **committed write-side state** of the aggregate. It is built from the aggregate only after `SaveWithMetadata` returned without error, so a failed save never produces a success body. Fields:
+
+```
+vehicle_id, dealership_id, vin, make, model, model_year, stocked_on, status, sold_on|null,
+age_days, is_aging, current_action{action_id, action_type, note}|null, version, business_date
+```
+
+`age_days` and `is_aging` are derived at `business_date` (the dealership's date from its IANA zone) and never stored.
+
+Deviation from the read-model shape above: no `proposed_at`, `updated_at` or `updated_by` timestamps. The aggregate doesn't hold them; the read model will.
+
+### Request handling
+
+- **Bodies:** `Content-Type: application/json` is required (otherwise `415`). Bodies are capped at 64 KiB (`413`). Unknown fields are rejected, so a `dealership_id` in the body is a `400 INVALID_BODY`: the dealership always comes from the URL. Wrong types and trailing data are also rejected.
+- **`X-Actor-Id` is required on every command** (`400 ACTOR_REQUIRED` / `INVALID_ACTOR`). **It is an unauthenticated, demo-only identity:** it is recorded as `actor_id` in event metadata for audit and is never used for authorisation. Real authentication is out of scope.
+- **`X-Request-Id`:** a valid inbound value is kept, otherwise a UUIDv7 is generated. It is echoed in the response, used as `correlation_id` in event metadata, and included in problem bodies and logs. A valid W3C `traceparent` is stored in metadata too.
+- **`If-Match: "<version>"`** (strong ETag only; `W/` → `400 INVALID_IF_MATCH`). A mismatch returns `412 VERSION_MISMATCH` and is never retried with a newer version.
+
+### Error codes added by the implementation
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `ACTOR_REQUIRED`, `INVALID_ACTOR`, `INVALID_BODY`, `INVALID_IF_MATCH`, `VALIDATION_ERROR` (with `errors[{field,message}]`) | request problems |
+| 404 | `DEALERSHIP_NOT_FOUND`, `VEHICLE_NOT_FOUND`, `NOT_FOUND` | `VEHICLE_NOT_FOUND` also covers a vehicle of another dealership (no cross-tenant probing) |
+| 409 | `VEHICLE_ALREADY_EXISTS`, `VEHICLE_NOT_IN_STOCK`, `VEHICLE_ALREADY_SOLD`, `VEHICLE_NOT_AGING`, `ACTION_ALREADY_ACTIVE`, `ACTION_NOT_ACTIVE` | domain rules |
+| 409 | `CONCURRENCY_CONFLICT` | optimistic conflicts on all 3 attempts |
+| 412 | `VERSION_MISMATCH` | stale `If-Match` |
+| 413 / 415 | `BODY_TOO_LARGE` / `UNSUPPORTED_MEDIA_TYPE` | |
+| 503 | `UNAVAILABLE` + `Retry-After: 1` | database unreachable or connection lost, lock wait timeouts or deadlocks on every attempt, deadline exceeded. **Outcome unknown:** check the vehicle's version before retrying. |
+| 500 | `INTERNAL` | anything else, with a generic detail. The full error goes only to the log. |
+
+### Retries and idempotency
+
+- **Server-side retry:** on an optimistic conflict, deadlock or lock wait timeout, the command service reloads the vehicle and re-runs the command on the fresh state. That's at most 3 attempts, stopping on context cancellation. The domain rule therefore decides the outcome: concurrent proposals give one `201` and `409 ACTION_ALREADY_ACTIVE` for the rest.
+- **Never retried:** domain rejections, `If-Match` requests, and connection failures, where the commit may or may not have happened.
+- **Limitation, no `Idempotency-Key` yet:** a client that retries after a timeout or a `503` may repeat a command that did commit. Some repeats are caught by domain rules:
+  - stock with the same `vehicle_id` → 409;
+  - propose again → 409;
+  - sell again → 409;
+  - identical revise → no-op.
+
+  But a non-identical revise, or a cancel then re-propose, could apply twice. Clients should send `If-Match` (or re-read the vehicle) before retrying.

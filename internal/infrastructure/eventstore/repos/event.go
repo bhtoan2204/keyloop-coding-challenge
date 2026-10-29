@@ -50,8 +50,8 @@ func (r *eventRepo) Get(ctx context.Context, aggregateID string, fromVersion, to
 			&evt.SchemaVersion, &data, &metadata, &evt.CreatedAt); err != nil {
 			return err
 		}
-		// Rows written before migration 2 are backfilled; an empty type is tolerated
-		// for rows appended directly through the repository without one.
+		// Append requires a type and migration 2 backfilled older rows; an empty type can
+		// only remain on a legacy row whose es_aggregate row is missing, and is tolerated.
 		if evt.AggregateType != "" && evt.AggregateType != root.AggregateType() {
 			return fmt.Errorf("%w: event %d of aggregate %s has type %s, expected %s",
 				ErrAggregateTypeMismatch, evt.ID, aggregateID, evt.AggregateType, root.AggregateType())

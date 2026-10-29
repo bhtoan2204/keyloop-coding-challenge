@@ -1,8 +1,11 @@
 package repos
 
 import (
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/go-sql-driver/mysql"
@@ -66,4 +69,13 @@ func classifyTxError(err error) error {
 		return fmt.Errorf("%w: %w", ErrRetryable, err)
 	}
 	return err
+}
+
+// IsUnavailable reports errors that mean the database could not be reached or the
+// connection broke mid-request. When it happens around COMMIT the outcome is unknown,
+// so callers must not retry automatically.
+func IsUnavailable(err error) bool {
+	var netErr net.Error
+	return errors.Is(err, driver.ErrBadConn) || errors.Is(err, mysql.ErrInvalidConn) ||
+		errors.Is(err, sql.ErrConnDone) || errors.As(err, &netErr)
 }

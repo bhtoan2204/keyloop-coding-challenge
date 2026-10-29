@@ -158,7 +158,7 @@ func TestMigrateFreshDatabase(t *testing.T) {
 	if err := repos.Migrate(db); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
-	if got := appliedVersions(t, db); !reflect.DeepEqual(got, []int{1, 2}) {
+	if got := appliedVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3}) {
 		t.Fatalf("applied versions %v", got)
 	}
 	_, _, store := newStoreFor(t, db, 0)
@@ -178,7 +178,7 @@ func TestMigrateUpgradesOriginalSchemaWithExistingEvents(t *testing.T) {
 	if err := repos.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := appliedVersions(t, db); !reflect.DeepEqual(got, []int{1, 2}) {
+	if got := appliedVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3}) {
 		t.Fatalf("applied versions %v", got)
 	}
 	want := []streamColumns{{1, "qtyAggregate", 1}, {2, "qtyAggregate", 1}}
@@ -216,7 +216,7 @@ func TestMigrateResumesAfterPartialRun(t *testing.T) {
 	if err := repos.Migrate(db); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	if got := appliedVersions(t, db); !reflect.DeepEqual(got, []int{1, 2}) {
+	if got := appliedVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3}) {
 		t.Fatalf("applied versions %v", got)
 	}
 	want := []streamColumns{{1, "qtyAggregate", 1}, {2, "qtyAggregate", 1}}
@@ -252,7 +252,7 @@ func TestMigrateConcurrentCallers(t *testing.T) {
 			t.Fatalf("migrator %d: %v", i, err)
 		}
 	}
-	if got := appliedVersions(t, db); !reflect.DeepEqual(got, []int{1, 2}) {
+	if got := appliedVersions(t, db); !reflect.DeepEqual(got, []int{1, 2, 3}) {
 		t.Fatalf("applied versions %v", got)
 	}
 }

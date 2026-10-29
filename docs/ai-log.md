@@ -66,3 +66,25 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
     - the `IsRetryable` comment was inconsistent → reworded.
   - **Documented:** the new locking order, the backfill as a one-off history edit, and the missing snapshot format version.
   - **Not changed:** the 1213 mapping, because a real 1213 was observed in this session.
+
+## 2026-10-29 — Phase 3: application command layer + REST write API
+
+- **Delegated:** command handlers for the five commands, the REST write API, metadata persistence, dealership business date and ownership, bounded retries, `cmd api|migrate`, tests. The developer specified the scope and constraints in detail and said not to re-run the planning skill.
+- **Design choices made by the AI (small, framework preserved):**
+  - `AggregateStore.SaveWithMetadata` merges command metadata into the *cloned* events at save time, the same place Phase 2 stamps `aggregate_type`. `Save` delegates to it with `nil`, and domain methods stay unchanged.
+  - `repos.Migrate` version 3 adds the seeded `dealership` reference table, read by a new small `internal/infrastructure/referencedata` package.
+  - The command service retries only on `IsRetryable`, reloading and re-running the command, with at most 3 attempts.
+  - `IsUnavailable` maps connection failures to `503`, and they are never retried.
+- **AI mistakes caught during the phase:**
+  - (1) A placeholder `sql_ErrNoRows` was left in the dealership directory; vet caught it.
+  - (2) A `BaseContext` set-then-cleared block with a wrong signature was written in `cmd/main.go`; it was removed before the first build.
+  - (3) The metadata test first asserted `nil` metadata, but `ApplyChange` stores a typed nil map; the assertion was corrected to "unchanged from before the save".
+  - (4) An HTTP test built a request body by slicing another string, which produced invalid JSON; replaced with an explicit body.
+  - (5) Two mutants first failed to build (unused import) and were redone as compiling mutants.
+- **Verified (this session, MySQL 8.4.13):**
+  - `make check` passes.
+  - `make test-integration` passes 84 top-level tests across 8 packages, with 0 failures or skips. The integration suite also passes under `-race`.
+  - The 15 required MySQL cases run over HTTP with the API connected as the restricted user from `grants.sql`. Concurrent proposals, 5 rounds × 16 requests, gave exactly 1 × `201` and 15 × `409 ACTION_ALREADY_ACTIVE` per round. With a held row lock the API returns `503` and writes no event.
+  - **Runtime:** `make migrate` and `make mysql-grants` worked against the Compose database (closing Phase 2's unverified item). The built binary served the documented cURL calls (201/200/409/412/404/400 with `ETag`, `Location`, `X-Request-Id`, problem+json) and shut down gracefully on SIGTERM.
+  - **Mutation checks:** 7 valid mutants were caught. Removing the `If-Match` short-circuit after a conflict was an *equivalent* mutant (the reload re-check still returns 412), so it isn't a test gap.
+- **Not verified:** behaviour under a real network partition mid-COMMIT (only simulated with `driver.ErrBadConn`), and the HTTP server under load beyond the concurrency tests.

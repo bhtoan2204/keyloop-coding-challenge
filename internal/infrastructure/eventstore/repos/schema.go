@@ -23,6 +23,7 @@ type migration struct {
 var migrations = []migration{
 	{1, "event store tables", applyBaseSchema},
 	{2, "es_event aggregate_type and schema_version", addEventStreamColumns},
+	{3, "dealership reference data", addDealershipReferenceData},
 }
 
 // Migrate brings the event-store schema up to date. A database created by the original
@@ -133,6 +134,40 @@ func addEventStreamColumns(db *gorm.DB) error {
 		SET aggregate_type = (SELECT a.aggregate_type FROM es_aggregate a WHERE a.id = es_event.aggregate_id)
 		WHERE aggregate_type = ''
 			AND EXISTS (SELECT 1 FROM es_aggregate a WHERE a.id = es_event.aggregate_id)`).Error
+}
+
+// addDealershipReferenceData creates the dealership reference table the write side
+// reads (time zone for the business date, ownership checks) and seeds the demo
+// dealerships. Dealership master data is owned elsewhere; this is a read-only copy.
+// Seeding is idempotent and never overwrites an existing row.
+func addDealershipReferenceData(db *gorm.DB) error {
+	ddl := `CREATE TABLE IF NOT EXISTS dealership (
+		dealership_id TEXT NOT NULL PRIMARY KEY,
+		name TEXT NOT NULL,
+		timezone TEXT NOT NULL
+	)`
+	seed := `INSERT OR IGNORE INTO dealership(dealership_id, name, timezone) VALUES (?, ?, ?)`
+	if isMySQL(db) {
+		ddl = `CREATE TABLE IF NOT EXISTS dealership (
+			dealership_id VARCHAR(64) NOT NULL PRIMARY KEY,
+			name VARCHAR(255) NOT NULL,
+			timezone VARCHAR(64) NOT NULL
+		)`
+		seed = `INSERT INTO dealership(dealership_id, name, timezone) VALUES (?, ?, ?)
+			ON DUPLICATE KEY UPDATE dealership_id = dealership_id`
+	}
+	if err := db.Exec(ddl).Error; err != nil {
+		return err
+	}
+	for _, d := range [][3]string{
+		{"d-001", "Keyloop Motors London", "Europe/London"},
+		{"d-002", "Keyloop Motors Sydney", "Australia/Sydney"},
+	} {
+		if err := db.Exec(seed, d[0], d[1], d[2]).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func columnExists(db *gorm.DB, table, column string) (bool, error) {

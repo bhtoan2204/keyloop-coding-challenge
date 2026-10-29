@@ -6,7 +6,7 @@ COMPOSE ?= docker compose
 MYSQL_DATABASE ?= inventory
 MYSQL_APP_USER ?= inventory_app
 
-.PHONY: fmt-check vet test test-race test-integration check mysql-up mysql-wait mysql-down mysql-grants
+.PHONY: fmt-check vet test test-race test-integration check build migrate run-api mysql-up mysql-wait mysql-down mysql-grants
 
 fmt-check:
 	@test -z "$$(gofmt -l .)" || { gofmt -l .; echo "gofmt needed"; exit 1; }
@@ -24,9 +24,20 @@ test-race:
 ## Runs the MySQL-backed tests. Needs a running MySQL (make mysql-up) and MYSQL_TEST_DSN.
 ## The tests fail (never skip) when MYSQL_TEST_DSN is missing.
 test-integration:
-	go test -tags integration -count=1 -v ./internal/infrastructure/eventstore/...
+	go test -tags integration -count=1 -v ./...
 
 check: fmt-check vet test test-race
+
+build:
+	go build -o bin/inventory ./cmd
+
+## Applies migrations with the admin account (MYSQL_MIGRATE_DSN or root + MYSQL_ROOT_PASSWORD).
+migrate:
+	go run ./cmd migrate
+
+## Serves the write API as the restricted app user (MYSQL_DSN or MYSQL_APP_USER/MYSQL_APP_PASSWORD).
+run-api:
+	go run ./cmd api
 
 mysql-up:
 	$(COMPOSE) up -d mysql

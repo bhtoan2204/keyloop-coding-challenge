@@ -89,6 +89,7 @@ Load (`AggregateStore.Get`): `FindAggregate` (version + type check) → optional
 - Each applied version is recorded in `es_schema_migrations(version, name, applied_at)`.
 - **Version 1** is the original `CREATE TABLE IF NOT EXISTS` DDL, unchanged. A database created by the old unversioned `Migrate` is therefore adopted without error.
 - **Version 2** is the columns above.
+- **Version 3** (Phase 3) is the `dealership(dealership_id, name, timezone)` reference table, seeded idempotently with `d-001` (Europe/London) and `d-002` (Australia/Sydney). The application user only has `SELECT` on it.
 - **Partial runs:** MySQL DDL is not transactional, so each step is idempotent. A column is added only if `information_schema.COLUMNS` (or SQLite's `pragma_table_info`) shows it missing, and the backfill only touches rows `WHERE aggregate_type = ''`. A run that stopped after the first `ALTER` completes on the next run (tested).
 - **Concurrent migrators:** on MySQL they are serialised with `GET_LOCK(CONCAT('es_migrate:', MD5(DATABASE())))` on one pinned connection (`db.Connection`). The name is hashed because lock names are limited to 64 characters. Tested with 4 parallel callers.
 - **Newer schema:** if `es_schema_migrations` holds a version above the newest this build knows, `Migrate` fails, so an older release doesn't run against a schema it doesn't understand (tested).
@@ -134,12 +135,13 @@ OCC is unchanged: **CAS on `es_aggregate.version` inside the save transaction**,
 | domain rule violation | domain errors, raised before Save | no |
 
 - 1205 is **verified with a real lock wait**. An admin transaction holds `SELECT … FOR UPDATE` and the store uses `innodb_lock_wait_timeout=1`. The failed save keeps its pending events, and the **same** save succeeds after the lock is released, since nothing was persisted.
-- **The store never retries.** Re-saving stale pending events would be wrong. The application layer (Phase 3) must reload the aggregate, re-run the command against fresh state, and save, with a bounded retry count.
+- **The store never retries.** Re-saving stale pending events would be wrong. `internal/application/command.Service.execute` (Phase 3) reloads the aggregate, re-runs the command against fresh state and saves, with at most 3 attempts. It never retries with `If-Match`, on domain errors, or on `IsUnavailable` errors.
+- **Metadata (Phase 3):** `AggregateStore.SaveWithMetadata(ctx, agg, md)` merges command metadata (`actor_id`, `correlation_id`, `traceparent`) into the cloned events at save time. Keys an event already carries win, the aggregate's pending events are never modified, and `Save` is `SaveWithMetadata(…, nil)`.
 - **Duplicate detection** checks the typed MySQL error number first, then the gorm sentinel, then a text match. The text match is kept for SQLite, which would otherwise require importing the cgo driver into production code.
 
 | Scenario | Behaviour |
 |---|---|
-| Two managers propose concurrently | Loser gets `ErrConcurrencyConflict`. The Phase 3 handler reloads, re-runs, sees the active action, and returns `409 ACTION_ALREADY_ACTIVE`. |
+| Two managers propose concurrently | Loser gets `ErrConcurrencyConflict`. `command.Service` (Phase 3) reloads, re-runs, sees the active action, and returns `409 ACTION_ALREADY_ACTIVE`. Verified over HTTP on MySQL: 5 rounds × 16 requests give 1 × 201 and 15 × 409 each round. |
 | Two revisions with `If-Match` | Handler compares versions before the command and returns `412` |
 | Retry without an idempotency key | Caught by domain rules (04 §6 for the optional key store) |
 | MySQL down / connection lost | Non-retryable infrastructure error. The transaction guarantees no partial state. |

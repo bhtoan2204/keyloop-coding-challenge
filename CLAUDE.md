@@ -27,8 +27,13 @@ Implemented and tested:
 - `internal/domain`: `VehicleInventoryAggregate` (state, commands Stock/ProposeAction/ReviseAction/
   CancelAction/Sell, appliers, snapshot JSON), typed events, `Date`, `AgeInDays`, `IsAging`, domain errors.
 
-Not implemented yet: `internal/application/{command,query,messaging}` (incl. the reload-and-retry loop),
-`internal/presentation`, Postgres `viewstore`, projector, Kafka/Debezium, `cmd/main.go` subcommands, `Dockerfile`.
+- `internal/application/command`: command service (load → dealership ownership → If-Match → domain command at the
+  dealership business date → `SaveWithMetadata`; reload-and-retry ≤ 3 on `IsRetryable`). `internal/presentation`:
+  REST write API (5 commands, problem+json, `/healthz`, `/readyz`). `internal/infrastructure/referencedata`:
+  dealership time zones (migration v3). `cmd/main.go api|migrate` (`make migrate`, `make run-api`).
+
+Not implemented yet: `internal/application/{query,messaging}`, query endpoints, Postgres `viewstore`, projector,
+Kafka/Debezium, `Dockerfile`, Idempotency-Key.
 `docker-compose.yaml` has MySQL only. `.env` is git-ignored; copy `.env.example`.
 
 ## Reuse map (extend these; do not build parallel versions)

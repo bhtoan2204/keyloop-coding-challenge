@@ -2,8 +2,11 @@ package repos
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"net"
 	"testing"
 
 	"github.com/go-sql-driver/mysql"
@@ -56,6 +59,26 @@ func TestIsDuplicateKey(t *testing.T) {
 	for name, tc := range cases {
 		if got := isDuplicateKey(tc.err); got != tc.want {
 			t.Errorf("%s: got %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestIsUnavailable(t *testing.T) {
+	cases := map[string]struct {
+		err  error
+		want bool
+	}{
+		"bad conn":        {fmt.Errorf("x: %w", driver.ErrBadConn), true},
+		"invalid conn":    {fmt.Errorf("x: %w", mysql.ErrInvalidConn), true},
+		"conn done":       {fmt.Errorf("x: %w", sql.ErrConnDone), true},
+		"dial refused":    {fmt.Errorf("x: %w", &net.OpError{Op: "dial", Err: errors.New("connection refused")}), true},
+		"conflict":        {ErrConcurrencyConflict, false},
+		"duplicate entry": {&mysql.MySQLError{Number: mysqlDuplicateEntry}, false},
+		"nil":             {nil, false},
+	}
+	for name, tc := range cases {
+		if got := IsUnavailable(tc.err); got != tc.want {
+			t.Errorf("%s: got %v", name, got)
 		}
 	}
 }
