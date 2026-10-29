@@ -103,3 +103,53 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
     - nil readiness check, `Unwrap`, empty field name.
   - **Documented, not changed:** 404 vs 405, the chunked empty body, a panic after headers, demo seed rows in the migration, and the stock-retry advice (send `vehicle_id`).
 - **After the fixes:** `make check` passes. `make test-integration` passes 86 top-level tests with 0 failures or skips. The integration suite passes under `-race`. The rebuilt binary served the commands and shut down cleanly. In that smoke run **the AI's own expected values were wrong**: it assumed a Sydney date of 10-30 from the test clock, but the real clock gave 10-29, so the `409` (exactly 90 days) was correct behaviour.
+
+## 2026-10-29 — Phase 4: PostgreSQL read model, projections, query API
+
+- **Delegated:** the PostgreSQL read model, a transactional `VehicleProjector` on the existing projection/viewstore packages, a MySQL → PostgreSQL rebuild, query services, four GET endpoints, tests, and an end-to-end demo.
+- **Discrepancy reported, not papered over:** the brief said "Phase 3.5: source organization refactor" was complete and referenced `.claude/rules/source-organization.md`. Neither exists on `main`, `origin/main` (`354f015`), any branch, or the stash. Following the brief's own instruction to use the **actual** HEAD, Phase 4 was built on `354f015`, with query code in separate cohesive files.
+- **Environment blocker:** `docker pull postgres:17` and the Go module proxy both failed with "x509: certificate signed by unknown authority". The AI stopped and reported it. The developer fixed the TLS issue, then the work resumed.
+- **Design decisions made by the AI:**
+  - GORM's PostgreSQL driver, so there is no second access abstraction.
+  - A per-aggregate `pg_advisory_xact_lock`, so the first event of an unseen vehicle is serialised.
+  - Separate `projection_aggregate` bookkeeping.
+  - A pipeline that runs sequentially, which removed `errgroup` and the `golang.org/x/sync` dependency.
+  - Sync and rebuild read the whole history from one MySQL consistent snapshot ordered by `(aggregate_id, version)`, with no `es_event.id` cursor carried between runs.
+  - A shared/exclusive projection lock between appliers and runs.
+- **AI mistakes caught and corrected:**
+  - (1) A placeholder type `*timeLocation` and a duplicated sort branch in the query service; caught by vet and review.
+  - (2) **Scalability bug in the AI's own first design:** a rebuild in one transaction would have taken one advisory lock per vehicle, which exhausts PostgreSQL's shared lock table, plus a GORM savepoint per event. It was caught before testing and redesigned to the exclusive run lock, with no per-aggregate locks or savepoints inside a run.
+  - (3) The `Rebuild` comment claimed readers "see the old model"; in fact `TRUNCATE` makes them wait. Corrected.
+  - (4) The explain-plan seed violated the table's own `CHECK` (SOLD without `sold_on`); seed fixed.
+  - (5) **Real bootstrap bug found by the live demo:** `openPostgres` defaulted the *reader* connection to the *owner's* user name, so the API failed SASL auth when `POSTGRES_READER_USER` was unset. Fixed with a per-role default.
+  - (6) A first live-demo script stalled; it was not root-caused. It was re-run step by step with per-command timeouts and `make … < /dev/null`, and completed.
+  - (7) **Two weak tests found by mutation checks:**
+    - removing the `vehicle_id` tie-breaker from `ORDER BY` survived, because the index scan happened to return ties in `vehicle_id` order;
+    - removing the run lock made the test hang instead of fail.
+
+    Fixes: the paging test now also runs on a connection with index scans disabled, and the concurrent-run test has a 5 s deadline. Both mutants are now caught.
+  - (8) A `pkill -f` pattern matched the AI's own shell and killed it, so the edits did not apply; re-applied without `pkill`. A throwaway test database left by the hung mutant was dropped.
+- **Verified (this session):**
+  - `gofmt` clean.
+  - `make check` passes (9 packages, normal and race).
+  - `make test-integration` passes 111 top-level tests on MySQL 8.4.13 + PostgreSQL 17.11, with 0 failures or skips. The integration suite also passes under `-race`.
+  - Mutation checks: 9 valid mutants caught.
+  - **Live demo** on the Compose databases with the built binary:
+    - stock via API → event in MySQL;
+    - 404 on the read side before the rebuild;
+    - `make rebuild-projections` → `age_days` 120, `is_aging` true;
+    - propose → read model unchanged before the sync (version 1, no action);
+    - `make sync-projections` (read 9, applied 1) → current action, history with actor and correlation ID, summary;
+    - restart MySQL, PostgreSQL and the API → state persisted.
+
+    `make migrate` and `make pg-grants` worked, and the API ran as the read-only role.
+- **Not verified:** sync/rebuild duration on large histories (O(total events) per run), and query performance beyond the 5,000-row explain test.
+- **Independent review** (read-only `event-sourcing-reviewer` subagent; it could run only the non-database tests): no Critical findings. It independently confirmed the gap-free argument for the snapshot sync. **Accepted and fixed:**
+  - **Major:** all Phase 4 logic was tested only under `-tags integration`, so `make test` could not catch, for example, an off-by-one aging cutoff or an ignored cursor fingerprint. Added default-suite unit tests for `ProjectVehicle`, `query.Service` (fake read model) and `listVehiclesSQL`. Mutation checks confirmed both examples now fail in plain `go test`.
+  - **Minor:**
+    - `ReadAll` could skip `ROLLBACK` on a cancelled ctx and pool a connection still inside the snapshot → now rolls back with `context.WithoutCancel`;
+    - the schema-version guard used `>` → now anything other than 0/1 is rejected;
+    - an unknown event on a sold vehicle was reported as "inconsistent" → the type is checked first;
+    - EXPLAIN coverage now includes the age filters and `aging=true`;
+    - **a new test covers the shared/exclusive lock between appliers and runs.** Removing the shared lock was undetected before, and is now caught by mutation check.
+  - **Documented as accepted limitations** (docs/05 §6.7, docs/06): sort semantics for SOLD/ALL, the read-model ETag, rebuild blocking queries, one bad event halting a run, duplicated dealership data, a sync not detecting a read model ahead of MySQL, `as_of` semantics, and the Phase 5 batching hazard.

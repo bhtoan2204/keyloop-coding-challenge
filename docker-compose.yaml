@@ -1,5 +1,5 @@
-# Local infrastructure. Phase 2: MySQL event store only; Debezium, Kafka and Postgres
-# are added in later phases. Configuration comes from .env (see .env.example).
+# Local infrastructure: MySQL event store (write side) and PostgreSQL read model.
+# Debezium and Kafka are added in Phase 5. Configuration comes from .env (see .env.example).
 name: keyloop
 
 services:
@@ -25,5 +25,22 @@ services:
       timeout: 3s
       retries: 40
 
+  postgres:
+    image: docker.io/library/postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-inventory}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-inventory_read}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
 volumes:
   mysql-data:
+  postgres-data:

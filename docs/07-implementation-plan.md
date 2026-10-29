@@ -47,7 +47,9 @@ Tests: the existing tests stay as they are. MySQL/Postgres integration tests sit
 > | Phase 1 | Domain only | committed `ac84073` |
 > | Phase 2 | MySQL event store: migrations, OCC fix, error classes, grants (`04-event-store.md` §8) | committed `82826e4` |
 > | Phase 3 | Application command layer, REST write API, `cmd api|migrate`, dealership reference data, metadata (`06-api-contracts.md` "Phase 3") | uncommitted |
-> | Next | PostgreSQL read model + query endpoints, then CDC (Debezium/Kafka) | not started |
+> | Phase 3 | committed `ba964e7`, review fixes `354f015` | committed |
+> | Phase 4 | PostgreSQL read model, projections, sync/rebuild, query API (`05` §6, `06` "Phase 4") | uncommitted |
+> | Next (Phase 5) | Debezium/Kafka live projection | not started |
 >
 > Phase numbers below are the original plan. Dates are unchanged.
 

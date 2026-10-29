@@ -32,8 +32,12 @@ Implemented and tested:
   REST write API (5 commands, problem+json, `/healthz`, `/readyz`). `internal/infrastructure/referencedata`:
   dealership time zones (migration v3). `cmd/main.go api|migrate` (`make migrate`, `make run-api`).
 
-Not implemented yet: `internal/application/{query,messaging}`, query endpoints, Postgres `viewstore`, projector,
-Kafka/Debezium, `Dockerfile`, Idempotency-Key.
+- Read side (Phase 4): `internal/infrastructure/viewstore` (PostgreSQL 17 read model + migrations),
+  `internal/infrastructure/projection` (`Projection.Apply`, `VehicleProjector`, `Runner` sync/rebuild from one
+  consistent MySQL snapshot via `repos.EventStore.ReadAll`), `internal/application/query`, `presentation/queries.go`
+  (4 GET endpoints). `cmd`: `sync-projections`, `rebuild-projections`. **Not real-time until Phase 5.**
+
+Not implemented yet: `internal/application/messaging` (Kafka consumer), Debezium/Kafka, `Dockerfile`, Idempotency-Key.
 `docker-compose.yaml` has MySQL only. `.env` is git-ignored; copy `.env.example`.
 
 ## Reuse map (extend these; do not build parallel versions)
@@ -77,7 +81,9 @@ gofmt -l .                     # must print nothing
 go vet ./...
 go test -count=1 ./...         # unit + SQLite-backed store tests (needs cgo for go-sqlite3)
 go test -race -count=1 ./...
-make mysql-up && make test-integration   # real MySQL 8.4; needs MYSQL_TEST_DSN (admin DSN, no db name)
+make up && make test-integration          # real MySQL 8.4 + PostgreSQL 17; needs MYSQL_TEST_DSN and PG_TEST_DSN
+make migrate && make mysql-grants && make pg-grants && make run-api   # local API
+make sync-projections                     # refresh the read model (Phase 4: manual, point in time)
 make check                                # fmt-check, vet (incl. -tags integration), test, test-race
 ```
 Integration tests fail (never skip) without `MYSQL_TEST_DSN`. The dev machine uses rootless Podman

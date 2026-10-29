@@ -213,3 +213,98 @@ sequenceDiagram
 - **Read side:** **eventually consistent** and **monotonic per aggregate** (the version check means a row never moves backwards). There is no cross-aggregate snapshot consistency. Lag is exposed by `projection_lag_seconds` and the per-vehicle `version`.
 - **Read-your-writes:** the client compares the `version` in the command response with the `version` on reads.
 - **Aging** depends only on the immutable `stocked_on` and the request's business date, so it is never stale because of lag.
+
+## 6. Phase 4 — as implemented (2026-10-29)
+
+**Status:** implemented and verified on PostgreSQL 17.11 + MySQL 8.4.13. **The read model is not real-time in Phase 4.** It changes only when `sync-projections` or `rebuild-projections` runs. Live delivery via Debezium/Kafka is Phase 5 and will reuse the same `Projection.Apply`.
+
+### 6.1 Driver and packages
+- **Driver: GORM + `gorm.io/driver/postgres`** (pgx v5 underneath). The write side already uses GORM with raw SQL and `WithTransaction`; using pgx directly would add a second access abstraction for the same concern.
+- **Packages:**
+
+  | Package | Holds |
+  |---|---|
+  | `internal/infrastructure/viewstore` | schema and migrations, `ViewStore` write port, `Postgres` (writes + read queries) |
+  | `internal/infrastructure/projection` | `Projection` pipeline, `Runner` |
+  | `projection/projectors` | `VehicleProjector`, whose state transition `ProjectVehicle` is a pure function |
+  | `internal/application/query` | query service and `ReadModel` port |
+  | `internal/presentation/queries.go` | handlers and DTOs |
+  | `cmd/readmodel.go` | projection commands and PG configuration |
+
+### 6.2 Schema (deviations from §1)
+- **IDs:** `vehicle_id TEXT`, because aggregate IDs are any client-safe string, not only UUIDs. `event_id` / `last_event_id` are `es_event.id` (BIGINT).
+- **History:** `vehicle_action_history` has PRIMARY KEY `(vehicle_id, version)` and also stores `correlation_id`.
+- **Applied versions:** kept in their own table, `projection_aggregate(aggregate_id, version, last_event_id)`, rather than only on `inventory_vehicle`. The pipeline owns the version check independently of any projector.
+- **No `projection_checkpoint`:** there are no Kafka offsets yet. Instead `projection_run` records each sync/rebuild (kind, start/finish, events read and applied).
+- **Integrity:** `CHECK ((status = 'SOLD') = (sold_on IS NOT NULL))`. Dealership reference data is seeded (`d-001` Europe/London, `d-002` Australia/Sydney), with an FK from `inventory_vehicle`.
+- **No `is_aging` or `days_in_stock` column.**
+- **Migrations:** versioned in `rm_schema_migrations`. Each version applies in one transaction (PostgreSQL DDL is transactional) under `pg_advisory_xact_lock`. A schema newer than the build is refused.
+
+### 6.3 Projection correctness
+
+`Projection.Apply(ev)` runs in one transaction:
+1. **Lock:** take `pg_advisory_xact_lock_shared(projection)`, then `pg_advisory_xact_lock(aggregate)` on `hashtext(aggregate_id)`. A `SELECT … FOR UPDATE` cannot lock a row that does not exist yet; the advisory lock serialises even the **first** event of an unseen vehicle.
+2. **Version check:** read the applied version (0 if none). If `version ≤ applied`, it's a duplicate and is skipped (`applied=false`). If `version ≠ applied+1`, return `ErrVersionGap`; this also covers a stream that doesn't start at 1.
+3. **Schema version:** an unknown schema version gives `ErrUnsupportedSchemaVersion`.
+4. **Projectors:** they run **sequentially** on the transaction-bound store. The old `errgroup` branch was removed, so no transaction is shared concurrently; the `golang.org/x/sync` dependency dropped out.
+   - An unknown payload gives `ErrUnsupportedEvent`.
+   - An event that doesn't fit the state (e.g. a revision of a non-active action) gives `ErrInconsistent`.
+5. **Commit:** `SetAppliedVersion` writes the new version. State, history and applied version commit together; any error rolls back the whole event.
+
+### 6.4 Sync and rebuild (Phase 4 synchronisation boundary)
+
+`main sync-projections` / `main rebuild-projections` (`make sync-projections`, `make rebuild-projections`):
+
+1. **Run lock:** take a PostgreSQL transaction and `pg_try_advisory_xact_lock(projection)` **exclusively**. If any run or applier holds the lock, the command fails with `ErrRunInProgress`.
+2. **Rebuild only:** `TRUNCATE` the projected tables in that transaction.
+3. **Read:** `repos.EventStore.ReadAll` streams **the entire history** inside ONE MySQL `START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY`, ordered by `(aggregate_id, version)` (keyset batches of 500 on the unique index).
+4. **Apply** each event through the same `Projection.Apply`. Duplicates are skipped, so a sync applies only what is new.
+5. **Record** the run in `projection_run` and commit. A failure anywhere rolls back everything, so the old read model stays intact.
+
+**Why this is gap-free without a write pause:**
+- No `es_event.id` cursor carries over between runs. Every run reads the full committed history as of its snapshot, so an event whose `AUTO_INCREMENT` id was allocated earlier but committed later can never be "behind the cursor".
+- Within the snapshot, each stream is a contiguous prefix `1..n`, because writers of one aggregate are serialised by the `es_aggregate` CAS (Phase 2).
+- Events committed after the snapshot are simply picked up by the next run.
+- Verified: `TestMySQLReadAllUsesOneConsistentSnapshot` commits new events *during* a `ReadAll`, and they are not seen.
+
+**What this is not:**
+- It is not real-time and not incremental at the source: each run re-reads the whole history (O(total events)). That is fine at demo scale, and is replaced by CDC in Phase 5.
+
+**Locking and scale:**
+- Inside a run the exclusive lock already excludes every other applier. Per-aggregate advisory locks and savepoints are therefore skipped (`exclusive` mode). Thousands of transaction-scoped advisory locks would otherwise exhaust PostgreSQL's shared lock table.
+- `TRUNCATE` takes an exclusive table lock, so queries wait during a rebuild and never see a partial read model.
+
+### 6.5 Queries (`internal/application/query` + `viewstore/queries.go`)
+- **Business date:** today in the dealership's IANA zone (from the PG `dealership` table; the read side never reads MySQL), or `as_of`.
+- **Ages are computed in Go** with the domain rule: `age_days`, and `is_aging = IN_STOCK ∧ age > 90`. A sold vehicle's age is `sold_on − stocked_on`.
+- **Filters are sargable:**
+  - `min_age_days` → `stocked_on <= bd − min`;
+  - `max_age_days` → `stocked_on >= bd − max`;
+  - `aging=true` → `status = 'IN_STOCK' AND stocked_on <= bd − 91`;
+  - sold rows in an age filter use `sold_on − stocked_on`, only in the SOLD branch.
+- **SQL text is fixed:** user input only selects among fixed predicates and two fixed `ORDER BY` clauses. Every value is a bound parameter.
+- **Keyset pagination:**
+  - order `(stocked_on, vehicle_id)` ASC for `age_desc` (oldest first, default), DESC for `age_asc`;
+  - row-comparison predicate, limit default 20, max 100, `limit+1` fetched for `has_more`;
+  - the cursor is base64url JSON `{v, s, a(as_of), f(filter fingerprint), k1, k2}`;
+  - a cursor with other filters, another sort or another `as_of` → `400 INVALID_CURSOR`;
+  - the cursor pins `as_of`, so paging across a dealership-local midnight stays consistent;
+  - the cursor is not signed: it only selects rows the caller could request directly.
+- **Indexes** were verified by `EXPLAIN` on 5,000 rows: the default, aging + cursor, and `age_asc` (backward) queries use `ix_vehicle_dealer_status_stocked`; make+model uses `ix_vehicle_dealer_make_model`; no sort nodes. The test asserts index *applicability* (`enable_seqscan=off`) and only logs the natural plan.
+- **Summary:** one aggregate query with `count(*) FILTER (…)`, using the same cutoff as the list (tested equal to list counts).
+
+### 6.6 Security
+- **API:** queries use the read-only role from `deploy/postgres/grants.sql` (`make pg-grants`), which has `SELECT` on `dealership`, `inventory_vehicle`, `vehicle_action_history` and `projection_run` only. Verified: INSERT, UPDATE, DELETE, TRUNCATE, CREATE and reading `projection_aggregate` all fail with `42501`.
+- **Projection commands** use the schema owner for PostgreSQL, and the restricted MySQL app user for `ReadAll` (it only needs `SELECT` on `es_event`).
+
+### 6.7 Limitations and operational risks (accepted for Phase 4)
+- **Not real-time.** A sync re-reads the full history (O(total events)) and keeps one long MySQL snapshot, which holds back InnoDB purge, plus one PostgreSQL transaction.
+- **A rebuild blocks queries for its duration.** `TRUNCATE` holds an exclusive lock, there is no statement timeout on queries, and `/readyz` stays ready.
+- **One bad event halts the whole run** (gap, unknown type, FK violation): the run is a single transaction. This is intended "halt, never skip" behaviour, and the operator must fix the cause.
+- **Dealership reference data exists twice** (MySQL `dealership` and PostgreSQL `dealership`, both seeded). A dealership added on one side only would make syncs fail on the FK.
+- **A sync cannot detect a read model that is *ahead* of MySQL** (e.g. after MySQL was reset): the old rows are skipped as duplicates. Only `rebuild-projections` repairs it.
+- **Sort semantics:** `sort` orders by `stocked_on`. For in-stock vehicles that equals age; for `status=SOLD|ALL` a sold vehicle's displayed `age_days` (age at sale) is not the sort key.
+- **`as_of` is a business-date override, not time travel:** it shows today's statuses, and an `as_of` before a vehicle's `stocked_on` gives a negative `age_days`.
+- **The `GET` detail `ETag` is the read-model version.** Between syncs it can be behind the write side, so `If-Match` with it can return `412` until the next sync.
+- **Future hazard (Phase 5):** a caller that wraps many `Apply` calls in one non-exclusive outer transaction would hold two advisory locks and a savepoint per event. The live consumer must commit per event (or per small batch).
+- No `make_model` sort, no total count.

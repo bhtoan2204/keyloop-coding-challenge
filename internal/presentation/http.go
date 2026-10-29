@@ -42,13 +42,15 @@ type ReadinessCheck func(ctx context.Context) error
 
 type api struct {
 	commands CommandService
+	queries  QueryService
 	ready    ReadinessCheck
 	log      *slog.Logger
 }
 
-// NewHandler returns the HTTP handler with all routes and middleware.
-func NewHandler(commands CommandService, ready ReadinessCheck, log *slog.Logger) http.Handler {
-	a := &api{commands: commands, ready: ready, log: log}
+// NewHandler returns the HTTP handler with all routes and middleware. The query routes
+// are registered only when queries is not nil.
+func NewHandler(commands CommandService, queries QueryService, ready ReadinessCheck, log *slog.Logger) http.Handler {
+	a := &api{commands: commands, queries: queries, ready: ready, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /readyz", a.readyz)
@@ -59,6 +61,9 @@ func NewHandler(commands CommandService, ready ReadinessCheck, log *slog.Logger)
 	mux.HandleFunc("PUT "+vehicle+"/actions/{actionId}", a.reviseAction)
 	mux.HandleFunc("POST "+vehicle+"/actions/{actionId}/cancel", a.cancelAction)
 	mux.HandleFunc("POST "+vehicle+"/sale", a.sellVehicle)
+	if queries != nil {
+		a.registerQueries(mux)
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, a.log, &apiError{status: http.StatusNotFound, code: "NOT_FOUND", detail: "no such endpoint"})
 	})

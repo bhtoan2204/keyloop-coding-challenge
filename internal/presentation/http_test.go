@@ -53,7 +53,7 @@ func newServer(t *testing.T) (*httptest.Server, *gorm.DB) {
 	}
 	store := commandstore.New(eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(db, serializer), 0))
 	svc := command.NewService(store, referencedata.NewDealerships(db), fixedClock{}, discard)
-	srv := httptest.NewServer(presentation.NewHandler(svc, sqlDB.PingContext, discard))
+	srv := httptest.NewServer(presentation.NewHandler(svc, nil, sqlDB.PingContext, discard))
 	t.Cleanup(srv.Close)
 	return srv, db
 }
@@ -246,7 +246,7 @@ func TestInfrastructureErrorsAreMappedWithoutLeakingDetails(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(presentation.NewHandler(stubService{tc.err}, nil, discard))
+			srv := httptest.NewServer(presentation.NewHandler(stubService{tc.err}, nil, nil, discard))
 			defer srv.Close()
 			got := do(t, srv, call{method: "POST", path: vehicles + "/v1/sale", body: `{"sold_on":"2026-10-29"}`})
 			if got.status != tc.status || got.code() != tc.code {
@@ -272,7 +272,7 @@ func TestHealthAndReadiness(t *testing.T) {
 		ok     bool
 		status int
 	}{{true, 200}, {false, 503}} {
-		srv := httptest.NewServer(presentation.NewHandler(stubService{}, ready(tc.ok), discard))
+		srv := httptest.NewServer(presentation.NewHandler(stubService{}, nil, ready(tc.ok), discard))
 		if got := do(t, srv, call{method: "GET", path: "/readyz"}); got.status != tc.status || strings.Contains(got.rawBody, "3306") {
 			t.Errorf("readyz ok=%v: %d %s", tc.ok, got.status, got.rawBody)
 		}
@@ -284,7 +284,7 @@ func TestHealthAndReadiness(t *testing.T) {
 }
 
 func TestPanicIsRecovered(t *testing.T) {
-	srv := httptest.NewServer(presentation.NewHandler(panicService{}, nil, discard))
+	srv := httptest.NewServer(presentation.NewHandler(panicService{}, nil, nil, discard))
 	defer srv.Close()
 	got := do(t, srv, call{method: "POST", path: vehicles + "/v1/sale", body: `{"sold_on":"2026-10-29"}`})
 	if got.status != 500 || got.code() != "INTERNAL" {

@@ -6,7 +6,7 @@ COMPOSE ?= docker compose
 MYSQL_DATABASE ?= inventory
 MYSQL_APP_USER ?= inventory_app
 
-.PHONY: fmt-check vet test test-race test-integration check build migrate run-api mysql-up mysql-wait mysql-down mysql-grants
+.PHONY: fmt-check vet test test-race test-integration check build migrate run-api sync-projections rebuild-projections up mysql-up mysql-wait mysql-down mysql-grants pg-up pg-wait pg-grants
 
 fmt-check:
 	@test -z "$$(gofmt -l .)" || { gofmt -l .; echo "gofmt needed"; exit 1; }
@@ -21,8 +21,8 @@ test:
 test-race:
 	go test -race -count=1 ./...
 
-## Runs the MySQL-backed tests. Needs a running MySQL (make mysql-up) and MYSQL_TEST_DSN.
-## The tests fail (never skip) when MYSQL_TEST_DSN is missing.
+## Runs the MySQL- and PostgreSQL-backed tests. Needs `make up`, MYSQL_TEST_DSN and PG_TEST_DSN.
+## The tests fail (never skip) when a DSN is missing.
 test-integration:
 	go test -tags integration -count=1 -v ./...
 
@@ -35,9 +35,20 @@ build:
 migrate:
 	go run ./cmd migrate
 
-## Serves the write API as the restricted app user (MYSQL_DSN or MYSQL_APP_USER/MYSQL_APP_PASSWORD).
+## Serves the API: commands as the restricted MySQL app user, queries as the PostgreSQL reader.
 run-api:
 	go run ./cmd api
+
+## Phase 4 read-model refresh (NOT real time): applies events committed since the last run,
+## read from one consistent MySQL snapshot. Safe to repeat; one run at a time.
+sync-projections:
+	go run ./cmd sync-projections
+
+## Rebuilds the whole read model from the MySQL history in one transaction.
+rebuild-projections:
+	go run ./cmd rebuild-projections
+
+up: mysql-up pg-up
 
 mysql-up:
 	$(COMPOSE) up -d mysql
@@ -52,6 +63,24 @@ mysql-wait:
 
 mysql-down:
 	$(COMPOSE) down
+
+pg-up:
+	$(COMPOSE) up -d postgres
+	$(MAKE) pg-wait
+
+pg-wait:
+	@for i in $$(seq 1 60); do \
+		$(COMPOSE) exec -T postgres pg_isready -U "$${POSTGRES_USER:-inventory}" -d "$${POSTGRES_DB:-inventory_read}" >/dev/null 2>&1 \
+			&& { echo "postgres is ready"; exit 0; }; \
+		sleep 2; \
+	done; echo "postgres did not become ready"; exit 1
+
+## Creates the read-only role used by the API's queries. Run after `make migrate`.
+pg-grants:
+	@test -n "$$POSTGRES_READER_PASSWORD" || { echo "set POSTGRES_READER_PASSWORD in .env"; exit 1; }
+	@sed -e "s/{{database}}/$${POSTGRES_DB:-inventory_read}/g" -e "s/{{reader_user}}/$${POSTGRES_READER_USER:-inventory_reader}/g" \
+		-e "s/{{reader_password}}/$$POSTGRES_READER_PASSWORD/g" deploy/postgres/grants.sql \
+		| $(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 -q -U "$${POSTGRES_USER:-inventory}" -d "$${POSTGRES_DB:-inventory_read}"
 
 ## Creates the restricted application user and grants it. Run after the schema is migrated.
 mysql-grants:

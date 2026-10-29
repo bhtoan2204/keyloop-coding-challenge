@@ -3,13 +3,17 @@
 package eventstore_test
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"os"
+	"reflect"
 	"testing"
 
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
+	"keyloop-coding-challenge/package/eventsourcing"
 
 	"github.com/go-sql-driver/mysql"
 	gormmysql "gorm.io/driver/mysql"
@@ -101,4 +105,37 @@ func openRawMySQLDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, _ := newMySQLDatabase(t)
 	return db
+}
+
+// TestMySQLReadAllUsesOneConsistentSnapshot: an event committed while ReadAll is
+// streaming must not appear in that run (it belongs to the next one), and a run never
+// sees part of a later commit.
+func TestMySQLReadAllUsesOneConsistentSnapshot(t *testing.T) {
+	db, serializer, store := newStore(t, 0)
+	for _, id := range []string{"a", "b", "c"} {
+		agg := newQty(t, id)
+		addQty(t, agg, 1)
+		mustSave(t, store, agg)
+	}
+	var seen []string
+	err := repos.New(db, serializer).EventStore().ReadAll(context.Background(), 1, func(ev eventsourcing.Event) error {
+		seen = append(seen, fmt.Sprintf("%s/%d", ev.AggregateID, ev.Version))
+		if len(seen) == 1 {
+			// Concurrent writer commits two new events (another connection).
+			late := newQty(t, "b2")
+			addQty(t, late, 1)
+			addQty(t, late, 1)
+			mustSave(t, store, late)
+			more := mustLoad(t, store, "c")
+			addQty(t, more, 1)
+			mustSave(t, store, more)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"a/1", "b/1", "c/1"}; !reflect.DeepEqual(seen, want) {
+		t.Fatalf("saw %v, want only the snapshot %v", seen, want)
+	}
 }

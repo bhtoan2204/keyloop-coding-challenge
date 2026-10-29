@@ -1,6 +1,6 @@
 # Design & Plan — Intelligent Inventory Dashboard (Scenario B, backend)
 
-Status: **Phase 3 (application command layer + REST write API) implemented and verified on MySQL 8.4 — uncommitted, awaiting developer review. Phases 1 (domain, `ac84073`) and 2 (MySQL event store, `82826e4`) are committed. Next: PostgreSQL read model + query API.**
+Status: **Phase 4 (PostgreSQL read model, projections, query API) implemented and verified — uncommitted, awaiting developer review. Phases 1–3 are committed (`ac84073`, `82826e4`, `ba964e7` + `354f015`). The read model is refreshed by `sync-projections` (not real-time); Phase 5 adds Debezium/Kafka.**
 Target completion of all deliverables: **Wednesday 4 November 2026.**
 
 > Sources: `KeyloopCodingChallange.pdf` (Scenario B, Part 1/2, deliverables, evaluation framework) and the

@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"keyloop-coding-challenge/internal/application/command"
+	"keyloop-coding-challenge/internal/application/query"
 	"keyloop-coding-challenge/internal/domain"
 )
 
@@ -57,6 +58,9 @@ var domainErrors = []struct {
 	title  string
 }{
 	{command.ErrDealershipNotFound, http.StatusNotFound, "DEALERSHIP_NOT_FOUND", "Dealership not found"},
+	{query.ErrDealershipNotFound, http.StatusNotFound, "DEALERSHIP_NOT_FOUND", "Dealership not found"},
+	{query.ErrVehicleNotFound, http.StatusNotFound, "VEHICLE_NOT_FOUND", "Vehicle not found"},
+	{query.ErrInvalidCursor, http.StatusBadRequest, "INVALID_CURSOR", "Invalid cursor"},
 	{command.ErrVehicleNotFound, http.StatusNotFound, "VEHICLE_NOT_FOUND", "Vehicle not found"},
 	{domain.ErrVehicleNotStocked, http.StatusNotFound, "VEHICLE_NOT_FOUND", "Vehicle not found"},
 	{command.ErrVersionMismatch, http.StatusPreconditionFailed, "VERSION_MISMATCH", "Vehicle version does not match If-Match"},

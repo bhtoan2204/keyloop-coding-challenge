@@ -1,7 +1,9 @@
 // Command main runs the inventory service.
 //
-//	main migrate   apply event-store migrations (admin MySQL account)
-//	main api       serve the REST write API (restricted application account)
+//	main migrate              apply MySQL event-store and PostgreSQL read-model migrations
+//	main api                  serve the REST API (commands: MySQL app user; queries: PG reader)
+//	main sync-projections     apply new events from MySQL to the read model (point in time)
+//	main rebuild-projections  rebuild the read model from the full MySQL history
 //
 // Configuration comes from the environment; see .env.example.
 package main
@@ -20,11 +22,13 @@ import (
 	_ "time/tzdata" // dealership time zones must resolve in minimal containers too
 
 	"keyloop-coding-challenge/internal/application/command"
+	"keyloop-coding-challenge/internal/application/query"
 	"keyloop-coding-challenge/internal/domain/aggregates"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/commandstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/infrastructure/referencedata"
+	"keyloop-coding-challenge/internal/infrastructure/viewstore"
 	"keyloop-coding-challenge/internal/presentation"
 	"keyloop-coding-challenge/package/eventsourcing"
 
@@ -46,7 +50,7 @@ func main() {
 func run(args []string) int {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
 	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: main api|migrate")
+		fmt.Fprintln(os.Stderr, usage)
 		return 2
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -58,8 +62,12 @@ func run(args []string) int {
 		err = runAPI(ctx, log)
 	case "migrate":
 		err = runMigrate(ctx, log)
+	case "sync-projections":
+		err = runProjections(ctx, log, false)
+	case "rebuild-projections":
+		err = runProjections(ctx, log, true)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q; usage: main api|migrate\n", args[0])
+		fmt.Fprintf(os.Stderr, "unknown command %q; %s\n", args[0], usage)
 		return 2
 	}
 	if err != nil {
@@ -81,7 +89,15 @@ func runMigrate(ctx context.Context, log *slog.Logger) error {
 	if err := repos.Migrate(db.WithContext(ctx)); err != nil {
 		return err
 	}
-	log.Info("migrations applied")
+	log.Info("event store migrations applied")
+	pg, err := openPostgres(ctx, "PG_DSN", "POSTGRES_USER", "inventory", "POSTGRES_PASSWORD")
+	if err != nil {
+		return err
+	}
+	if err := viewstore.Migrate(pg.WithContext(ctx)); err != nil {
+		return err
+	}
+	log.Info("read model migrations applied")
 	return nil
 }
 
@@ -107,9 +123,26 @@ func runAPI(ctx context.Context, log *slog.Logger) error {
 	store := eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(db, serializer), vehicleSnapshotInterval)
 	commands := command.NewService(commandstore.New(store), referencedata.NewDealerships(db), command.SystemClock{}, log)
 
+	pg, err := openPostgres(ctx, "PG_READ_DSN", "POSTGRES_READER_USER", "inventory_reader", "POSTGRES_READER_PASSWORD")
+	if err != nil {
+		return err
+	}
+	pgDB, err := pg.DB()
+	if err != nil {
+		return err
+	}
+	defer pgDB.Close()
+	queries := query.NewService(viewstore.NewPostgres(pg), command.SystemClock{})
+	ready := func(ctx context.Context) error {
+		if err := sqlDB.PingContext(ctx); err != nil {
+			return err
+		}
+		return pgDB.PingContext(ctx)
+	}
+
 	srv := &http.Server{
 		Addr:              envOr("HTTP_ADDR", "127.0.0.1:8080"), // set 0.0.0.0:8080 explicitly in a container
-		Handler:           presentation.NewHandler(commands, sqlDB.PingContext, log),
+		Handler:           presentation.NewHandler(commands, queries, ready, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

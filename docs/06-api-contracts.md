@@ -182,3 +182,35 @@ Deviation from the read-model shape above: no `proposed_at`, `updated_at` or `up
 - An empty chunked body without `Content-Type` on `/cancel` returns `415`.
 - A panic after headers were written cannot change the status.
 - Demo dealerships `d-001` and `d-002` are seeded by migration v3 in every environment.
+
+## Phase 4 — query API as implemented (2026-10-29)
+
+All four endpoints read the **PostgreSQL read model only**. It is **eventually consistent** with the event store, and in Phase 4 it changes only when `sync-projections` (or `rebuild-projections`) runs. Compare the `version` returned by a command with the `version` of a query to tell whether the read model has caught up.
+
+| Endpoint | Query parameters (unknown or repeated → `400 INVALID_QUERY`) |
+|---|---|
+| `GET /v1/dealerships/{d}/vehicles` | `make`, `model` (case-insensitive exact), `min_age_days`, `max_age_days` (inclusive), `aging` (`true`/`false`), `status` (`IN_STOCK` default, `SOLD`, `ALL`), `sort` (`age_desc` default = oldest first, `age_asc`), `limit` (1–100, default 20), `cursor`, `as_of` (YYYY-MM-DD) |
+| `GET /v1/dealerships/{d}/vehicles/{v}` | `as_of`. Returns `ETag: "<version>"` (read-model version). |
+| `GET /v1/dealerships/{d}/vehicles/{v}/actions` | `limit`, `cursor`. Oldest first. |
+| `GET /v1/dealerships/{d}/inventory/summary` | `as_of` |
+
+**Shapes:**
+- **List item / detail:** `vehicle_id, dealership_id, vin, make, model, model_year, stocked_on, status, sold_on|null, age_days, is_aging, current_action{action_id, action_type, note, proposed_at, updated_at, updated_by}|null, version`. The detail adds `as_of`.
+- **List:** `{as_of, aging_threshold_days: 90, data: [...], page: {limit, has_more, next_cursor|null}}`.
+- **History:** `{data: [{event_id, version, action_id, change (PROPOSED|REVISED|CANCELLED|CLOSED_BY_SALE), action_type, note, reason, actor_id, correlation_id, occurred_at}], page}`.
+- **Summary:** `{as_of, aging_threshold_days, in_stock, aging, aging_without_action, oldest_stocked_on|null}`.
+
+**Semantics:**
+- `age_days` for a sold vehicle is its age at sale, and it is never `is_aging`.
+- `aging=true` only ever returns in-stock vehicles, so `aging=true&status=SOLD` is empty.
+- `next_cursor` pins `as_of`, filters and sort. Reusing it with different parameters gives `400 INVALID_CURSOR`; the limit may change.
+- `sort` orders by `stocked_on`, which is the age order for in-stock vehicles. For `SOLD`/`ALL`, a sold vehicle's frozen `age_days` is not the sort key.
+- `as_of` overrides the business date for age and aging only. It is not time travel: statuses are current, and an `as_of` before `stocked_on` yields a negative `age_days`.
+- The detail `ETag` is the **read-model** version and may lag the write side until the next sync.
+
+**Errors:**
+- `404 DEALERSHIP_NOT_FOUND`;
+- `404 VEHICLE_NOT_FOUND`, which also covers a vehicle of another dealership;
+- `400 INVALID_CURSOR`;
+- `400 VALIDATION_ERROR` (limit, status, sort, age bounds, dates);
+- `500 INTERNAL` with no database detail.

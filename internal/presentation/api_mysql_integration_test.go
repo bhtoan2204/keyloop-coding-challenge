@@ -47,7 +47,7 @@ func newMySQLAPI(t *testing.T, params map[string]string) *mysqlAPI {
 	store := commandstore.New(eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(app, serializer), 0))
 	svc := command.NewService(store, referencedata.NewDealerships(app), fixedClock{}, discard)
 	sqlDB, _ := app.DB()
-	srv := httptest.NewServer(presentation.NewHandler(svc, sqlDB.PingContext, discard))
+	srv := httptest.NewServer(presentation.NewHandler(svc, nil, sqlDB.PingContext, discard))
 	t.Cleanup(srv.Close)
 	return &mysqlAPI{srv: srv, admin: admin,
 		store: eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(admin, serializer), 0)}

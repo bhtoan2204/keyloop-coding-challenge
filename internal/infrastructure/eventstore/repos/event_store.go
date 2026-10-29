@@ -18,6 +18,9 @@ type EventStore interface {
 	CreateSnapshot(ctx context.Context, agg eventsourcing.Aggregate) error
 	ReadSnapshot(ctx context.Context, aggregateID string, agg eventsourcing.Aggregate) (bool, error)
 	FindAggregate(ctx context.Context, id string) (version int, aggregateType string, err error)
+	// ReadAll streams the whole event history from one consistent snapshot, ordered by
+	// (aggregate_id, version). Read-only; used to rebuild and sync projections.
+	ReadAll(ctx context.Context, batchSize int, fn func(eventsourcing.Event) error) error
 	WithTransaction(ctx context.Context, fn func(EventStore) error) error
 }
 

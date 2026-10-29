@@ -2,53 +2,88 @@ package projection
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
-	"keyloop-coding-challenge/package/eventsourcing"
 
-	"golang.org/x/sync/errgroup"
+	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
+	"keyloop-coding-challenge/internal/infrastructure/viewstore"
+	"keyloop-coding-challenge/package/eventsourcing"
 )
 
+var (
+	// ErrVersionGap: the event is not the next version of its aggregate (missing or
+	// out-of-order events). Nothing is applied; the caller must not skip it.
+	ErrVersionGap = errors.New("aggregate version gap")
+	// ErrUnsupportedSchemaVersion: the payload schema is newer than this build.
+	ErrUnsupportedSchemaVersion = errors.New("unsupported event schema version")
+)
+
+// Projection applies events to the read model. The same Apply is used by the
+// rebuild/sync commands and, later, by the CDC consumer.
 type Projection interface {
-	Apply(ctx context.Context, ev eventsourcing.Event) error
+	// Apply applies ev in its own transaction. Inside a sync/rebuild run (exclusive
+	// mode) it joins the run's transaction instead, without a savepoint. It returns
+	// applied=false for a duplicate (version already applied).
+	Apply(ctx context.Context, ev eventsourcing.Event) (applied bool, err error)
 }
 
 type projectionPipeline struct {
+	store  viewstore.ViewStore
 	stages [][]projectors.Projector
 }
 
-func NewProjection(projs ...projectors.Projector) Projection {
+func NewProjection(store viewstore.ViewStore, projs ...projectors.Projector) Projection {
 	return &projectionPipeline{
+		store: store,
 		stages: [][]projectors.Projector{
 			projs,
 		},
 	}
 }
 
-func (p *projectionPipeline) Apply(ctx context.Context, ev eventsourcing.Event) error {
-	for stageIdx, stage := range p.stages {
-		if err := p.runStage(ctx, stage, ev); err != nil {
-			return fmt.Errorf("projection failed at stage %d for event %T: %w", stageIdx, ev, err)
+// Apply serialises per aggregate with a transaction-scoped lock (which also covers the
+// first event of a vehicle that has no row yet), skips duplicates, rejects gaps, and
+// commits the projected state, history and applied version in one transaction.
+func (p *projectionPipeline) Apply(ctx context.Context, ev eventsourcing.Event) (bool, error) {
+	if v := ev.SchemaVersion; v != 0 && v != eventsourcing.DefaultSchemaVersion { // 0 means the default
+		return false, fmt.Errorf("%w: %s v%d has schema version %d", ErrUnsupportedSchemaVersion, ev.AggregateID, ev.Version, ev.SchemaVersion)
+	}
+	applied := false
+	err := p.store.WithTransaction(ctx, func(tx viewstore.ViewStore) error {
+		current, err := tx.LockAggregate(ctx, ev.AggregateID)
+		if err != nil {
+			return err
+		}
+		if ev.Version <= current {
+			return nil // duplicate delivery: already applied
+		}
+		if ev.Version != current+1 {
+			return fmt.Errorf("%w: aggregate %s at version %d received version %d", ErrVersionGap, ev.AggregateID, current, ev.Version)
+		}
+		for stageIdx, stage := range p.stages {
+			if err := p.runStage(ctx, tx, stage, ev); err != nil {
+				return fmt.Errorf("projection failed at stage %d for %s v%d: %w", stageIdx, ev.AggregateID, ev.Version, err)
+			}
+		}
+		if err := tx.SetAppliedVersion(ctx, ev.AggregateID, ev.Version, ev.ID); err != nil {
+			return err
+		}
+		applied = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return applied, nil
+}
+
+// runStage runs the stage's projectors one after another: they share one database
+// transaction, which must not be used concurrently.
+func (p *projectionPipeline) runStage(ctx context.Context, tx viewstore.ViewStore, stage []projectors.Projector, ev eventsourcing.Event) error {
+	for _, proj := range stage {
+		if err := proj.Handle(ctx, tx, ev); err != nil {
+			return fmt.Errorf("projector %T: %w", proj, err)
 		}
 	}
 	return nil
-}
-
-func (p *projectionPipeline) runStage(ctx context.Context, stage []projectors.Projector, ev eventsourcing.Event) error {
-	if len(stage) == 1 {
-		return stage[0].Handle(ctx, ev)
-	}
-
-	g, groupCtx := errgroup.WithContext(ctx)
-
-	for _, proj := range stage {
-		g.Go(func() error {
-			if err := proj.Handle(groupCtx, ev); err != nil {
-				return fmt.Errorf("projector %T handle error: %w", proj, err)
-			}
-			return nil
-		})
-	}
-
-	return g.Wait()
 }
