@@ -8,6 +8,8 @@ BEGIN
 	IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{reader_user}}') THEN
 		CREATE ROLE {{reader_user}} LOGIN PASSWORD '{{reader_password}}';
 	END IF;
+	-- Re-applied on every run, so a changed password in .env takes effect.
+	ALTER ROLE {{reader_user}} LOGIN PASSWORD '{{reader_password}}';
 END
 $$;
 

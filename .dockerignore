@@ -1,0 +1,11 @@
+# Allow-list: the image needs only the Go module and its sources. Everything else
+# (.env, .git, docs, the challenge PDF, test data) stays out of the build context.
+*
+!go.mod
+!go.sum
+!api/
+!cmd/
+!internal/
+!package/
+**/*_test.go
+**/testdata/

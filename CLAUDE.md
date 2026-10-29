@@ -43,7 +43,14 @@ Implemented and tested:
   (franz-go transport); `projection.ConsumerAdapter`; `cmd projector` with `/healthz`, `/readyz`, `/status`.
   Pipeline tests: `internal/pipeline` (tags `integration pipeline`).
 
-Not implemented yet: `Dockerfile` (Go processes run on the host), Idempotency-Key, OpenAPI, observability.
+- Packaging and contract (Phase 6): multi-stage `Dockerfile` (distroless, nonroot), full Compose stack with
+  one-shot init services (`make stack-up`, engine-independent), `api/openapi.yaml` (embedded; served at
+  `/openapi.yaml`, `/docs`; `openapi_contract_test.go` checks every documented operation is routed), Prometheus
+  `/metrics` on both processes, `internal/e2e` (`make e2e`, business flow against a running stack).
+  Submission docs: `README.md` (AI Collaboration Narrative), `docs/system-design.md`, `docs/demo.md`,
+  `docs/curl-examples.md`.
+
+Not implemented: Idempotency-Key, authentication, VIN uniqueness (D4), OpenTelemetry export.
 `.env` is git-ignored; copy `.env.example`.
 
 ## Reuse map (extend these; do not build parallel versions)
@@ -109,7 +116,8 @@ make migrate && make mysql-grants && make pg-grants && make run-api   # local AP
 make cdc-up && make debezium-grants connector && make run-projector   # live change feed (docs/05 §7)
 make sync-projections                     # point-in-time catch-up from MySQL (recovery; safe while projector runs)
 make test-pipeline                        # real MySQL+Debezium+Kafka+PG; also needs KAFKA_TEST_BROKERS, CONNECT_TEST_URL
-make check                                # fmt-check, vet (incl. integration + pipeline tags), test, test-race
+make check                                # fmt-check, vet (incl. integration, pipeline, e2e tags), test, test-race
+make stack-up && make e2e                 # whole system in containers + business flow against it
 ```
 Integration tests fail (never skip) without `MYSQL_TEST_DSN`. The dev machine uses rootless Podman
 (`docker compose` → podman-compose); Testcontainers is not used.

@@ -79,6 +79,7 @@ func WriteError(w http.ResponseWriter, r *http.Request, log *slog.Logger, err er
 	if p.Status >= 500 && !errors.Is(err, context.Canceled) { // a client that went away is not a server error
 		level = slog.LevelError
 	}
+	observeProblem(r, p.Code)
 	log.Log(r.Context(), level, "request failed", "status", p.Status, "code", p.Code, "error", err.Error())
 	writeJSON(w, p.Status, "application/problem+json", p)
 }

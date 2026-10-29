@@ -5,6 +5,7 @@
 //	main sync-projections     apply new events from MySQL to the read model (point in time)
 //	main rebuild-projections  rebuild the read model from the full MySQL history
 //	main projector            apply the live change feed (Debezium/Kafka) to the read model
+//	main healthcheck URL      exit 0 when URL answers 2xx (container health checks)
 //
 // Configuration comes from the environment; see .env.example.
 package main
@@ -19,7 +20,7 @@ import (
 	_ "time/tzdata" // dealership time zones must resolve in minimal containers too
 )
 
-const usage = "usage: main api|migrate|sync-projections|rebuild-projections|projector"
+const usage = "usage: main api|migrate|sync-projections|rebuild-projections|projector|healthcheck URL"
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -27,6 +28,13 @@ func main() {
 
 func run(args []string) int {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
+	if len(args) == 2 && args[0] == "healthcheck" {
+		if err := runHealthcheck(context.Background(), args[1]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
 	if len(args) != 1 {
 		fmt.Fprintln(os.Stderr, usage)
 		return 2

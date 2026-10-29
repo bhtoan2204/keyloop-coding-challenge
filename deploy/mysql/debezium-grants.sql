@@ -3,6 +3,8 @@
 --   {{database}}  {{debezium_user}}  {{debezium_password}}
 
 CREATE USER IF NOT EXISTS '{{debezium_user}}'@'%' IDENTIFIED BY '{{debezium_password}}';
+-- Re-applied on every run, so a changed password in .env takes effect.
+ALTER USER '{{debezium_user}}'@'%' IDENTIFIED BY '{{debezium_password}}';
 
 -- Read the binlog (REPLICATION SLAVE, REPLICATION CLIENT) and take the brief global
 -- read lock that fixes the snapshot's binlog position (RELOAD; snapshot.locking.mode

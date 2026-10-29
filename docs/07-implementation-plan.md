@@ -51,7 +51,9 @@ Tests: the existing tests stay as they are. MySQL/Postgres integration tests sit
 > | Phase 4 | PostgreSQL read model, projections, sync/rebuild, query API (`05` §6, `06` "Phase 4") | committed `4ee0075` |
 > | Refactor | Source organisation, behaviour-preserving (`ai-log.md`) | committed `4cb5d8f` |
 > | Phase 5 | Live change feed: Kafka (KRaft) + Debezium in Compose, `application/messaging` consumer, Kafka transport, startup sync, gap repair from MySQL, `main projector`, pipeline tests (`05` §7) | uncommitted |
-> | Next | OpenAPI/curl, observability, Dockerfile, README/SDD/AI narrative, video (original Phases 5–6) | not started |
+> | Phase 5 | committed `53462bc`; presentation refactor (Phase 5.5) committed `ee7bdff` | committed |
+> | Phase 6 | Dockerfile, full Compose stack (`make stack-up`), OpenAPI 3.1 served at `/openapi.yaml` and `/docs`, Prometheus `/metrics`, E2E test, README with AI narrative, SDD, demo outline, curl examples | uncommitted |
+> | Not done | Video recording (outline only), OpenTelemetry export, Idempotency-Key, VIN reservation (D4), Kafka offsets in PostgreSQL (D5) | — |
 >
 > Phase numbers below are the original plan. Dates are unchanged.
 

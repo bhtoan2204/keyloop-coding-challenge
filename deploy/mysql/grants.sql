@@ -4,6 +4,8 @@
 --   {{database}}  {{app_user}}  {{app_password}}
 
 CREATE USER IF NOT EXISTS '{{app_user}}'@'%' IDENTIFIED BY '{{app_password}}';
+-- Re-applied on every run, so a changed password in .env takes effect.
+ALTER USER '{{app_user}}'@'%' IDENTIFIED BY '{{app_password}}';
 
 -- Aggregate registry and optimistic-concurrency CAS. INSERT ... ON DUPLICATE KEY
 -- UPDATE needs INSERT and UPDATE.

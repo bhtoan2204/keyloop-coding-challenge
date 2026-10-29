@@ -1,5 +1,20 @@
 # 08 — Observability Strategy
 
+> **As implemented (Phase 6).** The plan below was the target; this is what exists:
+> - **Logs:** JSON `slog`. One line per HTTP request (request ID, route pattern, status, duration, sanitised actor). Projector lifecycle, gap repairs and poison records (ERROR).
+> - **Metrics** (`/metrics` on the API and the projector):
+>   - `inventory_http_requests_total{method,route,status}`, `inventory_http_request_duration_seconds{method,route}` and `inventory_http_problems_total{route,code}`. The last gives command success/failure by business outcome; there is no separate `inventory_commands_total`.
+>   - `inventory_projection_{events_applied,duplicates_skipped,gap_events_repaired,record_failures}_total`, `inventory_projection_ready`, `inventory_projection_phase{phase}`, `inventory_projection_partition_halted{topic,partition}`, `inventory_projection_partition_last_offset` and `inventory_projection_last_change_lag_seconds`. The lag is apply time minus the MySQL commit time reported by Debezium, with ms resolution for streamed records; it replaces the planned `projection_lag_seconds`, which was based on `created_at` with 1 s resolution.
+>   - Go runtime and process metrics.
+> - **Not implemented:**
+>   - per-partition lag;
+>   - event store and apply latency histograms;
+>   - conflict-retry counters;
+>   - OpenTelemetry spans (`traceparent` is accepted and stored in the event metadata, but no spans are exported);
+>   - the Jaeger/Prometheus Compose profile (D8);
+>   - alert rules.
+> - **Health:** API `/readyz` checks MySQL and PostgreSQL. Projector `/readyz` is 503 while bootstrapping, while the broker is unreachable or while a partition is halted; `/status` gives the detail. Compose health checks use the binary's `healthcheck` subcommand (distroless image).
+
 Goal: an operator can answer three questions without attaching a debugger. *Is the API healthy? How far behind is the read model? Why did this command or event fail?*
 
 ## Logs (`log/slog`, JSON to stdout)

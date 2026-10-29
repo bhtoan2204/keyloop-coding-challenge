@@ -102,3 +102,38 @@ func TestReadinessFollowsPhaseAndRevokedPartitions(t *testing.T) {
 		t.Fatalf("after stop: %+v", st)
 	}
 }
+
+// TestRecordsFailedCountsOwnedAttemptsOnly: every failed attempt of an owned partition
+// counts; a batch finishing after its partition was revoked does not.
+func TestRecordsFailedCountsOwnedAttemptsOnly(t *testing.T) {
+	tr, proj := newFakeTransport(), newFakeProjector()
+	bad := stream("bad", 1, 1)[0]
+	tr.append(0, bad.key(), bad.changeValue("c", 2)) // poison, retried at RetryMaxDelay
+	c := messaging.NewConsumer(tr, proj, &fakeHistory{}, nil, messaging.NewDecoder(newSerializer(t)), testConfig(), discard)
+	c.AssignPartitions(topic, []int32{0})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	eventually(t, "two failed attempts", func() bool { return c.Status().RecordsFailed >= 2 })
+	tr.block()
+	eventually(t, "no batch in flight", tr.idle)
+	c.ForgetPartitions(topic, []int32{0})
+	counted := c.Status().RecordsFailed
+	if counted != int64(len(tr.retried())) {
+		t.Fatalf("RecordsFailed %d, retries %d", counted, len(tr.retried()))
+	}
+
+	tr.mu.Lock()
+	tr.blocked = false
+	tr.mu.Unlock()
+	tr.signal()
+	eventually(t, "another attempt on the revoked partition", func() bool { return len(tr.retried()) > int(counted) })
+	if got := c.Status().RecordsFailed; got != counted {
+		t.Fatalf("RecordsFailed grew from %d to %d for a partition this member no longer owns", counted, got)
+	}
+}

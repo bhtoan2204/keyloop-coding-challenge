@@ -11,7 +11,8 @@ paths:
   (`AggregateRoot`, `AggregateStore`, `repos.EventStore`, serializer, `Projection`, `Projector`,
   `ViewStore`). Extend it. Never create a parallel framework, store or aggregate base.
 - **Layers are fixed, files are not:** keep the layers `internal/{domain,application,infrastructure,presentation}`,
-  `package/eventsourcing` and `cmd`, and their dependency direction. Moving code between files of
+  `package/eventsourcing` and `cmd`, and their dependency direction. The top-level `api` package only embeds
+  the OpenAPI document (`go:embed` cannot reach parent directories); only `presentation/apidocs` imports it. Moving code between files of
   the same package is allowed and expected when it improves cohesion (see
   `.claude/rules/source-organization.md`). A new package needs a real boundary, must keep the
   dependency direction and must not create an import cycle. Within a layer, organise

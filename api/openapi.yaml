@@ -1,0 +1,1053 @@
+openapi: 3.1.0
+info:
+  title: Keyloop Inventory API (Scenario B — Intelligent Inventory Dashboard)
+  version: 1.0.0
+  summary: Dealership inventory with automatic aging-stock detection and manager actions.
+  description: |
+    Commands (POST/PUT) are processed on the **write side**: they load the vehicle's event
+    stream from MySQL, run the business rules and append events atomically with optimistic
+    concurrency. Their responses reflect the **committed** state.
+
+    Queries (GET) read the **PostgreSQL read model**, which Debezium/Kafka keeps up to date.
+    It is **eventually consistent**: a GET right after a command may still show the previous
+    version for a short time (about 0.5 s on the development machine). Compare the `version`
+    of a command response with the `version` you read.
+
+    **Aging:** a vehicle is aging when it is `IN_STOCK` and more than 90 calendar days have
+    passed since `stocked_on` (exactly 90 is not aging). Ages are computed at request time from
+    the dealership's business date (today in the dealership's IANA time zone, or `as_of`).
+
+    **Authentication:** none. This is a demo: `X-Actor-Id` is an **unauthenticated**
+    identity, required on commands, recorded in the event metadata for audit, and never used
+    for authorization. Production would derive the actor from an authenticated token and
+    authorise access per dealership.
+
+    **Idempotency:** there is no `Idempotency-Key` support. Retrying a command after a
+    timeout or `503` may apply it twice where the business rules allow it (for example
+    proposing an action after the first one was cancelled). Business rules make most retries
+    safe: stocking the same `vehicle_id` again gives `409 VEHICLE_ALREADY_EXISTS`, proposing
+    while an action is active gives `409 ACTION_ALREADY_ACTIVE`, and an identical revision
+    records nothing. Use `If-Match` to make a retry conditional on the version you saw.
+
+    **Request IDs:** every response carries `X-Request-Id`. A valid inbound `X-Request-Id`
+    (1-128 characters of `A-Z a-z 0-9 . _ : @ -`) is kept, otherwise one is generated. It is the
+    `correlation_id` stored with the events and returned in action history and problem bodies.
+    A valid W3C `traceparent` header on a command is stored in the event metadata.
+  contact:
+    name: Keyloop take-home submission
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local (docker compose or `make run-api`)
+tags:
+  - name: Commands
+    description: Write side (MySQL event store). Strongly consistent per vehicle.
+  - name: Queries
+    description: Read side (PostgreSQL read model). Eventually consistent.
+  - name: Operations
+    description: Probes, metrics and this document.
+
+paths:
+  /v1/dealerships/{dealershipId}/vehicles:
+    parameters:
+      - $ref: '#/components/parameters/DealershipId'
+    post:
+      tags: [Commands]
+      operationId: stockVehicle
+      summary: Stock a vehicle (it enters inventory)
+      description: |
+        Creates the vehicle's event stream. `vehicle_id` is optional; a UUIDv7 is generated
+        when it is omitted. Stocking an existing `vehicle_id` returns `409 VEHICLE_ALREADY_EXISTS`.
+        `stocked_on` may be in the past (back-dated stock) but not after the dealership's
+        business date. `If-Match` is not used by this endpoint.
+      parameters:
+        - $ref: '#/components/parameters/ActorId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StockVehicleRequest'
+            example:
+              vehicle_id: veh-1001
+              vin: 1HGCM82633A004352
+              make: Toyota
+              model: Corolla
+              model_year: 2023
+              stocked_on: '2026-06-01'
+      responses:
+        '201':
+          description: Stocked. `Location` addresses the new vehicle; `ETag` is its version.
+          headers:
+            Location:
+              description: /v1/dealerships/{dealershipId}/vehicles/{vehicleId}
+              schema:
+                type: string
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandVehicle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    get:
+      tags: [Queries]
+      operationId: listInventory
+      summary: List inventory (filters, aging, keyset pagination)
+      description: |
+        Oldest stock first by default. Unknown or repeated query parameters are rejected with
+        `400 INVALID_QUERY`, so a typo cannot silently return an unfiltered list.
+        `has_more` and `next_cursor` page through the result; a cursor is bound to the filters,
+        the sort and the business date it was issued for (`400 INVALID_CURSOR` otherwise), so
+        paging across midnight in the dealership's time zone stays consistent. There is no total count.
+      parameters:
+        - name: make
+          in: query
+          description: Exact make, case-insensitive (max 64 characters).
+          schema:
+            type: string
+            maxLength: 64
+        - name: model
+          in: query
+          description: Exact model, case-insensitive (max 64 characters).
+          schema:
+            type: string
+            maxLength: 64
+        - name: min_age_days
+          in: query
+          description: Minimum age in days (inclusive). For sold vehicles, the age at sale.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100000
+        - name: max_age_days
+          in: query
+          description: Maximum age in days (inclusive). Must not be below `min_age_days`.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100000
+        - name: aging
+          in: query
+          description: '`true`: only aging stock (IN_STOCK and older than 90 days).'
+          schema:
+            type: boolean
+            default: false
+        - name: status
+          in: query
+          description: '`IN_STOCK` (default), `SOLD` or `ALL`; case-insensitive.'
+          schema:
+            type: string
+            default: IN_STOCK
+            examples: [IN_STOCK, SOLD, ALL]
+        - name: sort
+          in: query
+          description: '`age_desc`: oldest stock first (by `stocked_on`, then `vehicle_id`).'
+          schema:
+            type: string
+            enum: [age_desc, age_asc]
+            default: age_desc
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/AsOf'
+      responses:
+        '200':
+          description: One page of vehicles.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventoryList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/dealerships/{dealershipId}/vehicles/{vehicleId}:
+    parameters:
+      - $ref: '#/components/parameters/DealershipId'
+      - $ref: '#/components/parameters/VehicleId'
+    get:
+      tags: [Queries]
+      operationId: getVehicle
+      summary: Vehicle detail from the read model
+      description: |
+        The `ETag` is the read-model version. It can lag the write side until the projector
+        has applied the latest events, so an `If-Match` built from it can return `412` for a
+        short time after a command.
+      parameters:
+        - $ref: '#/components/parameters/AsOf'
+      responses:
+        '200':
+          description: The vehicle.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VehicleDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/dealerships/{dealershipId}/vehicles/{vehicleId}/actions:
+    parameters:
+      - $ref: '#/components/parameters/DealershipId'
+      - $ref: '#/components/parameters/VehicleId'
+    post:
+      tags: [Commands]
+      operationId: proposeAction
+      summary: Propose an action for an aging vehicle
+      description: |
+        Only for an `IN_STOCK` vehicle that is aging at the business date
+        (`409 VEHICLE_NOT_AGING` otherwise) and has no active action
+        (`409 ACTION_ALREADY_ACTIVE`). `note` is required when `action_type` is `OTHER`.
+      parameters:
+        - $ref: '#/components/parameters/ActorId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActionRequest'
+            example:
+              action_type: PRICE_REDUCTION
+              note: Reduce by 5%
+      responses:
+        '201':
+          description: Proposed. `Location` addresses the new action.
+          headers:
+            Location:
+              description: /v1/dealerships/{dealershipId}/vehicles/{vehicleId}/actions/{actionId}
+              schema:
+                type: string
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommandVehicle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    get:
+      tags: [Queries]
+      operationId: getActionHistory
+      summary: Action history of a vehicle (audit trail)
+      description: |
+        Every proposal, revision, cancellation and closure by sale, oldest first, with the actor
+        and correlation ID that caused it.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of history entries.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionHistory'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/dealerships/{dealershipId}/vehicles/{vehicleId}/actions/{actionId}:
+    parameters:
+      - $ref: '#/components/parameters/DealershipId'
+      - $ref: '#/components/parameters/VehicleId'
+      - $ref: '#/components/parameters/ActionId'
+    put:
+      tags: [Commands]
+      operationId: reviseAction
+      summary: Revise the active action
+      description: |
+        `actionId` must be the vehicle's active action (`409 ACTION_NOT_ACTIVE` otherwise).
+        A revision identical to the current action records nothing and returns the unchanged
+        state (same version).
+      parameters:
+        - $ref: '#/components/parameters/ActorId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActionRequest'
+            example:
+              action_type: AUCTION
+              note: Lot 12, Thursday sale
+      responses:
+        '200':
+          $ref: '#/components/responses/CommandOK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/dealerships/{dealershipId}/vehicles/{vehicleId}/actions/{actionId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/DealershipId'
+      - $ref: '#/components/parameters/VehicleId'
+      - $ref: '#/components/parameters/ActionId'
+    post:
+      tags: [Commands]
+      operationId: cancelAction
+      summary: Cancel the active action
+      description: The body is optional; send none (and no Content-Type) or a JSON object.
+      parameters:
+        - $ref: '#/components/parameters/ActorId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/TraceParent'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelActionRequest'
+            example:
+              reason: Buyer found
+      responses:
+        '200':
+          $ref: '#/components/responses/CommandOK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/dealerships/{dealershipId}/vehicles/{vehicleId}/sale:
+    parameters:
+      - $ref: '#/components/parameters/DealershipId'
+      - $ref: '#/components/parameters/VehicleId'
+    post:
+      tags: [Commands]
+      operationId: sellVehicle
+      summary: Record the sale (closes any active action)
+      description: |
+        `sold_on` must not be before `stocked_on` or after the business date. A sold vehicle is
+        terminal: further commands return `409 VEHICLE_ALREADY_SOLD` or `409 VEHICLE_NOT_IN_STOCK`.
+      parameters:
+        - $ref: '#/components/parameters/ActorId'
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/TraceParent'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SellVehicleRequest'
+            example:
+              sold_on: '2026-10-29'
+      responses:
+        '200':
+          $ref: '#/components/responses/CommandOK'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/dealerships/{dealershipId}/inventory/summary:
+    parameters:
+      - $ref: '#/components/parameters/DealershipId'
+    get:
+      tags: [Queries]
+      operationId: getInventorySummary
+      summary: Aging summary counts for the dashboard
+      description: Uses the same aging cutoff as the list (`aging=true`).
+      parameters:
+        - $ref: '#/components/parameters/AsOf'
+      responses:
+        '200':
+          description: Counts at the business date.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventorySummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: healthz
+      summary: Liveness (the process serves HTTP)
+      responses:
+        '200':
+          $ref: '#/components/responses/ProbeOK'
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readyz
+      summary: Readiness (MySQL and PostgreSQL reachable within 2 s)
+      responses:
+        '200':
+          $ref: '#/components/responses/ProbeOK'
+        '503':
+          description: A dependency is unreachable (the reason is logged, not returned).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProbeStatus'
+              example:
+                status: unavailable
+  /metrics:
+    get:
+      tags: [Operations]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        `inventory_http_requests_total`, `inventory_http_request_duration_seconds` and
+        `inventory_http_problems_total` by route pattern, plus Go runtime and process metrics.
+        The projector process serves the same endpoint with `inventory_projection_*` metrics.
+      responses:
+        '200':
+          description: Prometheus text exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /openapi.yaml:
+    get:
+      tags: [Operations]
+      operationId: openapi
+      summary: This document
+      responses:
+        '200':
+          description: OpenAPI 3.1 document.
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /docs:
+    get:
+      tags: [Operations]
+      operationId: apiDocs
+      summary: Swagger UI for this document
+      description: The page loads Swagger UI from the jsDelivr CDN.
+      responses:
+        '200':
+          description: HTML page.
+          content:
+            text/html:
+              schema:
+                type: string
+
+components:
+  parameters:
+    DealershipId:
+      name: dealershipId
+      in: path
+      required: true
+      description: Dealership (seeded reference data `d-001` Europe/London, `d-002` Australia/Sydney).
+      schema:
+        type: string
+      example: d-001
+    VehicleId:
+      name: vehicleId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/SafeId'
+      example: veh-1001
+    ActionId:
+      name: actionId
+      in: path
+      required: true
+      description: The action ID returned when the action was proposed.
+      schema:
+        type: string
+    ActorId:
+      name: X-Actor-Id
+      in: header
+      required: true
+      description: |
+        UNAUTHENTICATED, demo-only identity of the manager issuing the command. Required
+        (`400 ACTOR_REQUIRED`); 1-128 characters of `A-Z a-z 0-9 . _ : @ -` (`400 INVALID_ACTOR`).
+        Recorded in the event metadata and shown in the action history; never used for
+        authorization.
+      schema:
+        $ref: '#/components/schemas/SafeId'
+      example: manager-42
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: |
+        Optional ETag (`"3"`) of the vehicle version the command was based on. A stale version
+        returns `412 VERSION_MISMATCH` and nothing is changed. A weak ETag (`W/"3"`), `*`, or
+        anything that is not a positive version returns `400 INVALID_IF_MATCH`; the unquoted form
+        (`3`) is also accepted. Without it, concurrent commands are still serialised by optimistic
+        concurrency and retried server-side (up to 3 attempts).
+      schema:
+        type: string
+      example: '"2"'
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Correlation ID to reuse; echoed in the response and stored as `correlation_id`.
+      schema:
+        $ref: '#/components/schemas/SafeId'
+    TraceParent:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C trace context; stored in the event metadata when well-formed.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+    Limit:
+      name: limit
+      in: query
+      description: Page size, 1-100. Absent or `0` means the default (20).
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque `next_cursor` of the previous page.
+      schema:
+        type: string
+    AsOf:
+      name: as_of
+      in: query
+      description: |
+        Business date override (YYYY-MM-DD) for what-if views and boundary checks; default is
+        today in the dealership's time zone. It changes the age calculation only, not which
+        vehicles exist or their status.
+      schema:
+        type: string
+        format: date
+  headers:
+    ETag:
+      description: Strong ETag of the vehicle version, e.g. `"3"`. Use it as `If-Match`.
+      schema:
+        type: string
+    RequestId:
+      description: Correlation ID of this request.
+      schema:
+        type: string
+  responses:
+    CommandOK:
+      description: Applied. The body is the committed state; `ETag` is its version.
+      headers:
+        ETag:
+          $ref: '#/components/headers/ETag'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CommandVehicle'
+    ProbeOK:
+      description: OK.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProbeStatus'
+          example:
+            status: ok
+    BadRequest:
+      description: |
+        Invalid request. Codes: `VALIDATION_ERROR` (with `errors[]`), `INVALID_BODY`,
+        `INVALID_QUERY`, `INVALID_CURSOR`, `ACTOR_REQUIRED`, `INVALID_ACTOR`, `INVALID_IF_MATCH`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.inventory.local/VALIDATION_ERROR
+            title: Request validation failed
+            status: 400
+            code: VALIDATION_ERROR
+            detail: request validation failed
+            instance: /v1/dealerships/d-001/vehicles
+            request_id: 01a18702-a3db-7294-ba3f-2828fd5b885b
+            errors:
+              - field: vin
+                message: must be 17 characters A-Z/0-9 excluding I, O and Q
+    NotFound:
+      description: '`DEALERSHIP_NOT_FOUND`, `VEHICLE_NOT_FOUND` (also for a vehicle of another dealership) or `NOT_FOUND` (no such endpoint).'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: |
+        A business rule rejected the command: `VEHICLE_ALREADY_EXISTS`, `VEHICLE_NOT_IN_STOCK`,
+        `VEHICLE_ALREADY_SOLD`, `VEHICLE_NOT_AGING`, `ACTION_ALREADY_ACTIVE`, `ACTION_NOT_ACTIVE`,
+        or `CONCURRENCY_CONFLICT` (the vehicle kept changing during the server's retries).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.inventory.local/VEHICLE_NOT_AGING
+            title: Vehicle is not aging
+            status: 409
+            code: VEHICLE_NOT_AGING
+            detail: 'vehicle is not aging: veh-1001 is 30 days in stock on 2026-10-29'
+            instance: /v1/dealerships/d-001/vehicles/veh-1001/actions
+            request_id: 01a18702-a3db-7294-ba3f-2828fd5b885b
+    PreconditionFailed:
+      description: '`VERSION_MISMATCH`: `If-Match` does not equal the current version.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: '`BODY_TOO_LARGE`: the body exceeds 64 KiB.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: '`UNSUPPORTED_MEDIA_TYPE`: the body is not `application/json`.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Internal:
+      description: '`INTERNAL`: unexpected error; details are logged with the request ID, never returned.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unavailable:
+      description: |
+        `UNAVAILABLE` with `Retry-After: 1`. Commands: MySQL was unreachable, a transient
+        database error persisted through the retries, or the request timed out (10 s); the
+        outcome is unknown, so check the vehicle's state before retrying. Queries: only on the
+        request timeout; a read model that cannot be reached returns `500 INTERNAL`.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    SafeId:
+      type: string
+      pattern: '^[A-Za-z0-9._:@-]{1,128}$'
+    Date:
+      type: string
+      format: date
+      example: '2026-06-01'
+    ActionType:
+      type: string
+      enum: [PRICE_REDUCTION, PROMOTE, TRANSFER, AUCTION, WHOLESALE, HOLD, OTHER]
+    InventoryStatus:
+      type: string
+      enum: [IN_STOCK, SOLD]
+    StockVehicleRequest:
+      type: object
+      additionalProperties: false
+      required: [vin, make, model, model_year, stocked_on]
+      properties:
+        vehicle_id:
+          $ref: '#/components/schemas/SafeId'
+          description: Optional; generated (UUIDv7) when omitted.
+        vin:
+          type: string
+          description: 17 characters A-Z/0-9 without I, O, Q (lower case is upper-cased).
+          pattern: '^[A-HJ-NPR-Za-hj-npr-z0-9]{17}$'
+          example: 1HGCM82633A004352
+        make:
+          type: string
+          minLength: 1
+          maxLength: 64
+        model:
+          type: string
+          minLength: 1
+          maxLength: 64
+        model_year:
+          type: integer
+          minimum: 1900
+          description: At most the business date's year + 1.
+        stocked_on:
+          $ref: '#/components/schemas/Date'
+          description: Not after the dealership's business date.
+    ActionRequest:
+      type: object
+      additionalProperties: false
+      required: [action_type]
+      properties:
+        action_type:
+          $ref: '#/components/schemas/ActionType'
+        note:
+          type: string
+          maxLength: 1000
+          description: Required when action_type is OTHER.
+    CancelActionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          maxLength: 1000
+    SellVehicleRequest:
+      type: object
+      additionalProperties: false
+      required: [sold_on]
+      properties:
+        sold_on:
+          $ref: '#/components/schemas/Date'
+    CommandAction:
+      type: object
+      required: [action_id, action_type, note]
+      properties:
+        action_id:
+          type: string
+        action_type:
+          $ref: '#/components/schemas/ActionType'
+        note:
+          type: string
+    CommandVehicle:
+      type: object
+      description: Committed write-side state. `age_days` and `is_aging` are computed at `business_date`.
+      required: [vehicle_id, dealership_id, vin, make, model, model_year, stocked_on, status, sold_on, age_days, is_aging, current_action, version, business_date]
+      properties:
+        vehicle_id:
+          type: string
+        dealership_id:
+          type: string
+        vin:
+          type: string
+        make:
+          type: string
+        model:
+          type: string
+        model_year:
+          type: integer
+        stocked_on:
+          $ref: '#/components/schemas/Date'
+        status:
+          $ref: '#/components/schemas/InventoryStatus'
+        sold_on:
+          oneOf:
+            - $ref: '#/components/schemas/Date'
+            - type: 'null'
+        age_days:
+          type: integer
+          description: Days in stock at business_date (for a sold vehicle, until sold_on).
+        is_aging:
+          type: boolean
+          description: IN_STOCK and age_days > 90.
+        current_action:
+          oneOf:
+            - $ref: '#/components/schemas/CommandAction'
+            - type: 'null'
+        version:
+          type: integer
+          minimum: 1
+        business_date:
+          $ref: '#/components/schemas/Date'
+      example:
+        vehicle_id: veh-1001
+        dealership_id: d-001
+        vin: 1HGCM82633A004352
+        make: Toyota
+        model: Corolla
+        model_year: 2023
+        stocked_on: '2026-06-01'
+        status: IN_STOCK
+        sold_on: null
+        age_days: 150
+        is_aging: true
+        current_action: null
+        version: 1
+        business_date: '2026-10-29'
+    CurrentAction:
+      type: object
+      required: [action_id, action_type, note, proposed_at, updated_at, updated_by]
+      properties:
+        action_id:
+          type: string
+        action_type:
+          $ref: '#/components/schemas/ActionType'
+        note:
+          type: string
+        proposed_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        updated_by:
+          type: string
+          description: X-Actor-Id of the last proposal or revision.
+    InventoryItem:
+      type: object
+      required: [vehicle_id, dealership_id, vin, make, model, model_year, stocked_on, status, sold_on, age_days, is_aging, current_action, version]
+      properties:
+        vehicle_id:
+          type: string
+        dealership_id:
+          type: string
+        vin:
+          type: string
+        make:
+          type: string
+        model:
+          type: string
+        model_year:
+          type: integer
+        stocked_on:
+          $ref: '#/components/schemas/Date'
+        status:
+          $ref: '#/components/schemas/InventoryStatus'
+        sold_on:
+          oneOf:
+            - $ref: '#/components/schemas/Date'
+            - type: 'null'
+        age_days:
+          type: integer
+          description: Days in stock at as_of (for a sold vehicle, until sold_on; negative if as_of is before stocked_on).
+        is_aging:
+          type: boolean
+        current_action:
+          oneOf:
+            - $ref: '#/components/schemas/CurrentAction'
+            - type: 'null'
+        version:
+          type: integer
+          description: Read-model version of the vehicle (may lag the write side).
+    VehicleDetail:
+      allOf:
+        - $ref: '#/components/schemas/InventoryItem'
+        - type: object
+          required: [as_of]
+          properties:
+            as_of:
+              $ref: '#/components/schemas/Date'
+    PageInfo:
+      type: object
+      required: [limit, has_more, next_cursor]
+      properties:
+        limit:
+          type: integer
+        has_more:
+          type: boolean
+        next_cursor:
+          type: [string, 'null']
+    InventoryList:
+      type: object
+      required: [as_of, aging_threshold_days, data, page]
+      properties:
+        as_of:
+          $ref: '#/components/schemas/Date'
+        aging_threshold_days:
+          type: integer
+          const: 90
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/InventoryItem'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+    HistoryEntry:
+      type: object
+      required: [event_id, version, action_id, change, action_type, note, reason, actor_id, correlation_id, occurred_at]
+      properties:
+        event_id:
+          type: integer
+          format: int64
+        version:
+          type: integer
+        action_id:
+          type: string
+        change:
+          type: string
+          enum: [PROPOSED, REVISED, CANCELLED, CLOSED_BY_SALE]
+        action_type:
+          $ref: '#/components/schemas/ActionType'
+        note:
+          type: string
+        reason:
+          type: string
+        actor_id:
+          type: string
+        correlation_id:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+    ActionHistory:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/HistoryEntry'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+    InventorySummary:
+      type: object
+      required: [as_of, aging_threshold_days, in_stock, aging, aging_without_action, oldest_stocked_on]
+      properties:
+        as_of:
+          $ref: '#/components/schemas/Date'
+        aging_threshold_days:
+          type: integer
+          const: 90
+        in_stock:
+          type: integer
+        aging:
+          type: integer
+        aging_without_action:
+          type: integer
+          description: Aging vehicles that still need a decision.
+        oldest_stocked_on:
+          oneOf:
+            - $ref: '#/components/schemas/Date'
+            - type: 'null'
+    ProbeStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+        message:
+          type: string
+    Problem:
+      type: object
+      description: RFC 9457 problem details with a stable machine-readable `code`.
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: https://errors.inventory.local/VEHICLE_NOT_FOUND
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+        detail:
+          type: string
+        instance:
+          type: string
+        request_id:
+          type: string
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'

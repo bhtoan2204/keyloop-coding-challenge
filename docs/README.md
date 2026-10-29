@@ -1,6 +1,6 @@
 # Design & Plan — Intelligent Inventory Dashboard (Scenario B, backend)
 
-Status: **Phase 4 (PostgreSQL read model, projections, query API) implemented and verified — uncommitted, awaiting developer review. Phases 1–3 are committed (`ac84073`, `82826e4`, `ba964e7` + `354f015`). The read model is refreshed by `sync-projections` (not real-time); Phase 5 adds Debezium/Kafka.**
+Status: **Phase 6 (packaging, API contract, documentation) implemented and verified — uncommitted, awaiting developer review. Phases 1–5.5 are committed. The submission entry points are the [README](../README.md), the [System Design Document](system-design.md), the [OpenAPI contract](../api/openapi.yaml), [curl examples](curl-examples.md) and the [demo outline](demo.md).** The numbered documents below are the working design notes; where they differ from the code, the code and the "as implemented" sections win.
 Target completion of all deliverables: **Wednesday 4 November 2026.**
 
 > Sources: `KeyloopCodingChallange.pdf` (Scenario B, Part 1/2, deliverables, evaluation framework) and the
@@ -30,6 +30,9 @@ recommendation was **rejected by the developer** and is reversed below (D1, D2).
 | 06 | [API contracts](06-api-contracts.md) | REST endpoints, payloads, errors, pagination |
 | 07 | [Implementation plan](07-implementation-plan.md) | Minimal-change roadmap to 4 Nov, critical path, cut list |
 | 08 | [Observability strategy](08-observability.md) | Logs, metrics, traces, health |
+| — | [System Design Document](system-design.md) | The submission SDD: architecture, flows, consistency, concurrency, failures, security, trade-offs, GenAI |
+| — | [curl examples](curl-examples.md) | Every endpoint and error, copy-paste ready |
+| — | [Demo / video outline](demo.md) | 5–10 minute walkthrough script |
 | — | [AI collaboration log](ai-log.md) | Factual record of AI contributions, corrections and verification |
 
 ## Decisions
@@ -41,11 +44,11 @@ IDs are stable. Reversed or downgraded decisions keep their ID so the history st
 | D1 | ~~Replace GORM + SQLite with `database/sql`/`pgx`~~ → **Keep GORM for the event store.** Add the GORM MySQL driver. Keep the SQLite tests as fast unit-level tests and add MySQL-backed integration tests. | **Reversed** | 02 §4, 04 |
 | D2 | ~~Drop snapshots, `es_aggregate`, serializer, outbox, Redis/cache stubs~~ → **Keep all.** Snapshots are **disabled for `VehicleInventoryAggregate`** (interval 0) because of a verified state-loss hazard (04 §7). The outbox, cache and Redis stubs stay in place, unwired. | **Reversed** | 02 §4, 04 §7 |
 | D3 | A new action may only be **proposed** for a vehicle that is aging at the business date | Proposed | 01 A6, 03 |
-| D4 | Active-VIN uniqueness reservation table | **Optional** (cut list) | 04 §6 |
+| D4 | Active-VIN uniqueness reservation table | **Cut** (not implemented; disclosed) | 04 §6 |
 | D5 | Projection progress = the per-aggregate version stored in the same Postgres tx as the state (**mandatory**). Storing Kafka offsets in Postgres too is **optional**. | Downgraded | 05 §4 |
-| D6 | Version gaps: **detect + halt** (mandatory). Automatic repair from MySQL is **optional**. | Downgraded | 05 §4.3 |
-| D7 | One binary (`cmd/main.go`) with subcommands `api`, `projector`, `migrate`, `rebuild` | Proposed | 02 §2 |
-| D8 | Jaeger + Prometheus containers only behind an opt-in Compose profile | Proposed | 08 |
+| D6 | Version gaps: **detect + halt** (mandatory). Automatic repair from MySQL is **optional**. | **Implemented** (repair from MySQL, halt if unrepairable) | 05 §7.5 |
+| D7 | One binary (`cmd/main.go`) with subcommands `api`, `projector`, `migrate`, `rebuild` | **Implemented** (+ `sync-projections`, `healthcheck`) | README |
+| D8 | Jaeger + Prometheus containers only behind an opt-in Compose profile | **Not done**: `/metrics` endpoints only, no extra containers | 08 |
 | D9 | Action vocabulary: fixed enum + note; Proposed → Revised* → Cancelled / closed by sale | Proposed | 03 |
 | D10 | Inventory **summary** endpoint backing the PDF's "prominently display" | Proposed | 06 |
 | D11 | Maintain [ai-log.md](ai-log.md) from Phase 0 onward as the only source for the AI narrative | **Active** | 07 |

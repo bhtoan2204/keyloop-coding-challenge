@@ -295,3 +295,59 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
     - The projector probe servers gave identical `/healthz`, `/readyz`, 404 and `/status` shape.
     - The access-log and error-log lines were identical.
 - **Not changed:** business behaviour, events, SQL, schemas, dependencies, `cmd/`.
+
+## 2026-10-29 — Phase 6: packaging, API contract, observability, submission docs
+
+- **Delegated:**
+  - **Packaging:** a multi-stage `Dockerfile` (`golang:1.26.9-alpine3.24` → `distroless/static:nonroot`, both pinned by digest; 26 MB image) and an allow-list `.dockerignore`. Compose gains one-shot init services (`migrate`, `mysql-grants`, `postgres-grants`, `kafka-topic`, `connector`) plus `api` and `projector`. New Make targets `stack-up`/`stack-wait`/`stack-down`/`stack-logs`/`e2e`.
+  - **CLI:** a `healthcheck` subcommand for the distroless health checks.
+  - **API contract:** `api/openapi.yaml` (OpenAPI 3.1), embedded and served at `/openapi.yaml` and `/docs` (Swagger UI, new `presentation/apidocs`), with a contract test.
+  - **Metrics:** Prometheus `/metrics` on both processes. HTTP metrics live in `httpkit`; the consumer metrics come from a scrape-time collector over `messaging.Status`, which gained `RecordsFailed`. New dependency: `prometheus/client_golang` v1.24.1; minimum version selection raised `x/sync` 0.10 → 0.22 and `x/text` 0.21 → 0.40.
+  - **Tests:** `internal/e2e` (build tag `e2e`).
+  - **Docs:** `README.md` (rewritten, with the AI Collaboration Narrative), `docs/system-design.md`, `docs/demo.md` (video outline; **no video recorded**), `docs/curl-examples.md`, and status updates in `docs/README.md`, `06`, `07`, `08`, `CLAUDE.md`, `.env.example` and the architecture rule.
+- **Problems found while verifying, and fixed:**
+  - (1) **podman-compose cannot start a service whose `depends_on` target has exited:** it adds `podman --requires`, which needs running containers, and it re-ran init jobs when retrying. `make stack-up` now runs each init job with `compose run --rm --no-deps`, which works on any engine. `docker compose up -d --build` relies on Docker Compose v2's `service_completed_successfully` and is **not verified** here: only podman-compose was available.
+  - (2) **A latent Phase 5 Makefile bug:** `CONNECT_URL ?= …$${CONNECT_PORT:-8083}`, once exported, was expanded by sub-makes as a make variable (to empty), so `$(MAKE) connect-wait` (also inside `make cdc-up`) polled `http://127.0.0.1:/connectors` forever. It was found by the clean start and fixed with make-level `CONNECT_PORT`/`API_PORT`/`PROJECTOR_PORT`.
+  - (3) **An invalid restart check.** The first projector-restart check ran right after a `.env` source failure; `compose stop projector` silently did nothing, and the "stale read" was ordinary lag. Redone with visible output.
+  - (4) **The AI's own `pgrep -f` pattern matched its shell and killed the command** (exit 144), the same mistake as in Phase 4. The interrupted edits were re-run.
+  - (5) **Two wrong facts in the AI's first SDD draft:** "20 concurrent proposals → 1×201, 19×409" (the log says 16 per round over 5 rounds, 1×201 + 15×409) and a non-existent `internal/domain/aging.go`. Both corrected.
+  - (6) **The README first said the safety hook blocks commits.** It only asks for approval. Corrected.
+  - (7) **External tool denied.** `npx @redocly/cli lint` (downloading and executing external code) was denied by the session's permission classifier. The spec was instead validated locally with PyYAML (all 162 `$ref`s resolve, unique operationIds, path parameters declared, no unused components), and a Go test checks that every documented operation is routed.
+- **Independent reviews** (read-only agents; no Critical findings):
+  - **Security review.** Fixed:
+    - the `method` metric label was client-controlled: series could grow without limit (the reviewer reproduced 50 methods → 650 series). Methods are now folded into a fixed set plus `OTHER`, with a test;
+    - compose could create the Debezium account with an **empty password**, and `CREATE USER IF NOT EXISTS` never rotated a password. The init scripts now refuse empty or non-alphanumeric passwords (sed substitution into SQL) and re-apply passwords with `ALTER USER`/`ALTER ROLE`; root's password uses `MYSQL_PWD` instead of argv. The empty-password refusal was verified (exit 1);
+    - `/docs` loaded CDN scripts with no protection. It now uses SRI hashes and a strict CSP (inline script allowed by a hash computed from the script); verified by rendering the page in headless Chromium with no violations.
+
+    Documented, not fixed:
+    - the projector and projection commands write PostgreSQL as the image-created **superuser**; the docs had wrongly called it the "schema owner";
+    - MySQL `root@'%'`;
+    - floating infrastructure image tags; no resource limits;
+    - the connector config hard-codes the database and user names;
+    - the `govulncheck` findings.
+  - **Go/architecture review.** Fixed:
+    - the OpenAPI document said queries return 503 on a dependency failure; the code returns 500 (only timeouts give 503). The **spec was corrected, behaviour unchanged**;
+    - the spec misdescribed `If-Match` (unquoted values are accepted, `*` is rejected), `limit=0` (means default) and `status` (case-insensitive);
+    - e2e subtests called `Fatal` on the parent test, and "today" could change mid-run;
+    - there was no messaging-level test of `RecordsFailed` (owned vs revoked partition), and the collector test checked too few series;
+    - stale compose comments; the image was built once per service; health checks had no `start_period`;
+    - the top-level `api` package is recorded as a deliberate exception in the architecture rule.
+
+    Accepted as is: the contract test checks routing in one direction only (status codes and schemas are not machine-checked against the code).
+  - **New mutation checks:** an unbounded method label, counting failures for revoked partitions, a missing CSP header, and an undocumented route in the spec. All failed the tests as intended.
+- **Verified (this session):**
+  - **Clean start, twice.** The working tree was copied without `.env` into a scratch directory, given a fresh `.env` from `.env.example` with random alphanumeric passwords, and run as Compose project `keyloop-clean` with its own volumes, with the dev stack stopped (not removed). `make stack-up` exited 0 in 65 s and, after the review fixes, in 82 s. The image was removed first; Podman's layer cache may have shortened the build.
+  - **On the clean stack:**
+    - `make e2e`: `TestBusinessFlow` passed with all 6 subtests, covering stock; aging at 120/91/90/89 days (exactly 90 is not aging, 90 turns aging with `as_of` tomorrow); make, model and age-range filters; `age_asc`; keyset pagination and `INVALID_CURSOR`; `VEHICLE_NOT_AGING`, propose with `If-Match`/`Location`/`ETag`, `ACTION_ALREADY_ACTIVE`, 412 on a stale `If-Match`, revise, cancel, re-propose, sale, `VEHICLE_ALREADY_SOLD`; propagation through Debezium/Kafka; history `PROPOSED, REVISED, CANCELLED, PROPOSED, CLOSED_BY_SALE` with the actor; error mapping; summary;
+    - **projector restart:** stopped (logged "stopped", exit 0); 4 commands written while it was down; restarted. The startup sync applied the 4 events and Kafka re-delivered them as 4 duplicates, which were skipped. History had 3 entries, not duplicated;
+    - **rebuild while running:** read 17, applied 17; identical rows (23/23);
+    - **full stop and start of the stack:** the read model was unchanged (23 rows); a second `make e2e` passed;
+    - **served:** `/openapi.yaml` (application/yaml), `/docs`, and both `/metrics` endpoints;
+    - **idempotency:** all five init jobs re-ran with exit 0 on the populated stack.
+  - **Dev stack:** `gofmt` clean, `go vet ./...` clean, `make check` exit 0 (34 ok lines, 316 PASS lines in the default suite), `make test-integration` exit 0 (164 top-level PASS, 0 FAIL/SKIP), integration suite under `-race` exit 0 (17 packages ok), `make test-pipeline` 9/9 PASS.
+  - **`govulncheck ./...`:** 17 reachable findings (15 stdlib with Go 1.26.5, `x/text` v0.40.0, `pgx` v5.6.0), none in modules added in Phase 6.
+- **Not verified:** Docker Compose v2 (`docker compose up -d --build`), a cold image build time, `/docs` in a real browser beyond headless Chromium, load or latency beyond the single-host measurements, and the video (not recorded).
+- **Environment notes:**
+  - the dev stack was stopped twice and restarted for the clean-start runs; `compose up` recreated the dev MySQL container after its health check changed, and the data volumes were kept;
+  - the clean projects' containers and volumes were removed afterwards (0 left).
+- **Not done by the AI:** no commit or push.

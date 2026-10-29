@@ -6,10 +6,15 @@ COMPOSE ?= docker compose
 MYSQL_DATABASE ?= inventory
 MYSQL_APP_USER ?= inventory_app
 DEBEZIUM_MYSQL_USER ?= debezium
-CONNECT_URL ?= http://127.0.0.1:$${CONNECT_PORT:-8083}
+# Make-level defaults: a shell-style ${VAR:-default} inside an exported variable would be
+# expanded by make (to nothing) in sub-makes such as `$(MAKE) connect-wait`.
+CONNECT_PORT ?= 8083
+API_PORT ?= 8080
+PROJECTOR_PORT ?= 8081
+CONNECT_URL ?= http://127.0.0.1:$(CONNECT_PORT)
 CONNECTOR ?= es-event-cdc
 
-.PHONY: fmt-check vet test test-race test-integration test-pipeline check build migrate run-api run-projector sync-projections rebuild-projections up mysql-up mysql-wait mysql-down mysql-grants pg-up pg-wait pg-grants cdc-up connect-wait debezium-grants connector connector-status connector-restart
+.PHONY: fmt-check vet test test-race test-integration test-pipeline e2e stack-up stack-wait stack-down stack-logs check build migrate run-api run-projector sync-projections rebuild-projections up mysql-up mysql-wait mysql-down mysql-grants pg-up pg-wait pg-grants cdc-up connect-wait debezium-grants connector connector-status connector-restart
 
 fmt-check:
 	@test -z "$$(gofmt -l .)" || { gofmt -l .; echo "gofmt needed"; exit 1; }
@@ -18,6 +23,7 @@ vet:
 	go vet ./...
 	go vet -tags integration ./...
 	go vet -tags 'integration pipeline' ./...
+	go vet -tags e2e ./...
 
 test:
 	go test -count=1 ./...
@@ -36,7 +42,45 @@ test-integration:
 test-pipeline:
 	go test -tags 'integration pipeline' -count=1 -v -timeout 20m -run 'TestPipeline' ./internal/pipeline/...
 
+## Business flow against a running system (docker compose stack or run-api + run-projector).
+## E2E_BASE_URL defaults to http://127.0.0.1:8080.
+e2e:
+	go test -tags e2e -count=1 -v ./internal/e2e/...
+
 check: fmt-check vet test test-race
+
+## The whole system in containers: databases, Kafka, Debezium, migrations, grants,
+## topic, connector, API (127.0.0.1:8080) and projector (127.0.0.1:8081).
+## Runs the init jobs one by one, so it works with Docker Compose and podman-compose
+## alike (podman cannot start a container whose depends_on target has exited; with
+## Docker Compose v2 a plain `docker compose up -d --build` does the same).
+stack-up:
+	$(COMPOSE) build migrate
+	$(COMPOSE) up -d mysql postgres kafka connect
+	$(MAKE) mysql-wait pg-wait connect-wait
+	$(COMPOSE) run --rm --no-deps migrate
+	$(COMPOSE) run --rm --no-deps mysql-grants
+	$(COMPOSE) run --rm --no-deps postgres-grants
+	$(COMPOSE) run --rm --no-deps kafka-topic
+	$(COMPOSE) run --rm --no-deps connector
+	$(COMPOSE) up -d --no-deps api projector
+	$(MAKE) stack-wait
+
+## Waits until the API and the projector report ready.
+stack-wait:
+	@for i in $$(seq 1 90); do \
+		curl -fsS -m 3 http://127.0.0.1:$(API_PORT)/readyz >/dev/null 2>&1 \
+			&& curl -fsS -m 3 http://127.0.0.1:$(PROJECTOR_PORT)/readyz >/dev/null 2>&1 \
+			&& { echo "api and projector are ready"; exit 0; }; \
+		sleep 2; \
+	done; echo "api/projector not ready; see make stack-logs"; exit 1
+
+## Stops and removes the containers; data volumes are kept (add -v by hand to wipe them).
+stack-down:
+	$(COMPOSE) down
+
+stack-logs:
+	$(COMPOSE) logs -f api projector
 
 build:
 	go build -o bin/inventory ./cmd
@@ -74,7 +118,7 @@ cdc-up:
 
 connect-wait:
 	@for i in $$(seq 1 90); do \
-		curl -fsS $(CONNECT_URL)/connectors >/dev/null 2>&1 && { echo "kafka connect is ready"; exit 0; }; \
+		curl -fsS -m 3 $(CONNECT_URL)/connectors >/dev/null 2>&1 && { echo "kafka connect is ready"; exit 0; }; \
 		sleep 2; \
 	done; echo "kafka connect did not become ready"; exit 1
 

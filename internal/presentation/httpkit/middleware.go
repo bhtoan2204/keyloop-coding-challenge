@@ -57,13 +57,15 @@ func WithRequestContext(log *slog.Logger, next http.Handler) http.Handler {
 			status:         http.StatusOK,
 		}
 		next.ServeHTTP(rec, r)
+		elapsed := time.Since(start)
+		observeRequest(r, rec.status, elapsed)
 		log.InfoContext(r.Context(), "http request",
 			"request_id", id,
 			"method", r.Method,
 			"route", r.Pattern,
 			"path", r.URL.Path,
 			"status", rec.status,
-			"duration_ms", time.Since(start).Milliseconds(),
+			"duration_ms", elapsed.Milliseconds(),
 			"actor_id", sanitizedActor(r))
 	})
 }

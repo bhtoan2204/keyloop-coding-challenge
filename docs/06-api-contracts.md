@@ -1,5 +1,7 @@
 # 06 — REST API Contracts
 
+> **The authoritative contract is [`api/openapi.yaml`](../api/openapi.yaml)** (OpenAPI 3.1, served by the API at `/openapi.yaml` and `/docs`; `openapi_contract_test.go` checks every documented operation is routed). This document is the design note it was derived from; where they differ, the OpenAPI document and the code win.
+
 Per the PDF, the client layer is stubbed with this OpenAPI contract **and** runnable cURL examples (`docs/curl-examples.md`, exercised by `scripts/demo.sh`).
 
 Base path `/v1`, JSON only. Dates are `YYYY-MM-DD`, timestamps are RFC 3339 UTC. The OpenAPI 3.1 spec lives at `api/openapi.yaml` and is served at `GET /openapi.yaml`, with Swagger UI at `/docs`. A contract test validates every handler response in the integration suite against the spec (kin-openapi).

@@ -24,6 +24,8 @@ type Status struct {
 	EventsApplied     int64  `json:"events_applied"`
 	DuplicatesSkipped int64  `json:"duplicates_skipped"`
 	GapEventsRepaired int64  `json:"gap_events_repaired"`
+	// RecordsFailed counts failed attempts (each retry of a halted record counts).
+	RecordsFailed int64 `json:"records_failed"`
 	// LastAppliedAt is when the last event was applied (not skipped).
 	LastAppliedAt *time.Time `json:"last_applied_at,omitempty"`
 	// LastChangeLagMs is apply time minus the MySQL commit time of the last live
@@ -140,6 +142,7 @@ func (h *health) partitionFailed(rec Record, err error, poison bool) int {
 	if !h.isOwned(rec.partitionID()) {
 		return 1
 	}
+	h.status.RecordsFailed++
 	p := h.partition(rec.partitionID())
 	if !p.Failing || p.FailingOffset != rec.Offset {
 		p.Failures = 0

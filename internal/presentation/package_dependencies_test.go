@@ -22,6 +22,7 @@ func TestPresentationPackageDependencies(t *testing.T) {
 		"commands": {"httpkit"},
 		"queries":  {"httpkit"},
 		"probes":   {"httpkit"},
+		"apidocs":  {"httpkit"},
 	}
 	for pkg, may := range allowed {
 		p, err := build.ImportDir(filepath.Join(root, pkg), 0)
