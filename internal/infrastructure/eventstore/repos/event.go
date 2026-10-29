@@ -111,7 +111,7 @@ func (r *eventRepo) decode(evt *eventsourcing.Event, aggregateType, data string,
 	}
 	factory, ok := r.serialize.Type(aggregateType, evt.EventType)
 	if !ok {
-		return fmt.Errorf("unknown event type %s_%s", aggregateType, evt.EventType)
+		return fmt.Errorf("%w %s_%s", ErrUnknownEventType, aggregateType, evt.EventType)
 	}
 	eventData := factory()
 	if err := r.serialize.Unmarshal([]byte(data), eventData); err != nil {

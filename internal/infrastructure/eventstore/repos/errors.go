@@ -23,6 +23,10 @@ var (
 	// struct could silently drop or misread fields, so it is refused.
 	ErrUnsupportedSchemaVersion = errors.New("unsupported event schema version")
 
+	// ErrUnknownEventType means a stored event's aggregate/event type is not registered
+	// with the serializer (written by a newer release, or a missing registration).
+	ErrUnknownEventType = errors.New("unknown event type")
+
 	// ErrRetryable marks a transient database failure (deadlock, lock wait timeout).
 	// The transaction was rolled back; the caller may reload the aggregate and re-run
 	// the command. It is not an optimistic concurrency conflict.

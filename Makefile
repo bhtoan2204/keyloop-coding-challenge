@@ -5,8 +5,11 @@ export
 COMPOSE ?= docker compose
 MYSQL_DATABASE ?= inventory
 MYSQL_APP_USER ?= inventory_app
+DEBEZIUM_MYSQL_USER ?= debezium
+CONNECT_URL ?= http://127.0.0.1:$${CONNECT_PORT:-8083}
+CONNECTOR ?= es-event-cdc
 
-.PHONY: fmt-check vet test test-race test-integration check build migrate run-api sync-projections rebuild-projections up mysql-up mysql-wait mysql-down mysql-grants pg-up pg-wait pg-grants
+.PHONY: fmt-check vet test test-race test-integration test-pipeline check build migrate run-api run-projector sync-projections rebuild-projections up mysql-up mysql-wait mysql-down mysql-grants pg-up pg-wait pg-grants cdc-up connect-wait debezium-grants connector connector-status connector-restart
 
 fmt-check:
 	@test -z "$$(gofmt -l .)" || { gofmt -l .; echo "gofmt needed"; exit 1; }
@@ -14,6 +17,7 @@ fmt-check:
 vet:
 	go vet ./...
 	go vet -tags integration ./...
+	go vet -tags 'integration pipeline' ./...
 
 test:
 	go test -count=1 ./...
@@ -25,6 +29,12 @@ test-race:
 ## The tests fail (never skip) when a DSN is missing.
 test-integration:
 	go test -tags integration -count=1 -v ./...
+
+## Full pipeline tests: real MySQL, Debezium (Kafka Connect), Kafka and PostgreSQL.
+## Needs `make up cdc-up debezium-grants` and the DSNs plus KAFKA_TEST_BROKERS and
+## CONNECT_TEST_URL (see .env.example). Each test registers its own connector.
+test-pipeline:
+	go test -tags 'integration pipeline' -count=1 -v -timeout 20m -run 'TestPipeline' ./internal/pipeline/...
 
 check: fmt-check vet test test-race
 
@@ -39,8 +49,14 @@ migrate:
 run-api:
 	go run ./cmd api
 
-## Phase 4 read-model refresh (NOT real time): applies events committed since the last run,
-## read from one consistent MySQL snapshot. Safe to repeat; one run at a time.
+## Live projection consumer: Debezium/Kafka change feed -> PostgreSQL read model.
+## Probes on PROJECTOR_HTTP_ADDR (/healthz, /readyz, /status).
+run-projector:
+	go run ./cmd projector
+
+## Point-in-time read-model refresh from MySQL (recovery; the projector does this on
+## startup): applies events committed since the last run, read from one consistent
+## MySQL snapshot. Safe to repeat and safe while the projector runs.
 sync-projections:
 	go run ./cmd sync-projections
 
@@ -49,6 +65,37 @@ rebuild-projections:
 	go run ./cmd rebuild-projections
 
 up: mysql-up pg-up
+
+## Kafka (KRaft) and Kafka Connect with Debezium. Then: `make debezium-grants connector`.
+cdc-up:
+	@test -n "$$DEBEZIUM_MYSQL_PASSWORD" || { echo "set DEBEZIUM_MYSQL_PASSWORD in .env"; exit 1; }
+	$(COMPOSE) up -d kafka connect
+	$(MAKE) connect-wait
+
+connect-wait:
+	@for i in $$(seq 1 90); do \
+		curl -fsS $(CONNECT_URL)/connectors >/dev/null 2>&1 && { echo "kafka connect is ready"; exit 0; }; \
+		sleep 2; \
+	done; echo "kafka connect did not become ready"; exit 1
+
+## Creates the Debezium MySQL account (binlog + SELECT on es_event). Run after `make migrate`.
+debezium-grants:
+	@test -n "$$DEBEZIUM_MYSQL_PASSWORD" || { echo "set DEBEZIUM_MYSQL_PASSWORD in .env"; exit 1; }
+	@sed -e "s/{{database}}/$(MYSQL_DATABASE)/g" -e "s/{{debezium_user}}/$(DEBEZIUM_MYSQL_USER)/g" \
+		-e "s/{{debezium_password}}/$$DEBEZIUM_MYSQL_PASSWORD/g" deploy/mysql/debezium-grants.sql \
+		| $(COMPOSE) exec -T mysql mysql -uroot -p"$$MYSQL_ROOT_PASSWORD"
+
+## Registers (or updates) the es_event connector. Idempotent: PUT of the config.
+connector:
+	@curl -fsS -X PUT -H 'Content-Type: application/json' --data @deploy/debezium/es-event-connector.json \
+		$(CONNECT_URL)/connectors/$(CONNECTOR)/config >/dev/null && echo "connector $(CONNECTOR) registered"
+
+connector-status:
+	@curl -fsS $(CONNECT_URL)/connectors/$(CONNECTOR)/status; echo
+
+## Restarts the connector and its task; it resumes from its stored binlog offset.
+connector-restart:
+	@curl -fsS -X POST "$(CONNECT_URL)/connectors/$(CONNECTOR)/restart?includeTasks=true" >/dev/null && echo "restart requested"
 
 mysql-up:
 	$(COMPOSE) up -d mysql

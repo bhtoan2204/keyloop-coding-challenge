@@ -21,6 +21,10 @@ type EventStore interface {
 	// ReadAll streams the whole event history from one consistent snapshot, ordered by
 	// (aggregate_id, version). Read-only; used to rebuild and sync projections.
 	ReadAll(ctx context.Context, batchSize int, fn func(eventsourcing.Event) error) error
+	// ReadStream returns the events of one aggregate with afterVersion < version <=
+	// toVersion, in version order, decoded like ReadAll. Read-only; used by the live
+	// projection consumer to repair version gaps in the change feed.
+	ReadStream(ctx context.Context, aggregateID string, afterVersion, toVersion int) ([]eventsourcing.Event, error)
 	WithTransaction(ctx context.Context, fn func(EventStore) error) error
 }
 

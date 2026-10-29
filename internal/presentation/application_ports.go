@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"keyloop-coding-challenge/internal/application/command"
+	"keyloop-coding-challenge/internal/application/messaging"
 	"keyloop-coding-challenge/internal/application/query"
 	"keyloop-coding-challenge/internal/domain"
 )
@@ -20,9 +21,12 @@ type CommandService interface {
 // ReadinessCheck reports whether the dependencies of the write API are reachable.
 type ReadinessCheck func(ctx context.Context) error
 
+// ConsumerStatus is implemented by (*messaging.Consumer).Status.
+type ConsumerStatus func() messaging.Status
+
 // QueryService is implemented by *query.Service. Responses come from the PostgreSQL
-// read model, which is eventually consistent with the event store (in Phase 4 it is
-// refreshed by the sync-projections command, not continuously).
+// read model, which is eventually consistent with the event store: the projector
+// applies the change feed continuously (Phase 5).
 type QueryService interface {
 	ListInventory(ctx context.Context, q query.ListInventory) (*query.InventoryPage, error)
 	GetVehicle(ctx context.Context, dealershipID, vehicleID string, asOf *domain.Date) (*query.VehicleResult, error)

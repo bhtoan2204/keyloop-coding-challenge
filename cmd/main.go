@@ -4,6 +4,7 @@
 //	main api                  serve the REST API (commands: MySQL app user; queries: PG reader)
 //	main sync-projections     apply new events from MySQL to the read model (point in time)
 //	main rebuild-projections  rebuild the read model from the full MySQL history
+//	main projector            apply the live change feed (Debezium/Kafka) to the read model
 //
 // Configuration comes from the environment; see .env.example.
 package main
@@ -18,7 +19,7 @@ import (
 	_ "time/tzdata" // dealership time zones must resolve in minimal containers too
 )
 
-const usage = "usage: main api|migrate|sync-projections|rebuild-projections"
+const usage = "usage: main api|migrate|sync-projections|rebuild-projections|projector"
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -43,6 +44,8 @@ func run(args []string) int {
 		err = runProjections(ctx, log, false)
 	case "rebuild-projections":
 		err = runProjections(ctx, log, true)
+	case "projector":
+		err = runProjector(ctx, log)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q; %s\n", args[0], usage)
 		return 2

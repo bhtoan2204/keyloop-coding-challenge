@@ -64,7 +64,44 @@ func (r *eventRepo) readBatch(ctx context.Context, conn *gorm.DB, afterID string
 	}
 	// Decode the whole batch before calling fn, so the result set is closed while fn
 	// runs (fn may be slow: it writes to the read model).
-	var batch []eventsourcing.Event
+	batch, err := r.scanEvents(rows)
+	if err != nil {
+		return 0, fmt.Errorf("read all: %w", err)
+	}
+	for _, evt := range batch {
+		if err := fn(evt); err != nil {
+			return 0, err
+		}
+	}
+	return len(batch), nil
+}
+
+func (r *eventRepo) ReadStream(ctx context.Context, aggregateID string, afterVersion, toVersion int) ([]eventsourcing.Event, error) {
+	if toVersion <= afterVersion {
+		return nil, nil
+	}
+	rows, err := r.db.WithContext(ctx).Raw(`
+		SELECT id, aggregate_id, aggregate_type, event_type, version, schema_version, data, metadata, created_at
+		FROM es_event
+		WHERE aggregate_id = ?
+			AND version > ?
+			AND version <= ?
+		ORDER BY version`, aggregateID, afterVersion, toVersion).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("read stream %s: %w", aggregateID, err)
+	}
+	events, err := r.scanEvents(rows)
+	if err != nil {
+		return nil, fmt.Errorf("read stream %s: %w", aggregateID, err)
+	}
+	return events, nil
+}
+
+// scanEvents decodes and closes rows of the es_event columns selected by ReadAll and
+// ReadStream. Every row must carry its aggregate type: it is decoded on its own.
+func (r *eventRepo) scanEvents(rows *sql.Rows) ([]eventsourcing.Event, error) {
+	defer rows.Close()
+	var events []eventsourcing.Event
 	for rows.Next() {
 		var (
 			evt      eventsourcing.Event
@@ -73,28 +110,18 @@ func (r *eventRepo) readBatch(ctx context.Context, conn *gorm.DB, afterID string
 		)
 		if err := rows.Scan(&evt.ID, &evt.AggregateID, &evt.AggregateType, &evt.EventType, &evt.Version,
 			&evt.SchemaVersion, &data, &metadata, &evt.CreatedAt); err != nil {
-			rows.Close()
-			return 0, err
+			return nil, err
 		}
 		if evt.AggregateType == "" {
-			rows.Close()
-			return 0, fmt.Errorf("read all: event %d of aggregate %s has no aggregate type", evt.ID, evt.AggregateID)
+			return nil, fmt.Errorf("event %d of aggregate %s has no aggregate type", evt.ID, evt.AggregateID)
 		}
 		if err := r.decode(&evt, evt.AggregateType, data, metadata); err != nil {
-			rows.Close()
-			return 0, err
+			return nil, err
 		}
-		batch = append(batch, evt)
+		events = append(events, evt)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
-		return 0, fmt.Errorf("read all: %w", err)
+		return nil, err
 	}
-	rows.Close()
-	for _, evt := range batch {
-		if err := fn(evt); err != nil {
-			return 0, err
-		}
-	}
-	return len(batch), nil
+	return events, nil
 }

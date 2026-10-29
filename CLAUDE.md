@@ -35,10 +35,16 @@ Implemented and tested:
 - Read side (Phase 4): `internal/infrastructure/viewstore` (PostgreSQL 17 read model + migrations),
   `internal/infrastructure/projection` (`Projection.Apply`, `VehicleProjector`, `Runner` sync/rebuild from one
   consistent MySQL snapshot via `repos.EventStore.ReadAll`), `internal/application/query`, `presentation/*_handler.go`
-  (4 GET endpoints). `cmd`: `sync-projections`, `rebuild-projections`. **Not real-time until Phase 5.**
+  (4 GET endpoints). `cmd`: `sync-projections`, `rebuild-projections` (now bootstrap/recovery tools).
+- Live change feed (Phase 5, `docs/05` §7): Compose `kafka` (KRaft) + `connect` (Debezium 3.6.2, connector
+  `deploy/debezium/es-event-connector.json`, account `deploy/mysql/debezium-grants.sql`);
+  `internal/application/messaging` (consumer: Debezium decoding, per-partition processing, offset commit after the
+  PG commit, gap repair via `repos.EventStore.ReadStream`, startup sync, health); `internal/infrastructure/kafka`
+  (franz-go transport); `projection.ConsumerAdapter`; `cmd projector` with `/healthz`, `/readyz`, `/status`.
+  Pipeline tests: `internal/pipeline` (tags `integration pipeline`).
 
-Not implemented yet: `internal/application/messaging` (Kafka consumer), Debezium/Kafka, `Dockerfile`, Idempotency-Key.
-`docker-compose.yaml` has MySQL only. `.env` is git-ignored; copy `.env.example`.
+Not implemented yet: `Dockerfile` (Go processes run on the host), Idempotency-Key, OpenAPI, observability.
+`.env` is git-ignored; copy `.env.example`.
 
 ## Reuse map (extend these; do not build parallel versions)
 | Need | Use |
@@ -49,6 +55,7 @@ Not implemented yet: `internal/application/messaging` (Kafka consumer), Debezium
 | Store port for commands | `command.VehicleStore`, implemented by `eventstore/commandstore` (maps store errors to `command.Err*`) |
 | Transactions on the write side | `repos.EventStore.WithTransaction` |
 | Projection | `projection.Projection` + `projectors.Projector` + `viewstore.ViewStore` (narrow refactor per `docs/05` §4.1) |
+| Live consumer | `messaging.Consumer` with ports `Transport` (`kafka.Transport`), `Projector`/`Synchronizer` (`projection.ConsumerAdapter`), `EventHistory` (`repos.EventStore`) |
 | Empty packages to fill | `internal/application/*`, `internal/presentation`, `cmd/main.go` |
 | Leave unwired, do not delete | `projectors/projector_outbox.go`, `internal/infrastructure/cache`, `package/redis` |
 
@@ -71,8 +78,9 @@ functions near 40–60 lines are review triggers, not limits.
 - Stored names are Go struct names (`VehicleInventoryAggregate`, `VehicleStockedEvent`, …) and are **frozen**.
 - OCC: CAS on `es_aggregate.version` + unique `(aggregate_id, version)`. Conflicts are retried by re-loading
   and re-running the command, never by re-inserting.
-- Read side (planned): Debezium on `es_event` only, Kafka key = `aggregate_id`, projector applies per-aggregate
-  version in the **same** Postgres tx as the state, skips duplicates, halts on gaps. Rebuild reads MySQL, never Kafka.
+- Read side: Debezium on `es_event` only, Kafka key = `aggregate_id`, one `Projection.Apply` tx per record (state,
+  history and applied version together), duplicates skipped, gaps repaired from MySQL or halted, never skipped.
+  Offsets are committed only after the PG commit. Rebuild/sync read MySQL, never Kafka.
 - Read side is eventually consistent; aging is computed at query time (never stored).
 
 ## Business invariants (`internal/domain/aggregates/vehicle_inventory_*.go`)
@@ -89,8 +97,10 @@ go test -count=1 ./...         # unit + SQLite-backed store tests (needs cgo for
 go test -race -count=1 ./...
 make up && make test-integration          # real MySQL 8.4 + PostgreSQL 17; needs MYSQL_TEST_DSN and PG_TEST_DSN
 make migrate && make mysql-grants && make pg-grants && make run-api   # local API
-make sync-projections                     # refresh the read model (Phase 4: manual, point in time)
-make check                                # fmt-check, vet (incl. -tags integration), test, test-race
+make cdc-up && make debezium-grants connector && make run-projector   # live change feed (docs/05 §7)
+make sync-projections                     # point-in-time catch-up from MySQL (recovery; safe while projector runs)
+make test-pipeline                        # real MySQL+Debezium+Kafka+PG; also needs KAFKA_TEST_BROKERS, CONNECT_TEST_URL
+make check                                # fmt-check, vet (incl. integration + pipeline tags), test, test-race
 ```
 Integration tests fail (never skip) without `MYSQL_TEST_DSN`. The dev machine uses rootless Podman
 (`docker compose` → podman-compose); Testcontainers is not used.

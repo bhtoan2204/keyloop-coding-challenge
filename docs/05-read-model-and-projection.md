@@ -97,7 +97,7 @@ Bracketed predicates are emitted only when the filter is present. `age_days > 90
 
 The cursor is base64url JSON `{sort, last, as_of, filter_hash}`. It pins `as_of`, so paging across midnight stays consistent, and a filter mismatch returns 400. Limit default 20, max 100.
 
-## 3. CDC: Debezium → Kafka *(to add)*
+## 3. CDC: Debezium → Kafka *(original plan; as implemented in §7)*
 
 ```json
 {
@@ -170,7 +170,7 @@ The `errgroup` branch of `runStage` (stages with more than one projector) is **n
 
 - `version ≤ current` means a duplicate or stale record. It is skipped.
 - `version > current + 1` means missing events. **Mandatory:** detect it, roll back, pause that partition with backoff, log at ERROR with aggregate and version context, set `projection_halted{partition}=1`, and fail readiness. Records are never skipped.
-- **Optional (D6):** repair by reading the missing versions from MySQL with the new `repos.ReadStream` (04 / 02 §5) inside the same tx, then continue.
+- **Optional (D6):** repair by reading the missing versions from MySQL with the new `repos.ReadStream` (04 / 02 §5) inside the same tx, then continue. *Implemented in Phase 5 (§7.5), one transaction per repaired event, not inside the record's transaction.*
 - Unknown `aggregate_type_event_type` in the serializer (existing `Type()` returns `ok=false`) is handled the same way: halt, never skip.
 
 ### 4.4 Rebuild and catch-up (does not depend on Kafka retention; D14)
@@ -216,7 +216,7 @@ sequenceDiagram
 
 ## 6. Phase 4 — as implemented (2026-10-29)
 
-**Status:** implemented and verified on PostgreSQL 17.11 + MySQL 8.4.13. **The read model is not real-time in Phase 4.** It changes only when `sync-projections` or `rebuild-projections` runs. Live delivery via Debezium/Kafka is Phase 5 and will reuse the same `Projection.Apply`.
+**Status:** implemented and verified on PostgreSQL 17.11 + MySQL 8.4.13. In Phase 4 the read model changed only when `sync-projections` or `rebuild-projections` ran. Since Phase 5 the `projector` applies the change feed continuously through the same `Projection.Apply` (§7); sync and rebuild remain for bootstrap and recovery.
 
 ### 6.1 Driver and packages
 - **Driver: GORM + `gorm.io/driver/postgres`** (pgx v5 underneath). The write side already uses GORM with raw SQL and `WithTransaction`; using pgx directly would add a second access abstraction for the same concern.
@@ -306,5 +306,227 @@ sequenceDiagram
 - **Sort semantics:** `sort` orders by `stocked_on`. For in-stock vehicles that equals age; for `status=SOLD|ALL` a sold vehicle's displayed `age_days` (age at sale) is not the sort key.
 - **`as_of` is a business-date override, not time travel:** it shows today's statuses, and an `as_of` before a vehicle's `stocked_on` gives a negative `age_days`.
 - **The `GET` detail `ETag` is the read-model version.** Between syncs it can be behind the write side, so `If-Match` with it can return `412` until the next sync.
-- **Future hazard (Phase 5):** a caller that wraps many `Apply` calls in one non-exclusive outer transaction would hold two advisory locks and a savepoint per event. The live consumer must commit per event (or per small batch).
+- **Future hazard (Phase 5):** a caller that wraps many `Apply` calls in one non-exclusive outer transaction would hold two advisory locks and a savepoint per event. The live consumer must commit per event (or per small batch). *Resolved: the Phase 5 consumer commits one transaction per event (§7.4).*
 - No `make_model` sort, no total count.
+
+## 7. Phase 5 — live change feed, as implemented (2026-10-29)
+
+**Status:** implemented and verified on MySQL 8.4.13, Debezium 3.6.2.Final (Kafka Connect 4.3.0), Apache Kafka 4.3.1 (KRaft) and PostgreSQL 17.11. The read model follows the event store continuously; no manual sync is needed in normal operation.
+
+```
+API ──commands──► MySQL es_event ──binlog──► Debezium (Kafka Connect) ──key=aggregate_id──► Kafka topic (3 partitions)
+                       ▲                                                                        │
+                       │ ReadStream (gap repair), ReadAll (startup sync / data-loss resync)     ▼
+                       └──────────────────────────────── projector: messaging.Consumer ──► Projection.Apply ──► PostgreSQL
+```
+
+### 7.1 Components
+
+| Piece | Where | Notes |
+|---|---|---|
+| Kafka (KRaft, single node) | `docker-compose.yaml` `kafka` | `apache/kafka:4.3.1`; auto topic creation off; volume `kafka-data`; 127.0.0.1 only |
+| Kafka Connect + Debezium MySQL | `docker-compose.yaml` `connect` | `quay.io/debezium/connect:3.6.2.Final`; password from `${env:DEBEZIUM_MYSQL_PASSWORD}` (EnvVarConfigProvider), never stored in the connector config |
+| Connector config | `deploy/debezium/es-event-connector.json` | registered by `make connector` (idempotent PUT) |
+| Connector MySQL account | `deploy/mysql/debezium-grants.sql` | `RELOAD, REPLICATION SLAVE, REPLICATION CLIENT` + `SELECT` on `es_event` only |
+| Consumer core | `internal/application/messaging` | transport-neutral: decoding, partition processing, gap repair, offsets, health |
+| Kafka transport | `internal/infrastructure/kafka` | franz-go v1.22.0 consumer group (`messaging.Transport`); joins the group on its first poll |
+| Projection adapter | `internal/infrastructure/projection/consumer_adapter.go` | existing `Projection`, `Runner` and `repos.EventStore` behind the consumer's ports, errors translated (like `commandstore`) |
+| Gap-repair read | `repos.EventStore.ReadStream` (`repos/event_stream.go`) | one aggregate's version range, decoded like `ReadAll` |
+| Process | `cmd/projector.go` (`main projector`, `make run-projector`) | probes `/healthz`, `/readyz`, `/status` on `PROJECTOR_HTTP_ADDR` (`presentation/probe_router.go`); a probe server that cannot start stops the process |
+
+The projection framework is unchanged: the consumer calls the existing `Projection.Apply`, so state, history and the applied version still commit in one PostgreSQL transaction under the shared projection lock and the per-aggregate lock (§6.3).
+
+The Debezium envelope and key format is decoded in `application/messaging`, not in the Kafka adapter. It is the consumer's input contract, it needs no I/O, and keeping it next to the processing rules lets the default test suite cover decode → apply → commit together. The Kafka adapter only moves bytes and offsets.
+
+### 7.2 Connector configuration (deviations from §3)
+
+- **Full Debezium envelope, no `ExtractNewRecordState` SMT.** The consumer parses `{before, after, source, op}` itself (`messaging/debezium_envelope.go`). It sees the operation and the snapshot flag.
+- **Append-only violations are emitted and halt the consumer:**
+  - `skipped.operations=none` makes Debezium emit truncates (its default skips them);
+  - `tombstones.on.delete=false` keeps deletes as `op=d`;
+  - the decoder rejects `u`, `d`, `t` and tombstones as poison.
+
+  Verified: `TestPipelineTruncateOfEventTableHalts` truncates `es_event` on the real stack, and the partition halts on `op "t"`.
+- **`snapshot.mode=when_needed`** (plan: `initial`): snapshot on first start, and again if the stored binlog position is no longer available (binlog purged during a long outage, lost offsets topic). A re-snapshot only produces duplicates, which the version check skips.
+- **Ordered snapshot:** `snapshot.select.statement.overrides` reads `es_event ORDER BY aggregate_id, version`.
+- **Key:** `message.key.columns=<db>.es_event:aggregate_id` gives key `{"aggregate_id":"…"}`.
+- **Converters:** JSON without schemas.
+- **Heartbeat:** `heartbeat.interval.ms=10000` keeps the stored binlog position moving while no captured row changes.
+- **Topic:** created by the connector as `inventory.inventory.es_event`, with 3 partitions, `cleanup.policy=delete`, 7-day retention and replication factor 1 (single broker).
+- **Producer ordering:** Kafka Connect's source producers run with `acks=all` and `max.in.flight.requests.per.connection=1` (Connect defaults, read from the worker log). A retried send cannot overtake an earlier one. Idempotence is off, so a retry may write a duplicate, which the version check skips.
+
+### 7.3 Decoding (`messaging/message_decoder.go`, `event_row_decoder.go`, `message_key.go`)
+
+1. **Envelope:** only `op` `c` (binlog insert) or `r` (snapshot read) with an `after` row of table `es_event` is accepted.
+2. **Key:** the key's `aggregate_id` must equal the row's. The key decides the partition, so a mismatch could reorder an aggregate.
+3. **Row → `eventsourcing.Event`:** decoded with the **existing serializer** (`Type(aggregate_type, event_type)` + `Unmarshal`), under the same rules as `repos.decode`: the schema version must be 1, and unknown types are errors.
+
+Golden files captured from the real connector (one snapshot record, one binlog record) are in `internal/application/messaging/testdata/`.
+
+### 7.4 Processing, offsets and versions
+
+- **Per-partition sequential.**
+  - Each poll's records are grouped by partition; the adapter merges a partition that appears in several fetches.
+  - Partitions are processed in parallel goroutines, but within a partition strictly in offset order, one `Projection.Apply` transaction per record.
+  - All events of a vehicle share a partition (the key), so they are applied in version order.
+- **Offsets after the PostgreSQL commit.**
+  - After every partition of the batch has finished, the consumer commits, per partition, the offset after the last record whose transaction committed (`messaging/offsets.go`).
+  - Then it rewinds the failed partitions, and only then calls `Release`.
+  - Auto-commit is off.
+  - Rebalances are blocked from a poll until `Release` (`BlockRebalanceOnPoll`), so a partition cannot move to another member between apply and commit.
+- **At-least-once, idempotent by version.**
+  - A crash or failed offset commit after the PostgreSQL commit re-delivers records, and `Projection.Apply` skips them (`version ≤ applied`).
+  - A crash before the PostgreSQL commit rolls the transaction back, and the record is applied when re-delivered.
+  - History also has `PRIMARY KEY (vehicle_id, version)`, so a duplicate can never become a second history row.
+  - Exactly-once across MySQL → Kafka → PostgreSQL is **not** claimed.
+- **Never skip.**
+  - A failing record stops its partition at that record. The offset is not committed past it.
+  - The transport rewinds to the record (`SetOffsets`) and pauses the partition for a backoff (one pending resume per partition), then retries.
+  - Other partitions continue.
+  - **Poison errors** retry at the maximum backoff and are logged at ERROR. Poison means a malformed record, an unexpected operation, an unknown type or schema version (from Kafka or from the event store during a gap repair), an event rejected by the projector, or an unrepairable gap.
+  - **Anything else** (database or broker unavailable) backs off exponentially from 500 ms to 30 s.
+- **Records lost by the feed.** franz-go resets a partition past records it never delivered when they fall below the log start (retention) or the log is truncated. It reports `ErrDataLoss`. The adapter turns that into `messaging.ErrFeedDataLoss`, and the consumer then runs a sync from MySQL before it continues.
+  - Everything those records carried is committed in MySQL, so the sync applies it.
+  - If the lost record was poison, the sync keeps failing and the consumer stays not ready (phase `syncing`). The skip is never silent.
+  - Without a synchronizer the consumer exits with the error.
+- **Readiness (`/readyz` = 503):**
+  - while bootstrapping or re-syncing;
+  - after shutdown has begun (phase `stopping`, while the batch in progress drains);
+  - while a poll reports errors, including a failed broker connection (`kafka/dial_health.go`; the client otherwise retries silently);
+  - while any owned partition is halted.
+
+  Polls wait at most 5 s, so an idle consumer re-evaluates broker health regularly. Partition health follows the assignment callbacks: a partition revoked or lost mid-batch is not reported again by that batch.
+
+  `/status` shows the phase, counters (applied, duplicates, gap events repaired), the last change lag, and per partition the last offset, failing offset and last error.
+
+  Verified on the real stack: stopping the Kafka container turned `/readyz` to 503 at once, and it returned to 200 11 s after Kafka was started again.
+- **Batch budget.**
+  - `MaxPollRecords` is 100.
+  - A read-model transaction takes milliseconds, so a batch normally ends far within the 60 s `RebalanceTimeout`.
+  - On a database stalled past it, the member is evicted, its commit fails, and the records are re-delivered and skipped by version. That costs liveness, not correctness.
+- **Shutdown.**
+  - SIGTERM moves the consumer to `stopping`.
+  - The record being applied finishes with an uncancelled context, and the processed prefix is committed.
+  - The rest of the batch is re-delivered to the next owner.
+  - The consumer leaves the group.
+
+### 7.5 Bootstrap strategy (snapshot, existing history, existing projections)
+
+The read model may already hold projections, and MySQL may hold any amount of history. Three mechanisms cover different holes. All are idempotent by version.
+
+1. **Startup sync (`PROJECTOR_STARTUP_SYNC=true`, default).**
+   - Before the transport joins the group (the client is created on the first poll), the consumer runs `Runner.Sync`.
+   - Under the *exclusive* projection lock, the sync reads every committed event from ONE consistent MySQL snapshot `S` and applies what is missing.
+   - Everything committed before startup is therefore in PostgreSQL before any Kafka record is processed, whatever the topic still holds.
+   - The sync is retried with backoff while another applier holds the lock.
+2. **Debezium snapshot + binlog.**
+   - On first registration the connector snapshots `es_event`, ordered per aggregate.
+   - It then streams the binlog from the position recorded with the snapshot, under the snapshot's global read lock (`snapshot.locking.mode=minimal`). Every row is either in the snapshot or after that binlog position.
+   - Snapshot records are produced before streamed ones, and both kinds of one aggregate go to the same partition. Per-aggregate order therefore holds across the snapshot-to-streaming boundary.
+   - Rows already projected arrive as duplicates and are skipped.
+3. **Version-based gap repair.**
+   - If a record's version is not `applied + 1`, the consumer reads versions `1 … v−1` of that aggregate from MySQL (`ReadStream`) and applies them in order, then the record. This covers an earlier version missing from the feed or arriving later.
+   - Records that arrive later are duplicates.
+   - Once version `v` is committed, every lower version is committed too (the version CAS serialises the writers of an aggregate). The read is therefore complete unless history is broken; if it is broken, the gap is **unrepairable** and the partition halts.
+
+Data-loss resync (§7.4) is the same sync as mechanism 1, run while consuming.
+
+**Why nothing is missed or reordered.**
+- Ordering never relies on `es_event.id` (AUTO_INCREMENT ids are allocated at insert, not at commit). It relies on per-aggregate versions, the per-aggregate partition key, and Debezium's snapshot/binlog handoff.
+- The invariant that holds for any number of members and restarts: **every committed Kafka offset belongs to a record whose event is in this PostgreSQL database.** Offsets are committed only after the read-model commit; a rebuild re-applies them (see below).
+- Take any event `E`:
+  - If `E` committed before the latest startup sync's snapshot `S`, that sync applied it.
+  - Otherwise `E` is in the binlog after the connector's recorded position. Its record sits at or after its partition's committed offset, unless it was already applied, so some member delivers it. If retention deletes it first, the data-loss resync applies it.
+  - Duplicates in any of these paths are skipped by version.
+  - An out-of-order arrival is fixed by gap repair, or halts if MySQL disagrees.
+
+**Rebuild while the consumer runs.**
+- The consumer's `Apply` takes the projection lock *shared*. `rebuild-projections` takes it *exclusively* before it opens its MySQL snapshot `S`.
+- Every event the consumer applied before the rebuild committed in MySQL before the lock, so it is in `S` and re-applied by the rebuild.
+- Events after `S` wait for the rebuild's commit and are then applied on top. Their offsets were not committed yet, so nothing is lost.
+- A rebuild fails fast (`ErrRunInProgress`) if it cannot get the lock at that instant, and is retried.
+
+**Caveats.**
+- **A read model restored or replaced outside these commands** (for example a PostgreSQL restore from backup) while the projector keeps its offsets: aggregates with no later event stay stale until a projector restart (startup sync) or `make sync-projections`.
+- **With `PROJECTOR_STARTUP_SYNC=false`,** correctness after downtime relies on the topic still holding the records, the data-loss resync, or gap repair. Keep it enabled in production; disabling it is meant for tests and demos.
+- **Adding partitions** changes key → partition. Old and new events of an aggregate can then sit on different partitions and arrive out of order. Gap repair and duplicate skipping keep the result correct, but in-order delivery is lost. Do not change the partition count casually.
+
+| Situation | What happens | Verified by |
+|---|---|---|
+| Existing history, no projections | startup sync and/or Debezium snapshot apply it | `TestPipelineInitialSnapshotWithExistingHistoryAndProjections` (Debezium snapshot only, startup sync off) |
+| Existing projections | snapshot / re-delivered records skipped as duplicates | same test: 18 skipped, 18 applied; E2E run: 12 snapshot records skipped |
+| Commands written during connector snapshot and consumer bootstrap | snapshot/binlog handoff + startup sync | `TestPipelineBootstrapWhileCommandsAreWritten` |
+| Consumer restart, crash after PG commit before offset commit | re-delivered, skipped | `TestPipelineConsumerCrashAndRestart`, `TestCrashAfterProjectionCommitBeforeOffsetCommit` |
+| Crash / failure before PG commit | rolled back, re-applied once | `TestPipelineProjectionFailureRollsBackAndHalts`, `TestCrashBeforeProjectionCommit` |
+| Connector restart, pause, delete + re-create | resumes from stored binlog offset; replays skipped | `TestPipelineConnectorRestart` |
+| Rebuild during live consumption | lock ordering as above | `TestPipelineRebuildDuringLiveConsumption`, E2E step 14 |
+| Version arrives early / feed starts mid-stream | gap repaired from MySQL | `TestOutOfOrderVersionsRepairedFromEventStore`, `TestFeedStartingMidStreamRepairedFromEventStore` |
+| Version missing from MySQL too | partition halts, not ready | `TestUnrepairableGapHaltsOnlyItsPartition` |
+| Records deleted before being consumed | resync from MySQL | `TestFeedDataLossResyncsFromEventStore` (fake transport; not reproduced on Kafka) |
+| `es_event` truncated | partition halts on `op=t` | `TestPipelineTruncateOfEventTableHalts` |
+
+### 7.6 Failure handling and recovery runbook
+
+| Symptom (`/readyz` 503, `/status`) | Cause | Recovery |
+|---|---|---|
+| `phase: syncing` for long | another sync/rebuild holds the projection lock, MySQL/PG unavailable, or (after data loss) an event the sync cannot apply | check the log (`sync from the event store failed`); restore the database or fix the event as in the poison row |
+| `transport_error` set | broker unreachable or topic missing | start Kafka / register the connector (`make cdc-up connector`); the consumer reconnects and becomes ready again |
+| partition `failing`, not `poison` | PostgreSQL or MySQL errors (timeouts, FK violation for an unknown dealership) | fix the dependency or data (e.g. add the dealership to both reference tables); the record is retried automatically |
+| partition `failing`, `poison` | malformed record, `u`/`d`/`t` on `es_event`, unknown event type or schema version, event rejected by the projector, unrepairable gap | **Do not skip.** Deploy a build that understands the event (new type or upcaster), or repair the event store (history must stay append-only and contiguous). Then restart the projector: the startup sync re-applies from MySQL and the record is retried. After a truncate or restore of `es_event`, rebuild the read model and recreate the connector and consumer group, because the Kafka history no longer matches MySQL. |
+| read model suspected stale or wrong | any | `make sync-projections` (adds what is missing; safe while the projector runs) or `make rebuild-projections` (replaces it) |
+| connector `FAILED` | MySQL privileges, unreachable MySQL or Kafka | `make connector-status`, fix, `make connector-restart`; a re-snapshot only causes duplicates |
+
+### 7.7 Verification (this session)
+
+- **Unit tests** (default suite; fake transport and projector) cover:
+  - decoding: golden snapshot and binlog records, every rejection class (including a key-less truncate);
+  - delivery: duplicates, crashes before and after the PostgreSQL commit, restart, transient retry in place;
+  - gaps: out-of-order versions, a feed starting mid-stream, an unrepairable gap halting only its partition, repair counted when the record still fails;
+  - a poison record is never skipped;
+  - startup sync, data-loss resync, and data loss without a synchronizer;
+  - transport errors clearing after a healthy poll;
+  - the batch cycle order poll → commit → retry → release;
+  - shutdown letting the apply in progress finish;
+  - a lost partition not resurrected by its batch;
+  - readiness and backoff.
+
+  Also tested: the adapter's error translation (projection and event store), `ReadStream` on SQLite and MySQL, the probe handler, the Kafka config, `Transport` use before connecting and after close, and the batch merge.
+- **Pipeline tests** (`make test-pipeline`, real MySQL + Debezium + Kafka + PostgreSQL):
+  - each test has its own databases, connector, topic and group;
+  - 9 tests, 2 consecutive green runs after the review fixes;
+  - each convergence test compares the live read model with a rebuild from MySQL and checks that history rows equal non-stock events.
+- **Mutation checks:** 19 mutants, all killed.
+  - Skipping a failed record.
+  - Not rewinding a failed partition.
+  - Disabling gap repair; accepting a partial repair.
+  - Dropping the key/row check; accepting `op=u`; dropping the schema-version check.
+  - Skipping the startup sync.
+  - Committing a failed record.
+  - A Kafka `Retry` without `SetOffsets`; a Kafka `Commit` that commits nothing.
+  - No resync on data loss.
+  - A lost partition re-created by its batch.
+  - An apply cancelled by shutdown; no `stopping` phase.
+  - An unbounded poll.
+  - `Release` before commit.
+  - A repair count dropped on failure.
+  - Batch merging disabled.
+- **End to end** with the built binary (`api` + `projector`, Compose stack):
+  - the stocked vehicle was visible through `GET` 363 ms after the command returned, with no sync;
+  - over 20 further commands, command return → row visible through the API: min 376 ms, median 478 ms, p90 490 ms, max 493 ms (single host, WSL2 + rootless Podman; hypothesis, unverified: the floor is Debezium's default `poll.interval.ms` of 500 ms);
+  - stopping the projector, writing 4 commands and restarting it without startup sync applied exactly those 4 events (0 duplicates), giving 5 history rows for 5 versions;
+  - `rebuild-projections` while the projector ran produced identical rows (21/21);
+  - a Kafka outage turned `/readyz` to 503 and recovered.
+- **Independent reviews** (read-only Event Sourcing and Go reviewer agents): no Critical findings. The fixes are listed in `ai-log.md`.
+
+### 7.8 Limitations and risks
+
+- **Local stand-in, not production durability:** single broker, replication factor 1, one Connect worker.
+- **Startup sync cost:** O(total events) per projector start, holding the exclusive projection lock. While it runs, other members' applies wait and may time out and retry. Fine at this scale; at scale, replace it with a checkpointed catch-up.
+- **Gap repair reads the whole stream prefix** (`1 … v−1`) of one aggregate; vehicle streams are short.
+- **A halted partition holds back every aggregate on it,** not only the failing one (strict per-partition order).
+- **Offsets live only in Kafka** (D5 not implemented). The version check makes re-reads harmless.
+- **Read-your-writes** is still by version comparison (§5). Typical lag on this machine is about 0.5 s.
+- **The connector account needs global `RELOAD` and replication privileges** (MySQL has no narrower grant for binlog reading).
+- **Kafka, Connect and the projector's `/status`** (which shows raw error strings) are plaintext and unauthenticated, bound to 127.0.0.1 only.
+- **`make debezium-grants` substitutes the password into SQL with `sed`,** as `make mysql-grants` already does. A password containing `/`, `&` or `'` breaks it, so use alphanumeric passwords.
+- **Data-loss resync is verified with a fake transport only.** Kafka retention expiry was not reproduced on the real stack.

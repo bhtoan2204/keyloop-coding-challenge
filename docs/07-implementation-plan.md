@@ -48,8 +48,10 @@ Tests: the existing tests stay as they are. MySQL/Postgres integration tests sit
 > | Phase 2 | MySQL event store: migrations, OCC fix, error classes, grants (`04-event-store.md` §8) | committed `82826e4` |
 > | Phase 3 | Application command layer, REST write API, `cmd api|migrate`, dealership reference data, metadata (`06-api-contracts.md` "Phase 3") | uncommitted |
 > | Phase 3 | committed `ba964e7`, review fixes `354f015` | committed |
-> | Phase 4 | PostgreSQL read model, projections, sync/rebuild, query API (`05` §6, `06` "Phase 4") | uncommitted |
-> | Next (Phase 5) | Debezium/Kafka live projection | not started |
+> | Phase 4 | PostgreSQL read model, projections, sync/rebuild, query API (`05` §6, `06` "Phase 4") | committed `4ee0075` |
+> | Refactor | Source organisation, behaviour-preserving (`ai-log.md`) | committed `4cb5d8f` |
+> | Phase 5 | Live change feed: Kafka (KRaft) + Debezium in Compose, `application/messaging` consumer, Kafka transport, startup sync, gap repair from MySQL, `main projector`, pipeline tests (`05` §7) | uncommitted |
+> | Next | OpenAPI/curl, observability, Dockerfile, README/SDD/AI narrative, video (original Phases 5–6) | not started |
 >
 > Phase numbers below are the original plan. Dates are unchanged.
 
@@ -83,6 +85,7 @@ Acceptance tests:
 - Tests: projection duplicate/gap/unknown-event; summary counts = list counts; filters, `aging=true` at 90 vs 91 via `as_of`; keyset pages over 250 rows equal one unpaginated query; limit 20/100/101; the same aging fixture as Phase 1 run in SQL; rebuild produces the same read model as incremental apply.
 
 ### Phase 4 — Live CDC transport · Mon 2 Nov
+> Delivered as "Phase 5" on 29 Oct (see the table above and `05` §7). Deviations: the consumer parses the full Debezium envelope (no unwrap SMT), `snapshot.mode=when_needed`, a startup sync and gap repair from MySQL (cut-list item 5, D6, implemented), the E2E criterion measured as command → read-model lag (median 478 ms on one host; the 2 s p95 target was not load-tested). `Dockerfile` and the full Compose start-up ordering of the Go processes are still open (the Go processes run on the host).
 - `application/messaging` consumer (per-partition sequential, offset commit after the PG commit). Decode the Debezium row into `eventsourcing.Event` via the serializer. Full Compose stack with startup ordering.
 - Tests: golden-message decode; E2E: command → visible in the read API (≤ 2 s p95, B7) → stop the projector → more commands → restart → catches up → `rebuild` → identical.
 - If the spike failed: ship the catch-up reader as the transport behind the same consumer interface, and document the commit-order caveat (02 §1).

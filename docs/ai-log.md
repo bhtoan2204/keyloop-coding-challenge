@@ -181,3 +181,81 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
   - `make test-integration` exits 0 on MySQL 8.4.13 + PostgreSQL 17.11: 122 top-level tests passed, 0 failed or skipped. `go test -tags integration -race ./...` passes.
   - Live smoke test of the rebuilt binary: stock 201, propose, missing actor 400, unknown route 404, stale If-Match 412, sync, detail (aging), unknown query param 400, summary, graceful shutdown.
 - **Not changed:** REST contract, SQL text, event names and payloads, schema and migrations, dependencies, Docker. No assertion was removed or weakened.
+
+## 2026-10-29 — Phase 5: live change feed (MySQL → Debezium → Kafka → PostgreSQL)
+
+- **Delegated:** the AI implemented the live projection consumer on top of the existing `Projection.Apply` and kept sync/rebuild for recovery.
+  - **Compose:** Kafka (KRaft) and Kafka Connect with Debezium.
+  - **Deploy:** the connector config and the connector's MySQL grants.
+  - **`internal/application/messaging`:** the consumer.
+  - **`internal/infrastructure/kafka`:** the franz-go transport.
+  - **`projection.ConsumerAdapter`:** connects the consumer to the existing projection, runner and event store.
+  - **`repos.EventStore.ReadStream`:** the gap-repair read.
+  - **`cmd projector`:** the process, with probes.
+  - **Tests:** pipeline tests on real infrastructure; the E2E run.
+  - **Docs:** `docs/05` §7, `docs/07`, `CLAUDE.md`, and an operational `README.md`.
+- **Choices:**
+  - **Versions:** franz-go v1.22.0, the only new module. Images `apache/kafka:4.3.1` and `quay.io/debezium/connect:3.6.2.Final`. The broker version was chosen to match Connect's bundled Kafka 4.3.0 clients; all three are older than two weeks.
+  - **Debezium envelope:** parsed in full, not unwrapped, so update/delete/truncate are detected.
+  - **Snapshot:** `snapshot.mode=when_needed`, with an ordered snapshot select.
+  - **Bootstrap and delivery:** a startup sync from MySQL, version-based gap repair from MySQL (cut-list item 5, D6), and offsets committed after the PostgreSQL commit with rebalances blocked in between.
+  - **Kafka offsets in PostgreSQL** (D5) were not implemented.
+- **Errors found and corrected by the AI during implementation:**
+  - (1) The first live pipeline test counted a duplicate. The test wrote a command while the startup sync was still running, so the sync applied the event and the Kafka copy was skipped. That was correct behaviour; the test now waits for the `consuming` phase.
+  - (2) The multi-member test waited for a consumer group that never formed. With an empty table and topic auto-creation off, Debezium creates the topic only with the first record, and franz-go joins the group only once the topic exists. The test now writes a first event.
+  - (3) The rollback pipeline test failed a middle version (v2). A transport that skipped the failed record would have been rescued by gap repair from v3, so the test could not catch it. It now fails the vehicle's last event; the "Retry without SetOffsets" mutant is killed only after that change.
+  - (4) A decoder test used a `strings.Replace` pattern that did not occur, because JSON map keys sort `version` last. The case silently tested the valid record. A checked `replace` helper now fails on a missing pattern.
+  - (5) Two mutation runs first hit a compile error (unused import) instead of a test failure. They were re-run with a compiling mutant.
+  - (6) An edit dropped the `ReadAll` doc comment from the `repos.EventStore` interface. Found by review and restored.
+  - (7) The E2E "catch-up after restart" timing (13 ms) was measured after the projector had already caught up. It is not reported as a catch-up time.
+- **Independent review** (read-only `event-sourcing-reviewer` and `go-reviewer` agents; no Critical findings). **Accepted and fixed:**
+  - **Kafka retention reset:** franz-go moved a halted partition past deleted records with only a warning, which would silently skip records, including a halted poison record. Now `ErrDataLoss` → `messaging.ErrFeedDataLoss` → a resync from MySQL (or exit without a synchronizer). Unit-tested; **not reproduced on Kafka.**
+  - **Truncates never emitted:** Debezium's default `skipped.operations=t` meant a truncate of `es_event` was never emitted, so the docs' "op=t halts" claim was unfounded. Set `skipped.operations=none`, decode the value before the key (a truncate has no key), and added `TestPipelineTruncateOfEventTableHalts` (passes on the real stack).
+  - **Readiness:**
+    - a transport error stayed until records arrived; polls are now bounded (5 s);
+    - an unreachable broker was invisible, because the client retries internally; a broker-connect hook now reports it, verified by stopping the Kafka container (503 at once, 200 again 11 s after the restart);
+    - added a `stopping` phase during drain;
+    - partition health now follows assignment, so a partition lost mid-batch is not resurrected.
+  - **Probe server:** a probe server that failed to bind went unnoticed until shutdown; it now stops the projector.
+  - **Flaky unit test:** the revoke readiness test was timing-dependent; the fake transport now models in-flight batches.
+  - **Transport fixes:**
+    - batches are merged per partition;
+    - one pending resume timer per partition;
+    - `Retry` checks `closed` first;
+    - the transport joins the group on its first poll, i.e. after the startup sync.
+  - **Classification and counting:**
+    - gap-repair decode errors are classified as poison (new `repos.ErrUnknownEventType`, mapped by the adapter);
+    - repaired events are counted when the record still fails;
+    - `MaxPollRecords` is 100, with the batch budget documented.
+  - **Config, compose and tests:**
+    - `PROJECTOR_STARTUP_SYNC` is parsed with `strconv.ParseBool`;
+    - broker list trimmed;
+    - DB handles closed;
+    - Compose no longer requires the Debezium password for `make up` (checked in `make cdc-up`);
+    - the pipeline dump is ordered explicitly and the history count is asserted;
+    - the harness is split into env, connector and Kafka-admin files.
+  - **Documented as limitations** (`docs/05` §7.5, §7.8):
+    - read-model restore while offsets are kept;
+    - `PROJECTOR_STARTUP_SYNC=false`;
+    - changing the partition count;
+    - `/status` exposing raw errors (localhost);
+    - `sed` with special characters in grant passwords;
+    - startup sync cost.
+- **Verified (this session):**
+  - `gofmt` clean, `make check` exit 0.
+  - `make test-integration` exit 0: 155 top-level PASS, 0 FAIL/SKIP, on MySQL 8.4.13 + PostgreSQL 17.11. `go test -tags integration -race ./...` exit 0.
+  - `make test-pipeline`: 9/9 PASS in two consecutive runs after the review fixes. The pre-review suite (8 tests) was also green twice.
+  - Mutation checks: 19 mutants, all killed (list in `docs/05` §7.7).
+  - **E2E** with the built binary, against the Compose stack:
+    - stock → visible through `GET` after 363 ms with no sync; propose → 220 ms;
+    - 20 commands: command → visible min 376 / median 478 / p90 490 / max 493 ms on one WSL2 host;
+    - projector stopped, 4 commands written, restart without startup sync: exactly 4 applied, 0 duplicates, 5 history rows for 5 versions;
+    - committed offsets equal end offsets;
+    - `rebuild-projections` during live consumption gave identical rows (21/21).
+- **Not verified:**
+  - Kafka retention expiry on the real stack;
+  - throughput or lag under load;
+  - multi-broker durability;
+  - the hypothesis that the ~0.5 s lag floor is Debezium's `poll.interval.ms`.
+- **Environment note:** `docker compose up -d kafka connect` (podman-compose) recreated the running MySQL container. Its data volume persisted.
+- **Not done by the AI:** no commit or push. The project `keyloop-test`, `keyloop-review` and `keyloop-security` skills were run after this entry was written (they block edits); their findings are in the phase report, not here.
