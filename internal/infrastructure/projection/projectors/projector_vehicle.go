@@ -48,13 +48,25 @@ func (p *VehicleProjector) Handle(ctx context.Context, store viewstore.ViewStore
 // row and one event. It is pure, so it is deterministic on replay.
 func ProjectVehicle(current *viewstore.VehicleRow, ev eventsourcing.Event) (viewstore.VehicleRow, *viewstore.HistoryRow, error) {
 	at := time.Unix(ev.CreatedAt, 0).UTC()
-	actor, correlation := metadataString(ev.Metadata, "actor_id"), metadataString(ev.Metadata, "correlation_id")
+	actor := metadataString(ev.Metadata, "actor_id")
+	correlation := metadataString(ev.Metadata, "correlation_id")
 	inconsistent := func(format string, args ...interface{}) error {
 		return fmt.Errorf("%w: %s v%d %s: %s", ErrInconsistent, ev.AggregateID, ev.Version, ev.EventType, fmt.Sprintf(format, args...))
 	}
 	history := func(r viewstore.VehicleRow, change, actionID string, t domain.ActionType, note, reason string) *viewstore.HistoryRow {
-		return &viewstore.HistoryRow{VehicleID: r.VehicleID, Version: ev.Version, EventID: ev.ID, ActionID: actionID,
-			Change: change, ActionType: t, Note: note, Reason: reason, ActorID: actor, CorrelationID: correlation, OccurredAt: at}
+		return &viewstore.HistoryRow{
+			VehicleID:     r.VehicleID,
+			Version:       ev.Version,
+			EventID:       ev.ID,
+			ActionID:      actionID,
+			Change:        change,
+			ActionType:    t,
+			Note:          note,
+			Reason:        reason,
+			ActorID:       actor,
+			CorrelationID: correlation,
+			OccurredAt:    at,
+		}
 	}
 
 	switch ev.Data.(type) {
@@ -68,9 +80,17 @@ func ProjectVehicle(current *viewstore.VehicleRow, ev eventsourcing.Event) (view
 			return viewstore.VehicleRow{}, nil, inconsistent("vehicle already projected")
 		}
 		return viewstore.VehicleRow{
-			VehicleID: ev.AggregateID, DealershipID: e.DealershipID, VIN: e.VIN, Make: e.Make, Model: e.Model,
-			ModelYear: e.ModelYear, StockedOn: e.StockedOn, Status: domain.StatusInStock,
-			Version: ev.Version, LastEventID: ev.ID, UpdatedAt: at,
+			VehicleID:    ev.AggregateID,
+			DealershipID: e.DealershipID,
+			VIN:          e.VIN,
+			Make:         e.Make,
+			Model:        e.Model,
+			ModelYear:    e.ModelYear,
+			StockedOn:    e.StockedOn,
+			Status:       domain.StatusInStock,
+			Version:      ev.Version,
+			LastEventID:  ev.ID,
+			UpdatedAt:    at,
 		}, nil, nil
 	}
 	if current == nil {

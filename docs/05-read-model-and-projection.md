@@ -228,8 +228,8 @@ sequenceDiagram
   | `internal/infrastructure/projection` | `Projection` pipeline, `Runner` |
   | `projection/projectors` | `VehicleProjector`, whose state transition `ProjectVehicle` is a pure function |
   | `internal/application/query` | query service and `ReadModel` port |
-  | `internal/presentation/queries.go` | handlers and DTOs |
-  | `cmd/readmodel.go` | projection commands and PG configuration |
+  | `internal/presentation` | one `*_handler.go` per query, `read_model_responses.go` (DTOs), `read_model_mappers.go`, `query_params.go` |
+  | `cmd/projections.go`, `cmd/postgres.go` | projection commands, PG configuration |
 
 ### 6.2 Schema (deviations from §1)
 - **IDs:** `vehicle_id TEXT`, because aggregate IDs are any client-safe string, not only UUIDs. `event_id` / `last_event_id` are `es_event.id` (BIGINT).
@@ -274,7 +274,7 @@ sequenceDiagram
 - Inside a run the exclusive lock already excludes every other applier. Per-aggregate advisory locks and savepoints are therefore skipped (`exclusive` mode). Thousands of transaction-scoped advisory locks would otherwise exhaust PostgreSQL's shared lock table.
 - `TRUNCATE` takes an exclusive table lock, so queries wait during a rebuild and never see a partial read model.
 
-### 6.5 Queries (`internal/application/query` + `viewstore/queries.go`)
+### 6.5 Queries (`internal/application/query` + `viewstore/*_query.go`)
 - **Business date:** today in the dealership's IANA zone (from the PG `dealership` table; the read side never reads MySQL), or `as_of`.
 - **Ages are computed in Go** with the domain rule: `age_days`, and `is_aging = IN_STOCK ∧ age > 90`. A sold vehicle's age is `sold_on − stocked_on`.
 - **Filters are sargable:**

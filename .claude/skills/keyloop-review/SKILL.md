@@ -23,6 +23,12 @@ Base: `$ARGUMENTS` (if empty, use `HEAD`). Read-only: do not edit, stage, commit
   read-model writes from command handlers; consistency stated in API responses.
 - **Architecture** (`.claude/rules/architecture.md`): reuse instead of parallel abstractions,
   package direction, no new deps/schema/Docker outside the planned phase.
+- **Maintainability / source organization** (`.claude/rules/source-organization.md`): one
+  responsibility per file; handlers, DTOs, mappers, parsing, middleware and error mapping kept
+  apart; no catch-all files; files near 250–300 lines and functions near 40–60 lines justified;
+  multiline struct literals one field per line; guard clauses instead of nesting; comments explain
+  why. For structural refactors, confirm no behaviour change (same exported API, events, SQL, HTTP
+  contracts, tests and assertions).
 - **Tests:** do new behaviours have failing-without-change tests? Were any assertions weakened?
 - **Docs:** deviations from `docs/` recorded; `docs/ai-log.md` factual.
 

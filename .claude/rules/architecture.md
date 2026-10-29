@@ -10,15 +10,19 @@ paths:
 - **Reuse first.** Before adding a type, interface or package, search for an existing one
   (`AggregateRoot`, `AggregateStore`, `repos.EventStore`, serializer, `Projection`, `Projector`,
   `ViewStore`). Extend it. Never create a parallel framework, store or aggregate base.
-- **Package layout is fixed:** `internal/{domain,application,infrastructure,presentation}`,
-  `package/eventsourcing`, `cmd/main.go`. Fill the existing empty packages; do not move files.
+- **Layers are fixed, files are not:** keep the layers `internal/{domain,application,infrastructure,presentation}`,
+  `package/eventsourcing` and `cmd`, and their dependency direction. Moving code between files of
+  the same package is allowed and expected when it improves cohesion (see
+  `.claude/rules/source-organization.md`). A new package needs a real boundary, must keep the
+  dependency direction and must not create an import cycle.
 - **Dependency direction:** presentation → application → domain. Infrastructure implements
   interfaces that application declares. `internal/domain/**` imports only the standard library,
   `internal/domain`, `internal/domain/events` and `package/eventsourcing`.
 - **Domain purity:** no I/O, SQL, HTTP, logging or `time.Now()` in `internal/domain/**`. The
   business date and generated IDs come in through command parameters.
 - **Minimal change:** prefer a localized edit to a rewrite. A refactor needs a stated reason
-  (failing test, reproduced bug, or a compatibility need) and keeps public APIs where possible.
+  (failing test, reproduced bug, compatibility need, or a behaviour-preserving maintainability
+  improvement under the source-organization rules) and keeps public APIs where possible.
   `package/eventsourcing` changes require a failing test first.
 - **No speculative abstraction:** one implementation = no interface, unless a test fake needs it.
   No generic repositories, registries or plugin points.

@@ -2,6 +2,7 @@ package projectors
 
 import (
 	"context"
+
 	"keyloop-coding-challenge/internal/infrastructure/viewstore"
 	"keyloop-coding-challenge/package/eventsourcing"
 )

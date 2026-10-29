@@ -403,11 +403,23 @@ func TestReviseCancelSellAndNoOpRevision(t *testing.T) {
 	actionID := proposed.ActionID
 
 	saves := f.store.saves
-	same, err := f.svc.ReviseAction(ctx, command.ReviseAction{Target: target("v1"), ActionID: actionID, ActionType: domain.ActionHold, Note: " wait "}, meta)
+	identical := command.ReviseAction{
+		Target:     target("v1"),
+		ActionID:   actionID,
+		ActionType: domain.ActionHold,
+		Note:       " wait ",
+	}
+	same, err := f.svc.ReviseAction(ctx, identical, meta)
 	if err != nil || same.Changed || f.store.saves != saves || same.Vehicle.Version() != 2 {
 		t.Fatalf("identical revision: err=%v changed=%v saves=%d", err, same.Changed, f.store.saves-saves)
 	}
-	if _, err := f.svc.ReviseAction(ctx, command.ReviseAction{Target: target("v1"), ActionID: actionID, ActionType: domain.ActionAuction, Note: "lot 7"}, meta); err != nil {
+	revision := command.ReviseAction{
+		Target:     target("v1"),
+		ActionID:   actionID,
+		ActionType: domain.ActionAuction,
+		Note:       "lot 7",
+	}
+	if _, err := f.svc.ReviseAction(ctx, revision, meta); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.svc.CancelAction(ctx, command.CancelAction{Target: target("v1"), ActionID: actionID, Reason: "buyer"}, meta); err != nil {

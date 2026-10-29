@@ -34,7 +34,7 @@ Implemented and tested:
 
 - Read side (Phase 4): `internal/infrastructure/viewstore` (PostgreSQL 17 read model + migrations),
   `internal/infrastructure/projection` (`Projection.Apply`, `VehicleProjector`, `Runner` sync/rebuild from one
-  consistent MySQL snapshot via `repos.EventStore.ReadAll`), `internal/application/query`, `presentation/queries.go`
+  consistent MySQL snapshot via `repos.EventStore.ReadAll`), `internal/application/query`, `presentation/*_handler.go`
   (4 GET endpoints). `cmd`: `sync-projections`, `rebuild-projections`. **Not real-time until Phase 5.**
 
 Not implemented yet: `internal/application/messaging` (Kafka consumer), Debezium/Kafka, `Dockerfile`, Idempotency-Key.
@@ -51,6 +51,12 @@ Not implemented yet: `internal/application/messaging` (Kafka consumer), Debezium
 | Projection | `projection.Projection` + `projectors.Projector` + `viewstore.ViewStore` (narrow refactor per `docs/05` §4.1) |
 | Empty packages to fill | `internal/application/*`, `internal/presentation`, `cmd/main.go` |
 | Leave unwired, do not delete | `projectors/projector_outbox.go`, `internal/infrastructure/cache`, `package/redis` |
+
+## Source organization
+Follow `.claude/rules/source-organization.md`: one responsibility per file, one business operation per file
+when operations evolve independently, no catch-all `commands.go`/`queries.go`/`utils.go`, one field per line
+in multiline struct literals, guard clauses, comments that explain *why*. Files near 250–300 lines and
+functions near 40–60 lines are review triggers, not limits.
 
 ## Package boundaries
 - `internal/domain/**`: no I/O, no SQL, no HTTP, no `time.Now()`. The business date is passed in by the caller.
@@ -69,7 +75,7 @@ Not implemented yet: `internal/application/messaging` (Kafka consumer), Debezium
   version in the **same** Postgres tx as the state, skips duplicates, halts on gaps. Rebuild reads MySQL, never Kafka.
 - Read side is eventually consistent; aging is computed at query time (never stored).
 
-## Business invariants (`internal/domain/aggregates/vehicle_inventory.go`)
+## Business invariants (`internal/domain/aggregates/vehicle_inventory_*.go`)
 Stock once per aggregate · actions need IN_STOCK · propose needs aging (> 90 days at business date) ·
 at most one active action · revise/cancel need the matching active `action_id` · SOLD is terminal and a
 sale closes the active action · VIN 17 chars without I/O/Q · `stocked_on ≤ business date` ·
@@ -98,8 +104,9 @@ Integration tests fail (never skip) without `MYSQL_TEST_DSN`. The dev machine us
 6. Stop. The developer reviews and commits. **Never commit or push without explicit approval.**
 
 ## Restrictions
-- Never delete or rewrite whole packages or files to adopt a different design. Refactor only with a stated reason
-  and a test that shows it is needed (or a reproduced bug).
+- Never delete or rewrite whole packages to adopt a different design. Behaviour changes need a stated reason
+  and a test that shows them. Behaviour-preserving moves between files of a package are fine (and expected
+  when a file mixes responsibilities); a file may be removed once all its declarations have moved.
 - Never weaken an assertion just to make a test pass. Adapt a test only when it contradicts a valid invariant, and say so.
 - Do not modify `package/eventsourcing` unless a failing test reproduces a bug. Then make the smallest fix and keep the public API.
 - No `git reset --hard`, `git clean`, `git checkout -- .`, `git stash` or force-push. Do not edit `.git/` or real `.env*` files.

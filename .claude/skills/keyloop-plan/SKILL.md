@@ -23,6 +23,10 @@ or self-imposed requirement each change serves.
 ## 3. Minimal change
 - Ordered steps, each small enough to test on its own.
 - Files to create and modify. **No deletions** unless explicitly justified per file.
+- **Source organization** (`.claude/rules/source-organization.md`): say which file each new type,
+  handler, mapper or query goes into; one business operation per file where operations evolve
+  independently; no catch-all files. Flag existing files near 250–300 lines or functions near
+  40–60 lines that the change would grow, and say whether to split them first.
 - New dependencies, schema changes or Docker changes only if this phase owns them (`docs/07`).
 
 ## 4. Tests and acceptance criteria

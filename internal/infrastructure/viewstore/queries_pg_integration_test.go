@@ -48,8 +48,13 @@ func newFixture(t *testing.T) *fixture {
 	}
 	store := viewstore.NewPostgres(db)
 	n := now
-	return &fixture{store: store, proj: projection.NewProjection(store, &projectors.VehicleProjector{}),
-		svc: query.NewService(store, clock{&n}), now: &n, dsn: dsn}
+	return &fixture{
+		store: store,
+		proj:  projection.NewProjection(store, &projectors.VehicleProjector{}),
+		svc:   query.NewService(store, clock{&n}),
+		now:   &n,
+		dsn:   dsn,
+	}
 }
 
 type vspec struct {
@@ -65,8 +70,16 @@ func (f *fixture) add(t *testing.T, v vspec) {
 	apply := func(data interface{}) {
 		version++
 		f.ids++
-		ev := eventsourcing.Event{ID: f.ids, AggregateID: v.id, AggregateType: "VehicleInventoryAggregate", Version: version,
-			SchemaVersion: 1, Data: data, CreatedAt: now.Unix(), Metadata: map[string]interface{}{"actor_id": "m"}}
+		ev := eventsourcing.Event{
+			ID:            f.ids,
+			AggregateID:   v.id,
+			AggregateType: "VehicleInventoryAggregate",
+			Version:       version,
+			SchemaVersion: 1,
+			Data:          data,
+			CreatedAt:     now.Unix(),
+			Metadata:      map[string]interface{}{"actor_id": "m"},
+		}
 		if _, err := f.proj.Apply(ctx, ev); err != nil {
 			t.Fatalf("seed %s: %v", v.id, err)
 		}
@@ -77,7 +90,14 @@ func (f *fixture) add(t *testing.T, v vspec) {
 	if v.make == "" {
 		v.make, v.model = "Toyota", "Corolla"
 	}
-	apply(&events.VehicleStockedEvent{DealershipID: v.dealer, VIN: "1HGCM82633A004352", Make: v.make, Model: v.model, ModelYear: 2023, StockedOn: v.stockedOn})
+	apply(&events.VehicleStockedEvent{
+		DealershipID: v.dealer,
+		VIN:          "1HGCM82633A004352",
+		Make:         v.make,
+		Model:        v.model,
+		ModelYear:    2023,
+		StockedOn:    v.stockedOn,
+	})
 	closed := ""
 	if v.action {
 		apply(&events.VehicleActionProposedEvent{ActionID: "act-" + v.id, ActionType: domain.ActionHold})

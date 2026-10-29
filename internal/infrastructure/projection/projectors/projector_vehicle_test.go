@@ -15,8 +15,17 @@ import (
 var at = time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
 
 func ev(version int, data interface{}) eventsourcing.Event {
-	return eventsourcing.Event{ID: int64(100 + version), AggregateID: "v1", Version: version, Data: data, CreatedAt: at.Unix(),
-		Metadata: map[string]interface{}{"actor_id": "manager-42", "correlation_id": "req-1"}}
+	return eventsourcing.Event{
+		ID:          int64(100 + version),
+		AggregateID: "v1",
+		Version:     version,
+		Data:        data,
+		CreatedAt:   at.Unix(),
+		Metadata: map[string]interface{}{
+			"actor_id":       "manager-42",
+			"correlation_id": "req-1",
+		},
+	}
 }
 
 func stockedRow() *viewstore.VehicleRow {

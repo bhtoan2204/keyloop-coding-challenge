@@ -153,3 +153,31 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
     - EXPLAIN coverage now includes the age filters and `aging=true`;
     - **a new test covers the shared/exclusive lock between appliers and runs.** Removing the shared lock was undetected before, and is now caught by mutation check.
   - **Documented as accepted limitations** (docs/05 §6.7, docs/06): sort semantics for SOLD/ALL, the read-model ETag, rebuild blocking queries, one bad event halting a run, duplicated dealership data, a sync not detecting a read model ahead of MySQL, `as_of` semantics, and the Phase 5 batching hazard.
+
+## 2026-10-29 — Source-organization refactor (behaviour-preserving, between Phase 4 and Phase 5)
+- **Delegated:** the AI split mixed-responsibility files at HEAD `4ee0075` into files with one responsibility each (one business operation per file where operations evolve independently). It also added `.claude/rules/source-organization.md` and updated `CLAUDE.md`, `.claude/rules/architecture.md` and the `keyloop-plan`/`keyloop-review` skills. The old "package layout is fixed, do not move files" rule became "layers are fixed, files are not". No phase called "3.5" existed in `docs/07` before this; this entry records it as an unplanned maintainability step.
+- **Scope:**
+  - `application/command`: errors, ports, meta, result, service, execution/retry, plus one file per command.
+  - `application/query`: one file per query, plus cursor and codec files.
+  - `presentation`: routing, middleware, request body and params, metadata/ETag, error mapping, DTOs, mappers, plus one `*_handler.go` per operation.
+  - `domain/aggregates`: one file per command (command, method, applier), plus guards and validation.
+  - `viewstore`: writes, run locks, row scanning, one file per query.
+  - `repos`: `ReadAll` moved to `event_stream.go`.
+  - `cmd`: one file per subcommand, plus the DB openers.
+  - Multiline struct literals were reformatted one field per line, including test fixture builders.
+  - Two functions were split into named helpers with the same logic and order: `resolveListCursor` and `ageBoundsPredicate`.
+- **Method:** a scratchpad Go AST tool moved whole top-level declarations verbatim, with their comments. Imports were then fixed with `goimports -local keyloop-coding-challenge`. Files that became empty were removed with `git rm`; files whose content survived were renamed with `git mv`.
+- **Errors found and corrected:**
+  - The split tool first failed to build (no `go.mod` in the scratchpad), so nothing was written.
+  - `goimports` dropped the `gormmysql` import alias in `cmd/mysql.go`; it was re-added by hand.
+  - A scripted edit of `cmd/main.go` matched twice; its assertion aborted before writing, and the edit was redone.
+  - Stale section-divider comments left in `router.go` and `postgres.go` were removed.
+  - `goimports -local` also regrouped imports in a few files that were otherwise untouched. This is cosmetic only.
+- **Verified (this session):**
+  - `go doc -all` of every package is the same before and after, except two doc comments: the aggregate doc gained the text of the removed `commands.go` comment, and the `ListVehicles` comment moved to `ageBoundsPredicate`.
+  - The default test list is identical (247 / 247).
+  - The integration PASS lines are identical (299 / 299).
+  - `gofmt` is clean and `make check` exits 0.
+  - `make test-integration` exits 0 on MySQL 8.4.13 + PostgreSQL 17.11: 122 top-level tests passed, 0 failed or skipped. `go test -tags integration -race ./...` passes.
+  - Live smoke test of the rebuilt binary: stock 201, propose, missing actor 400, unknown route 404, stale If-Match 412, sync, detail (aging), unknown query param 400, summary, graceful shutdown.
+- **Not changed:** REST contract, SQL text, event names and payloads, schema and migrations, dependencies, Docker. No assertion was removed or weakened.

@@ -22,10 +22,22 @@ type stubQueries struct {
 var asOf = domain.NewDate(2026, 10, 29)
 
 var sample = query.Vehicle{
-	VehicleID: "v1", DealershipID: "d-001", VIN: "1HGCM82633A004352", Make: "Toyota", Model: "Corolla", ModelYear: 2023,
-	StockedOn: domain.NewDate(2026, 7, 30), Status: domain.StatusInStock, Version: 2,
-	Action: &query.Action{ID: "a1", Type: domain.ActionHold, ProposedAt: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC),
-		UpdatedAt: time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC), UpdatedBy: "manager-42"},
+	VehicleID:    "v1",
+	DealershipID: "d-001",
+	VIN:          "1HGCM82633A004352",
+	Make:         "Toyota",
+	Model:        "Corolla",
+	ModelYear:    2023,
+	StockedOn:    domain.NewDate(2026, 7, 30),
+	Status:       domain.StatusInStock,
+	Version:      2,
+	Action: &query.Action{
+		ID:         "a1",
+		Type:       domain.ActionHold,
+		ProposedAt: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC),
+		UpdatedAt:  time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC),
+		UpdatedBy:  "manager-42",
+	},
 }
 
 func (s *stubQueries) ListInventory(_ context.Context, q query.ListInventory) (*query.InventoryPage, error) {
@@ -33,7 +45,13 @@ func (s *stubQueries) ListInventory(_ context.Context, q query.ListInventory) (*
 	if s.err != nil {
 		return nil, s.err
 	}
-	return &query.InventoryPage{AsOf: asOf, Vehicles: []query.Vehicle{sample}, Limit: 20, HasMore: true, NextCursor: "abc"}, nil
+	return &query.InventoryPage{
+		AsOf:       asOf,
+		Vehicles:   []query.Vehicle{sample},
+		Limit:      20,
+		HasMore:    true,
+		NextCursor: "abc",
+	}, nil
 }
 func (s *stubQueries) GetVehicle(context.Context, string, string, *domain.Date) (*query.VehicleResult, error) {
 	if s.err != nil {
@@ -45,8 +63,19 @@ func (s *stubQueries) GetActionHistory(context.Context, string, string, int, str
 	if s.err != nil {
 		return nil, s.err
 	}
-	return &query.HistoryPage{Limit: 20, Entries: []query.HistoryEntry{{Version: 2, EventID: 7, ActionID: "a1",
-		Change: query.ChangeProposed, ActionType: domain.ActionHold, ActorID: "manager-42", OccurredAt: sample.Action.ProposedAt}}}, nil
+	entry := query.HistoryEntry{
+		Version:    2,
+		EventID:    7,
+		ActionID:   "a1",
+		Change:     query.ChangeProposed,
+		ActionType: domain.ActionHold,
+		ActorID:    "manager-42",
+		OccurredAt: sample.Action.ProposedAt,
+	}
+	return &query.HistoryPage{
+		Limit:   20,
+		Entries: []query.HistoryEntry{entry},
+	}, nil
 }
 func (s *stubQueries) GetInventorySummary(context.Context, string, *domain.Date) (*query.SummaryResult, error) {
 	if s.err != nil {

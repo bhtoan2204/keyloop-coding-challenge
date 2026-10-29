@@ -37,9 +37,17 @@ func (s *stream) ev(data interface{}) eventsourcing.Event {
 	s.version++
 	*s.nextID++
 	return eventsourcing.Event{
-		ID: *s.nextID, AggregateID: s.id, AggregateType: "VehicleInventoryAggregate", Version: s.version,
-		EventType: fmt.Sprintf("%T", data)[8:], SchemaVersion: 1, Data: data,
-		Metadata:  map[string]interface{}{"actor_id": "manager-42", "correlation_id": fmt.Sprintf("req-%d", *s.nextID)},
+		ID:            *s.nextID,
+		AggregateID:   s.id,
+		AggregateType: "VehicleInventoryAggregate",
+		Version:       s.version,
+		EventType:     fmt.Sprintf("%T", data)[8:],
+		SchemaVersion: 1,
+		Data:          data,
+		Metadata: map[string]interface{}{
+			"actor_id":       "manager-42",
+			"correlation_id": fmt.Sprintf("req-%d", *s.nextID),
+		},
 		CreatedAt: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC).Unix() + int64(s.version)*3600,
 	}
 }
