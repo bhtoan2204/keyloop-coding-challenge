@@ -17,6 +17,7 @@ import (
 	"keyloop-coding-challenge/internal/application/command"
 	"keyloop-coding-challenge/internal/domain/aggregates"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
+	"keyloop-coding-challenge/internal/infrastructure/eventstore/commandstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/infrastructure/referencedata"
 	"keyloop-coding-challenge/internal/presentation"
@@ -50,7 +51,7 @@ func newServer(t *testing.T) (*httptest.Server, *gorm.DB) {
 	if err := serializer.RegisterAggregate(&aggregates.VehicleInventoryAggregate{}); err != nil {
 		t.Fatal(err)
 	}
-	store := eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(db, serializer), 0)
+	store := commandstore.New(eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(db, serializer), 0))
 	svc := command.NewService(store, referencedata.NewDealerships(db), fixedClock{}, discard)
 	srv := httptest.NewServer(presentation.NewHandler(svc, sqlDB.PingContext, discard))
 	t.Cleanup(srv.Close)
@@ -234,10 +235,13 @@ func TestInfrastructureErrorsAreMappedWithoutLeakingDetails(t *testing.T) {
 		status int
 		code   string
 	}{
-		{"connection lost", fmt.Errorf("%s: %w", secret, driver.ErrBadConn), 503, "UNAVAILABLE"},
-		{"lock timeouts exhausted", fmt.Errorf("%s: %w", secret, eventstore.ErrRetryable), 503, "UNAVAILABLE"},
+		{"connection lost", fmt.Errorf("%w: %s: %w", command.ErrUnavailable, secret, driver.ErrBadConn), 503, "UNAVAILABLE"},
+		{"lock timeouts exhausted", fmt.Errorf("%s: %w", secret, command.ErrTransient), 503, "UNAVAILABLE"},
 		{"deadline", fmt.Errorf("%s: %w", secret, context.DeadlineExceeded), 503, "UNAVAILABLE"},
-		{"conflicts exhausted", fmt.Errorf("%s: %w", secret, eventstore.ErrConcurrencyConflict), 409, "CONCURRENCY_CONFLICT"},
+		{"client went away", fmt.Errorf("%s: %w", secret, context.Canceled), 503, "UNAVAILABLE"},
+		{"conflicts exhausted", fmt.Errorf("%s: %w", secret, command.ErrConflict), 409, "CONCURRENCY_CONFLICT"},
+		// A version mismatch that also wraps a conflict must still be 412.
+		{"If-Match race", fmt.Errorf("%w: %w", command.ErrVersionMismatch, command.ErrConflict), 412, "VERSION_MISMATCH"},
 		{"unexpected", errors.New(secret), 500, "INTERNAL"},
 	}
 	for _, tc := range cases {

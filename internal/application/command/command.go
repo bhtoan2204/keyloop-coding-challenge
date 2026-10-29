@@ -23,7 +23,22 @@ var (
 	ErrVersionMismatch = errors.New("aggregate version mismatch")
 )
 
-// VehicleStore is the part of eventstore.AggregateStore the commands use.
+// Store error contract. VehicleStore implementations report storage outcomes with
+// these sentinels (wrapping the cause), so this layer does not depend on a store.
+var (
+	// ErrStreamNotFound: Get found no vehicle stream under the ID.
+	ErrStreamNotFound = errors.New("stream not found")
+	// ErrConflict: optimistic concurrency conflict; nothing was written.
+	ErrConflict = errors.New("concurrent modification")
+	// ErrTransient: deadlock or lock wait timeout; the transaction was rolled back.
+	ErrTransient = errors.New("transient storage failure")
+	// ErrUnavailable: storage unreachable or the connection broke; a write's outcome
+	// is unknown, so it must not be retried automatically.
+	ErrUnavailable = errors.New("storage unavailable")
+)
+
+// VehicleStore is the persistence port the commands use (implemented by
+// eventstore.CommandStore over the existing AggregateStore).
 type VehicleStore interface {
 	Get(ctx context.Context, aggregateID string, agg eventsourcing.Aggregate) error
 	SaveWithMetadata(ctx context.Context, agg eventsourcing.Aggregate, metadata map[string]interface{}) error

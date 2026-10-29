@@ -14,6 +14,7 @@ import (
 	"keyloop-coding-challenge/internal/application/command"
 	"keyloop-coding-challenge/internal/domain/aggregates"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
+	"keyloop-coding-challenge/internal/infrastructure/eventstore/commandstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/infrastructure/referencedata"
 	"keyloop-coding-challenge/internal/presentation"
@@ -43,7 +44,7 @@ func newMySQLAPI(t *testing.T, params map[string]string) *mysqlAPI {
 	if err := serializer.RegisterAggregate(&aggregates.VehicleInventoryAggregate{}); err != nil {
 		t.Fatal(err)
 	}
-	store := eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(app, serializer), 0)
+	store := commandstore.New(eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(app, serializer), 0))
 	svc := command.NewService(store, referencedata.NewDealerships(app), fixedClock{}, discard)
 	sqlDB, _ := app.DB()
 	srv := httptest.NewServer(presentation.NewHandler(svc, sqlDB.PingContext, discard))

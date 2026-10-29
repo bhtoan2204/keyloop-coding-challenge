@@ -24,6 +24,10 @@ import (
 // maxBodyBytes limits command request bodies; the largest valid body is a few KB.
 const maxBodyBytes = 64 << 10
 
+// requestTimeout bounds every request's context, so a stuck database call ends with
+// 503 instead of holding the connection until the server's write timeout.
+const requestTimeout = 10 * time.Second
+
 // CommandService is implemented by *command.Service.
 type CommandService interface {
 	StockVehicle(ctx context.Context, cmd command.StockVehicle, meta command.Meta) (*command.Result, error)
@@ -66,6 +70,10 @@ func (a *api) healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *api) readyz(w http.ResponseWriter, r *http.Request) {
+	if a.ready == nil {
+		writeJSON(w, http.StatusServiceUnavailable, "application/json", map[string]string{"status": "unavailable"})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 	if err := a.ready(ctx); err != nil {
@@ -102,6 +110,9 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
 // withRequestContext assigns the request ID (a valid inbound X-Request-Id is kept so
 // callers can correlate), echoes it, and writes one structured access-log line.
 func (a *api) withRequestContext(next http.Handler) http.Handler {
@@ -112,7 +123,9 @@ func (a *api) withRequestContext(next http.Handler) http.Handler {
 			id = uuid.Must(uuid.NewV7()).String()
 		}
 		w.Header().Set("X-Request-Id", id)
-		r = r.WithContext(context.WithValue(r.Context(), requestIDKey, id))
+		ctx, cancel := context.WithTimeout(context.WithValue(r.Context(), requestIDKey, id), requestTimeout)
+		defer cancel()
+		r = r.WithContext(ctx)
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		a.log.InfoContext(r.Context(), "http request",
@@ -202,7 +215,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst interface{}, allowEm
 			}
 			return badRequest("INVALID_BODY", "request body is required")
 		case errors.As(err, &typeErr):
-			return invalidField(typeErr.Field, "has the wrong type")
+			field := typeErr.Field
+			if field == "" {
+				field = "body" // the top-level value is not a JSON object
+			}
+			return invalidField(field, "has the wrong type")
 		case strings.HasPrefix(err.Error(), "json: unknown field "):
 			return badRequest("INVALID_BODY", strings.TrimPrefix(err.Error(), "json: "))
 		default:

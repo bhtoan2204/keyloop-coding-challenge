@@ -41,7 +41,8 @@ Kafka/Debezium, `Dockerfile`, Idempotency-Key.
 |---|---|
 | Aggregate base, pending events, replay | `eventsourcing.AggregateRoot`, `ApplyChange(WithMetadata)`, `LoadFromHistory` |
 | Event (de)serialisation | `eventsourcing.NewSerializer()` + `RegisterAggregate` |
-| Load/save aggregates | `eventstore.AggregateStore` (`NewAggregateStoreWithSnapshotInterval`) |
+| Load/save aggregates | `eventstore.AggregateStore` (`NewAggregateStoreWithSnapshotInterval`), `SaveWithMetadata` |
+| Store port for commands | `command.VehicleStore`, implemented by `eventstore/commandstore` (maps store errors to `command.Err*`) |
 | Transactions on the write side | `repos.EventStore.WithTransaction` |
 | Projection | `projection.Projection` + `projectors.Projector` + `viewstore.ViewStore` (narrow refactor per `docs/05` §4.1) |
 | Empty packages to fill | `internal/application/*`, `internal/presentation`, `cmd/main.go` |

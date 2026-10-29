@@ -16,6 +16,7 @@ import (
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/aggregates"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
+	"keyloop-coding-challenge/internal/infrastructure/eventstore/commandstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/infrastructure/referencedata"
 	"keyloop-coding-challenge/package/eventsourcing"
@@ -38,6 +39,12 @@ type hookStore struct {
 	command.VehicleStore
 	beforeSave func(call int) error
 	saves      int
+	gets       int
+}
+
+func (h *hookStore) Get(ctx context.Context, id string, agg eventsourcing.Aggregate) error {
+	h.gets++
+	return h.VehicleStore.Get(ctx, id, agg)
 }
 
 func (h *hookStore) SaveWithMetadata(ctx context.Context, agg eventsourcing.Aggregate, md map[string]interface{}) error {
@@ -74,7 +81,7 @@ func newFixture(t *testing.T) *fixture {
 	if err := serializer.RegisterAggregate(&aggregates.VehicleInventoryAggregate{}); err != nil {
 		t.Fatal(err)
 	}
-	base := eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(db, serializer), 0)
+	base := commandstore.New(eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(db, serializer), 0))
 	hooks := &hookStore{VehicleStore: base}
 	dir := referencedata.NewDealerships(db)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -275,7 +282,8 @@ func TestExpectedVersionIsNotRetriedAfterConflict(t *testing.T) {
 	_, err := f.svc.SellVehicle(context.Background(), command.SellVehicle{
 		Target: command.Target{DealershipID: "d-001", VehicleID: "v1", ExpectedVersion: &expected}, SoldOn: domain.NewDate(2026, 10, 29),
 	}, meta)
-	if !errors.Is(err, command.ErrVersionMismatch) || f.store.saves != 1 {
+	// The reload re-checks If-Match: a clean version mismatch, not a conflict (HTTP 412, not 409).
+	if !errors.Is(err, command.ErrVersionMismatch) || errors.Is(err, command.ErrConflict) || f.store.saves != 1 {
 		t.Fatalf("got %v after %d saves", err, f.store.saves)
 	}
 	if got := f.eventTypes(t, "v1"); !reflect.DeepEqual(got, []string{"VehicleStockedEvent", "VehicleActionProposedEvent"}) {
@@ -328,12 +336,32 @@ func TestRetrySucceedsWhenCommandStillValid(t *testing.T) {
 	}
 }
 
+func TestExpectedVersionRetriesTransientFailureAtSameVersion(t *testing.T) {
+	// A deadlock or lock wait timeout rolled back without anyone committing: the version
+	// still matches If-Match, so the command is re-run and succeeds.
+	f := newFixture(t)
+	f.stock(t, "v1", 100)
+	f.store.beforeSave = func(call int) error {
+		if call == 1 {
+			return fmt.Errorf("save: %w", command.ErrTransient)
+		}
+		return nil
+	}
+	expected := 1
+	res, err := f.svc.ProposeAction(context.Background(), command.ProposeAction{
+		Target: command.Target{DealershipID: "d-001", VehicleID: "v1", ExpectedVersion: &expected}, ActionType: domain.ActionHold,
+	}, meta)
+	if err != nil || f.store.saves != 2 || res.Vehicle.Version() != 2 {
+		t.Fatalf("got %v after %d saves", err, f.store.saves)
+	}
+}
+
 func TestRetryIsBounded(t *testing.T) {
 	f := newFixture(t)
 	f.stock(t, "v1", 100)
-	f.store.beforeSave = func(int) error { return fmt.Errorf("save: %w", eventstore.ErrRetryable) }
+	f.store.beforeSave = func(int) error { return fmt.Errorf("save: %w", command.ErrTransient) }
 	_, err := f.svc.ProposeAction(context.Background(), command.ProposeAction{Target: target("v1"), ActionType: domain.ActionHold}, meta)
-	if !eventstore.IsRetryable(err) || f.store.saves != command.MaxAttempts {
+	if !command.IsRetryable(err) || f.store.saves != command.MaxAttempts {
 		t.Fatalf("got %v after %d saves", err, f.store.saves)
 	}
 }
@@ -342,9 +370,9 @@ func TestNonRetryableErrorsAreNotRetried(t *testing.T) {
 	f := newFixture(t)
 	f.stock(t, "v1", 100)
 	// A lost connection may have committed or not: retrying could duplicate the change.
-	f.store.beforeSave = func(int) error { return fmt.Errorf("commit: %w", driver.ErrBadConn) }
+	f.store.beforeSave = func(int) error { return fmt.Errorf("%w: commit: %w", command.ErrUnavailable, driver.ErrBadConn) }
 	_, err := f.svc.ProposeAction(context.Background(), command.ProposeAction{Target: target("v1"), ActionType: domain.ActionHold}, meta)
-	if !errors.Is(err, driver.ErrBadConn) || f.store.saves != 1 {
+	if !errors.Is(err, command.ErrUnavailable) || f.store.saves != 1 {
 		t.Fatalf("got %v after %d saves", err, f.store.saves)
 	}
 }
@@ -355,11 +383,12 @@ func TestCancelledContextStopsRetries(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	f.store.beforeSave = func(int) error {
 		cancel()
-		return eventstore.ErrConcurrencyConflict
+		return command.ErrConflict
 	}
 	_, err := f.svc.ProposeAction(ctx, command.ProposeAction{Target: target("v1"), ActionType: domain.ActionHold}, meta)
-	if !errors.Is(err, context.Canceled) || f.store.saves != 1 {
-		t.Fatalf("got %v after %d saves", err, f.store.saves)
+	// The loop stops before reloading: one Get, one save.
+	if !errors.Is(err, context.Canceled) || f.store.saves != 1 || f.store.gets != 1 {
+		t.Fatalf("got %v after %d gets, %d saves", err, f.store.gets, f.store.saves)
 	}
 }
 

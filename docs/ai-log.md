@@ -88,3 +88,18 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
   - **Runtime:** `make migrate` and `make mysql-grants` worked against the Compose database (closing Phase 2's unverified item). The built binary served the documented cURL calls (201/200/409/412/404/400 with `ETag`, `Location`, `X-Request-Id`, problem+json) and shut down gracefully on SIGTERM.
   - **Mutation checks:** 7 valid mutants were caught. Removing the `If-Match` short-circuit after a conflict was an *equivalent* mutant (the reload re-check still returns 412), so it isn't a test gap.
 - **Not verified:** behaviour under a real network partition mid-COMMIT (only simulated with `driver.ErrBadConn`), and the HTTP server under load beyond the concurrency tests.
+- **Independent review** (read-only `go-reviewer` subagent; it could run the non-MySQL tests): no Critical findings. **Accepted and fixed, each with a test that a mutation check showed would fail without it:**
+  - **Major (real bug), reproduced by reading:** an `If-Match` race at save time returned **409 instead of 412**. The error wrapped both `ErrVersionMismatch` and the store conflict, and HTTP checked the conflict first. Fix: removed the `If-Match` short-circuit, the same branch an earlier mutation check had flagged as "equivalent". The reload re-check now yields a clean `ErrVersionMismatch`, a transient failure at an unchanged version is re-run, and HTTP checks `ErrVersionMismatch` first. **The AI had wrongly classified that mutant as harmless:** it was equivalent at service level, but not at the HTTP mapping level.
+  - **Major:** application and presentation imported `infrastructure/eventstore`, violating `.claude/rules/architecture.md`. Fix: `command` declares the store error contract (`ErrStreamNotFound`, `ErrConflict`, `ErrTransient`, `ErrUnavailable`). The new `eventstore/commandstore` adapter translates into it. Its first placement inside `eventstore` caused a test-only import cycle and was moved to a subpackage. `go list -deps` now shows 0 infrastructure dependencies for application and presentation.
+  - **Minor, fixed:**
+    - the `referencedata` test failed with `-count=2` (reproduced by the reviewer);
+    - the metadata test could pass on an empty replay;
+    - the cancellation test now counts `Get` calls;
+    - command metadata now wins over event keys (audit);
+    - per-request 10 s deadline;
+    - `context.Canceled` → 503, logged at info;
+    - jittered backoff;
+    - `HTTP_ADDR` default `127.0.0.1:8080`;
+    - nil readiness check, `Unwrap`, empty field name.
+  - **Documented, not changed:** 404 vs 405, the chunked empty body, a panic after headers, demo seed rows in the migration, and the stock-retry advice (send `vehicle_id`).
+- **After the fixes:** `make check` passes. `make test-integration` passes 86 top-level tests with 0 failures or skips. The integration suite passes under `-race`. The rebuilt binary served the commands and shut down cleanly. In that smoke run **the AI's own expected values were wrong**: it assumed a Sydney date of 10-30 from the test clock, but the real clock gave 10-29, so the `409` (exactly 90 days) was correct behaviour.

@@ -5,16 +5,23 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
+	"time"
 
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/aggregates"
-	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 
 	"github.com/google/uuid"
 )
 
 // MaxAttempts bounds how often a command is re-run after a retryable save failure.
 const MaxAttempts = 3
+
+// IsRetryable reports a save failure after which reloading and re-running the
+// command may succeed: an optimistic conflict or a rolled-back transient failure.
+func IsRetryable(err error) bool {
+	return errors.Is(err, ErrConflict) || errors.Is(err, ErrTransient)
+}
 
 type Service struct {
 	store       VehicleStore
@@ -83,8 +90,9 @@ func (s *Service) SellVehicle(ctx context.Context, cmd SellVehicle, meta Meta) (
 // saves the new events. When the save fails with a retryable error (optimistic
 // conflict, deadlock, lock wait timeout) it reloads and re-runs the command, so the
 // decision is always made on fresh state; stale pending events are never re-sent.
-// It does not retry domain rejections, If-Match commands, or other infrastructure
-// errors (e.g. a lost connection, where the commit outcome is unknown).
+// An If-Match version is re-checked on every attempt, so a competing commit ends in
+// ErrVersionMismatch rather than a retry on newer state. Domain rejections and
+// ErrUnavailable (commit outcome unknown) are never retried.
 func (s *Service) execute(ctx context.Context, target Target, meta Meta, create bool,
 	run func(*aggregates.VehicleInventoryAggregate, domain.Date) error) (*Result, error) {
 	loc, err := s.dealerships.Location(ctx, target.DealershipID)
@@ -113,18 +121,31 @@ func (s *Service) execute(ctx context.Context, target Target, meta Meta, create 
 		if err == nil {
 			return &Result{Vehicle: v, BusinessDate: businessDate, Changed: true}, nil
 		}
-		if !eventstore.IsRetryable(err) {
+		if !IsRetryable(err) {
 			return nil, err
-		}
-		if target.ExpectedVersion != nil {
-			// The caller asserted a version; someone else committed first.
-			return nil, fmt.Errorf("%w: %w", ErrVersionMismatch, err)
 		}
 		if attempt >= MaxAttempts {
 			return nil, fmt.Errorf("giving up after %d attempts: %w", attempt, err)
 		}
 		s.log.WarnContext(ctx, "retrying command after retryable save failure",
 			"vehicle_id", target.VehicleID, "attempt", attempt, "error", err)
+		if err := backoff(ctx, attempt); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// backoff waits a short, jittered time before the next attempt, so competing writers
+// do not retry in lockstep. It returns early when ctx ends.
+func backoff(ctx context.Context, attempt int) error {
+	d := time.Duration(attempt)*5*time.Millisecond + rand.N(10*time.Millisecond)
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
@@ -134,13 +155,13 @@ func (s *Service) load(ctx context.Context, target Target, create bool) (*aggreg
 	v := &aggregates.VehicleInventoryAggregate{}
 	err := s.store.Get(ctx, target.VehicleID, v)
 	switch {
-	case errors.Is(err, eventstore.ErrAggregateNotFound) && create:
+	case errors.Is(err, ErrStreamNotFound) && create:
 		v = &aggregates.VehicleInventoryAggregate{}
 		if err := v.SetID(target.VehicleID); err != nil {
 			return nil, err
 		}
 		return v, nil
-	case errors.Is(err, eventstore.ErrAggregateNotFound), errors.Is(err, eventstore.ErrAggregateTypeMismatch):
+	case errors.Is(err, ErrStreamNotFound):
 		return nil, fmt.Errorf("%w: %s", ErrVehicleNotFound, target.VehicleID)
 	case err != nil:
 		return nil, err

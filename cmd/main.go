@@ -22,6 +22,7 @@ import (
 	"keyloop-coding-challenge/internal/application/command"
 	"keyloop-coding-challenge/internal/domain/aggregates"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
+	"keyloop-coding-challenge/internal/infrastructure/eventstore/commandstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/infrastructure/referencedata"
 	"keyloop-coding-challenge/internal/presentation"
@@ -104,10 +105,10 @@ func runAPI(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	store := eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(db, serializer), vehicleSnapshotInterval)
-	commands := command.NewService(store, referencedata.NewDealerships(db), command.SystemClock{}, log)
+	commands := command.NewService(commandstore.New(store), referencedata.NewDealerships(db), command.SystemClock{}, log)
 
 	srv := &http.Server{
-		Addr:              envOr("HTTP_ADDR", ":8080"),
+		Addr:              envOr("HTTP_ADDR", "127.0.0.1:8080"), // set 0.0.0.0:8080 explicitly in a container
 		Handler:           presentation.NewHandler(commands, sqlDB.PingContext, log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,

@@ -15,10 +15,15 @@ import (
 )
 
 func TestDealershipLocation(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file:dealerships?mode=memory&cache=shared"), &gorm.Config{Logger: logger.Discard})
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{Logger: logger.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := repos.Migrate(db); err != nil {
 		t.Fatal(err)
 	}

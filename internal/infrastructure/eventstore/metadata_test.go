@@ -21,8 +21,11 @@ func TestSaveWithMetadataPersistsAndReplays(t *testing.T) {
 	loaded := mustLoad(t, store, "inv")
 	want := []interface{}{
 		map[string]interface{}{"actor_id": "manager-42", "correlation_id": "req-1"},
-		// keys the event already carried win over the command metadata
-		map[string]interface{}{"actor_id": "from-event", "correlation_id": "req-1", "note": "x"},
+		// the event's own keys are kept, but command metadata (audit facts) wins
+		map[string]interface{}{"actor_id": "manager-42", "correlation_id": "req-1", "note": "x"},
+	}
+	if len(loaded.applied) != len(want) {
+		t.Fatalf("replayed %d events, want %d", len(loaded.applied), len(want))
 	}
 	for i, applied := range loaded.applied {
 		if !reflect.DeepEqual(applied.meta, want[i]) {

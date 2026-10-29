@@ -31,10 +31,6 @@ func IsRetryable(err error) bool {
 	return errors.Is(err, ErrConcurrencyConflict) || errors.Is(err, ErrRetryable)
 }
 
-// IsUnavailable reports a database that is down or a connection that broke; see
-// repos.IsUnavailable.
-func IsUnavailable(err error) bool { return repos.IsUnavailable(err) }
-
 const defaultSnapshotInterval = 10
 
 type AggregateStore interface {
@@ -165,26 +161,25 @@ func (as *aggregateStore) shouldCreateSnapshot(baseVersion, currentVersion int) 
 	return as.snapshotInterval > 0 && currentVersion/as.snapshotInterval > baseVersion/as.snapshotInterval
 }
 
-// mergeMetadata returns a new map with the command metadata plus the event's own keys
-// (which win). The aggregate's pending events are not modified: Save works on clones.
-// Metadata that is not a map is left unchanged.
+// mergeMetadata returns a new map with the event's own keys plus the command metadata,
+// which wins: actor and correlation IDs are audit facts an aggregate must not
+// overwrite. The aggregate's pending events are not modified (Save works on clones).
+// Non-map event metadata is kept under the "event" key.
 func mergeMetadata(own interface{}, command map[string]interface{}) interface{} {
 	if len(command) == 0 {
 		return own
 	}
-	var eventKeys map[string]interface{}
+	merged := make(map[string]interface{}, len(command)+1)
 	switch m := own.(type) {
 	case nil:
 	case map[string]interface{}:
-		eventKeys = m
+		for k, v := range m {
+			merged[k] = v
+		}
 	default:
-		return own
+		merged["event"] = m
 	}
-	merged := make(map[string]interface{}, len(command)+len(eventKeys))
 	for k, v := range command {
-		merged[k] = v
-	}
-	for k, v := range eventKeys {
 		merged[k] = v
 	}
 	return merged

@@ -9,7 +9,6 @@ import (
 
 	"keyloop-coding-challenge/internal/application/command"
 	"keyloop-coding-challenge/internal/domain"
-	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 )
 
 // problem is an RFC 9457 problem details body with a stable machine-readable code.
@@ -81,10 +80,15 @@ func writeError(w http.ResponseWriter, r *http.Request, log *slog.Logger, err er
 	case errors.As(err, &validation):
 		p.Status, p.Code, p.Title, p.Detail = http.StatusBadRequest, "VALIDATION_ERROR", "Request validation failed", "request validation failed"
 		p.Errors = []fieldError{{Field: validation.Field, Message: validation.Reason}}
-	case errors.Is(err, eventstore.ErrConcurrencyConflict):
+	case errors.Is(err, command.ErrVersionMismatch):
+		// Checked before the storage cases: a stale If-Match is the caller's answer.
+		p.Status, p.Code, p.Title = http.StatusPreconditionFailed, "VERSION_MISMATCH", "Vehicle version does not match If-Match"
+		p.Detail = "the vehicle was changed; reload it and retry with the current ETag"
+	case errors.Is(err, command.ErrConflict):
 		p.Status, p.Code, p.Title = http.StatusConflict, "CONCURRENCY_CONFLICT", "Concurrent update"
 		p.Detail = "the vehicle kept changing while the command was retried; reload and try again"
-	case errors.Is(err, eventstore.ErrRetryable), eventstore.IsUnavailable(err), errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, command.ErrTransient), errors.Is(err, command.ErrUnavailable),
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		p.Status, p.Code, p.Title = http.StatusServiceUnavailable, "UNAVAILABLE", "Service temporarily unavailable"
 		p.Detail = "the command was not confirmed; check the vehicle's state before retrying"
 		w.Header().Set("Retry-After", "1")
@@ -100,7 +104,7 @@ func writeError(w http.ResponseWriter, r *http.Request, log *slog.Logger, err er
 		}
 	}
 	level := slog.LevelInfo
-	if p.Status >= 500 {
+	if p.Status >= 500 && !errors.Is(err, context.Canceled) { // a client that went away is not a server error
 		level = slog.LevelError
 	}
 	log.Log(r.Context(), level, "request failed", "status", p.Status, "code", p.Code, "error", err.Error())

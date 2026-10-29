@@ -165,7 +165,9 @@ Deviation from the read-model shape above: no `proposed_at`, `updated_at` or `up
 ### Retries and idempotency
 
 - **Server-side retry:** on an optimistic conflict, deadlock or lock wait timeout, the command service reloads the vehicle and re-runs the command on the fresh state. That's at most 3 attempts, stopping on context cancellation. The domain rule therefore decides the outcome: concurrent proposals give one `201` and `409 ACTION_ALREADY_ACTIVE` for the rest.
-- **Never retried:** domain rejections, `If-Match` requests, and connection failures, where the commit may or may not have happened.
+- **`If-Match` commands:** the version is re-checked on every attempt. A competing commit therefore ends in `412` and is never retried on newer state. A deadlock or lock wait with an unchanged version is re-run.
+- **Never retried:** domain rejections and connection failures, where the commit may or may not have happened.
+- **Deadline:** every request context has a 10 s timeout. Retries back off by 5–25 ms with jitter.
 - **Limitation, no `Idempotency-Key` yet:** a client that retries after a timeout or a `503` may repeat a command that did commit. Some repeats are caught by domain rules:
   - stock with the same `vehicle_id` → 409;
   - propose again → 409;
@@ -173,3 +175,10 @@ Deviation from the read-model shape above: no `proposed_at`, `updated_at` or `up
   - identical revise → no-op.
 
   But a non-identical revise, or a cancel then re-propose, could apply twice. Clients should send `If-Match` (or re-read the vehicle) before retrying.
+- **Stocking:** send your own `vehicle_id`. After a `503` with a server-generated ID, the client cannot tell whether the vehicle was created, and a blind retry creates a second vehicle.
+
+### Known minor limitations (accepted for this phase)
+- A wrong method on a known path returns `404 NOT_FOUND` (catch-all route), not `405`.
+- An empty chunked body without `Content-Type` on `/cancel` returns `415`.
+- A panic after headers were written cannot change the status.
+- Demo dealerships `d-001` and `d-002` are seeded by migration v3 in every environment.
