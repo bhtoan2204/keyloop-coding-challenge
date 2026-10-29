@@ -1,119 +1,142 @@
 # 03 — Domain Model
 
+**Status (Phase 1, 2026-10-29): implemented** in `internal/domain/aggregates/` (`vehicle_inventory.go`, `commands.go`, `vehicle_inventory_snapshot.go`), `internal/domain/events/`, `internal/domain/{date,inventory,errors}.go`, with unit tests in the same packages. Section 6 lists where the implementation deviates from the earlier design text. Envelope fields `AggregateType`/`SchemaVersion` (§5) are still *(to add)* in Phase 2 (event store).
+
 ## 1. Aggregate boundary
 
-**`VehicleInventory`** (type name `VehicleInventory`): the stock lifecycle of **one physical vehicle at one dealership**, from stock-in to sale. One stream per stock record, ID `vehicle_id` (UUIDv7).
+**`VehicleInventoryAggregate`**: the stock lifecycle of one physical vehicle at one dealership, from stock-in to sale. There is one aggregate type and one stream per vehicle, keyed by `vehicle_id` (a UUIDv7 string, stored in `es_aggregate.id`). The stored aggregate type is the Go struct name `VehicleInventoryAggregate`, derived by reflection in `aggregateType()` and frozen (D12).
 
-Inside the boundary (must be consistent in one transaction):
-- identity and descriptive attributes (VIN, make, model, model year)
-- `stocked_on`, status (`IN_STOCK` / `SOLD`), `sold_on`
-- the active action (at most one) and its identity
+Inside the boundary: VIN, make, model, model year, `stocked_on`, status, `sold_on`, and the active action.
+Outside it:
+- **Dealership** is reference data (time zone).
+- **Active-VIN uniqueness** spans aggregates. It is optional and lives in the store (04 §6).
+- **Aging** is derived and time-dependent: never stored, never an event.
 
-Outside the boundary:
-- **Dealership** is reference data (ID, name, time zone). It is read, never modified, by commands.
-- **Active-VIN uniqueness** is a set-based rule across aggregates. It is enforced by a reservation table written in the same MySQL transaction as the append (04 §5), not by the aggregate.
-- **Aging** is a derived, time-dependent fact. It is never stored and never an event.
+A per-dealership aggregate would serialise all writes of a dealership through one stream for no cross-vehicle invariant, so it was rejected.
 
-Why not a `Dealership` aggregate that holds all its vehicles? It would serialise every write in a dealership through one stream. That causes contention for no invariant that actually spans vehicles, and huge streams.
+## 2. How it is built on the existing framework
 
-## 2. State (rebuilt from events only)
+The framework's pattern is kept as-is:
+
+```
+command method (to add)        validate input + current state, compute event payload
+   └─ a.ApplyChange(a, &events.X{...})           // package/eventsourcing
+         └─ a.Transition(event)                  // existing dispatch switch
+               └─ applyX(payload) (to fill in)   // structural checks + state mutation
+         event appended to pending list only if Transition succeeded (tested)
+AggregateStore.Save(ctx, a)                       // existing: one tx, CAS, append, Update()
+AggregateStore.Get(ctx, id, &VehicleInventoryAggregate{})  // existing: replay via LoadFromHistory → Transition
+```
+
+Consequences:
+- **Input and business rules** (VIN format, aging, "no active action") are checked in the **command methods**. They depend on the business date, which is passed in as a parameter. The domain never reads the clock.
+- **Structural rules** (first event must be `VehicleStockedEvent`, nothing after a sale, revise/cancel must target the active action) are checked in the **appliers**. They then also guard replay of stored history, because `LoadFromHistory` calls the same `Transition`.
+- Version contiguity on replay is already enforced by `AggregateRoot.LoadFromHistory` (tested).
+
+### State *(to add)* — unexported fields on `VehicleInventoryAggregate`
 
 ```go
-type Vehicle struct {
-    ID           uuid.UUID
-    DealershipID string
-    VIN          string
-    Make, Model  string
-    ModelYear    int
-    StockedOn    Date      // civil date, no time zone
-    Status       Status    // IN_STOCK | SOLD
-    SoldOn       *Date
-    ActiveAction *Action   // nil when none
-    Version      int       // last applied aggregate version
-}
-type Action struct {
-    ID      uuid.UUID
-    Type    ActionType
-    Note    string
+type VehicleInventoryAggregate struct {
+    eventsourcing.AggregateRoot
+    dealershipID string
+    vin, make, model string
+    modelYear    int
+    stockedOn    domain.Date   // civil date (to add: internal/domain/date.go)
+    status       domain.Status // IN_STOCK | SOLD
+    soldOn       domain.Date
+    activeAction *domain.Action
 }
 ```
 
-Style: **decide/evolve**. Command methods are pure: `func (v *Vehicle) ProposeAction(cmd, BusinessDate) ([]Event, error)`, and `apply(Event)` mutates in-memory state. No generic AggregateRoot framework, no reflection.
+The fields are unexported, so the aggregate implements `MarshalJSON`/`UnmarshalJSON` (`vehicle_inventory_snapshot.go`) for snapshots. It is covered by a JSON round-trip test that compares the whole struct and by a test through the real `AggregateStore` (SQLite) that restores from a snapshot after deleting the covered events. Whether snapshots are switched on is decided where the store is built (Phase 2), not here.
 
-## 3. Aging rule
+### Command methods *(to add)*
 
 ```go
-func AgeDays(stockedOn, businessDate Date) int       // businessDate − stockedOn, in days
-func IsAging(v Vehicle, businessDate Date) bool     // v.Status == IN_STOCK && AgeDays(...) > 90
+func (a *VehicleInventoryAggregate) Stock(cmd StockVehicle, businessDate Date) error
+func (a *VehicleInventoryAggregate) ProposeAction(cmd ProposeAction, businessDate Date) error
+func (a *VehicleInventoryAggregate) ReviseAction(cmd ReviseAction) error // no-op ⇒ no pending event
+func (a *VehicleInventoryAggregate) CancelAction(cmd CancelAction) error
+func (a *VehicleInventoryAggregate) Sell(cmd SellVehicle, businessDate Date) error
+```
+
+Each one either returns an error and records no pending event, or calls `ApplyChangeWithMetadata` (which exists already) to record one. Metadata (`actor_id`, `correlation_id`, `traceparent`) is attached by the application layer.
+
+## 3. Aging rule *(to add, `internal/domain`)*
+
+```go
 const AgingThresholdDays = 90
+func AgeDays(stockedOn, businessDate Date) int                  // businessDate − stockedOn
+func IsAging(status Status, stockedOn, businessDate Date) bool  // IN_STOCK && AgeDays > 90
+func BusinessDate(now time.Time, loc *time.Location) Date        // dealership-local date
 ```
 
-`BusinessDate` = `time.Now().In(dealership.Location)` truncated to a date. It is computed in the application layer through an injected `Clock` and passed into the domain. The domain never reads the clock.
+The stock-in day is day 0. **Exactly 90 days is not aging.** The SQL on the read side (05 §2) must match. A shared boundary fixture (89/90/91 days, time zone, DST, leap day, year boundary) is run against both.
 
-The same rule exists in SQL on the read side (05 §2). A shared table-driven test fixture (89/90/91 days, time-zone boundary, leap day, year boundary) runs against both the Go function and the SQL query so the two cannot drift.
+## 4. Commands, invariants, errors
 
-## 4. Commands, events and invariants
-
-### Commands
-
-| Command | Preconditions (else error) | Emits |
+| Command | Preconditions (else error) | Records |
 |---|---|---|
-| `StockVehicle{vehicle_id, dealership_id, vin, make, model, model_year, stocked_on}` | stream does not exist (`ErrVehicleAlreadyExists`); I2, I3; VIN not reserved (`ErrVINAlreadyInStock`, checked in infra) | `VehicleStocked` |
-| `ProposeAction{action_id, action_type, note}` | IN_STOCK (`ErrVehicleNotInStock`); no active action (`ErrActionAlreadyActive`); aging at business date (`ErrVehicleNotAging`) | `VehicleActionProposed` |
-| `ReviseAction{action_id, action_type, note}` | IN_STOCK; active action with that `action_id` (`ErrActionNotActive`); if nothing changed → **no event, success** (no-op) | `VehicleActionRevised` or nothing |
-| `CancelAction{action_id, reason}` | IN_STOCK; active action with that `action_id` | `VehicleActionCancelled` |
-| `SellVehicle{sold_on}` | IN_STOCK (`ErrVehicleAlreadySold`); `stocked_on ≤ sold_on ≤ business_date` | `VehicleSold` (closes the active action, if any) |
+| `StockVehicle{dealership_id, vin, make, model, model_year, stocked_on}` (vehicle ID = aggregate ID, set with `SetID`) | not yet stocked (`ErrVehicleAlreadyStocked`); I2, I3 | `VehicleStockedEvent` |
+| `ProposeAction{action_id, action_type, note}` | IN_STOCK (`ErrVehicleNotInStock`); no active action (`ErrActionAlreadyActive`); aging at business date (`ErrVehicleNotAging`) | `VehicleActionProposedEvent` |
+| `ReviseAction{action_id, action_type, note}` | IN_STOCK; `action_id` is the active one (`ErrActionNotActive`); unchanged values → **no event** | `VehicleActionRevisedEvent` |
+| `CancelAction{action_id, reason}` | IN_STOCK; `action_id` is active | `VehicleActionCancelledEvent` |
+| `Sell{sold_on}` | IN_STOCK (`ErrVehicleAlreadySold`); `stocked_on ≤ sold_on ≤ business_date` | `VehicleSoldEvent` (closes the active action) |
 
-Every command also carries an `expected_version` (optional, from `If-Match`) and `CommandMeta{command_id, actor_id, correlation_id, idempotency_key, traceparent}`.
+| ID | Invariant | Enforced in |
+|----|-----------|-------------|
+| I1 | The stream begins with exactly one `VehicleStockedEvent` (version 1) | applier |
+| I2 | VIN is 17 chars `[A-HJ-NPR-Z0-9]` (upper-cased); make/model non-empty, ≤ 64 chars; `model_year` ∈ [1900, year+1]; note ≤ 1000 chars | command |
+| I3 | `stocked_on ≤ business_date` | command |
+| I4 | One IN_STOCK vehicle per VIN | store, **optional** (D4) |
+| I5 | Action commands require IN_STOCK. SOLD is terminal. | command + applier |
+| I6 | At most one active action | command + applier |
+| I7 | Propose requires aging (D3) | command |
+| I8 | Revise/cancel reference the active `action_id` | command + applier |
+| I9 | Versions contiguous from 1 | **existing** `LoadFromHistory` + CAS |
+| I10 | `OTHER` requires a note | command |
 
-### Invariants
+Errors *(to add to `internal/domain/errors.go`, next to the existing `ErrUnknownEventType`)*: `ErrValidation` (with a `ValidationError{Field, Reason}`), `ErrVehicleNotStocked`, `ErrVehicleAlreadyStocked`, `ErrVehicleNotInStock`, `ErrVehicleAlreadySold`, `ErrVehicleNotAging`, `ErrActionAlreadyActive`, `ErrActionNotActive`, `ErrInvalidEventSequence` (implemented).
 
-| ID | Invariant |
-|----|-----------|
-| I1 | A stream begins with exactly one `VehicleStocked` at version 1. No other event may be first. |
-| I2 | VIN is 17 chars `[A-HJ-NPR-Z0-9]` (upper-cased). Make and model are non-empty, ≤ 64 chars, trimmed. `model_year` ∈ [1900, current year + 1]. The note is ≤ 1000 chars. |
-| I3 | `stocked_on ≤ business_date` (no future stock-in in dealership-local time). |
-| I4 | At most one `IN_STOCK` vehicle per VIN (infra-enforced, see 04 §5). |
-| I5 | Action commands require `IN_STOCK`. `SOLD` is terminal: every command on a sold vehicle is rejected. |
-| I6 | At most one active action. |
-| I7 | `ProposeAction` requires `IsAging(v, business_date)` (decision D3). |
-| I8 | Revise and cancel must reference the active `action_id`. This avoids silently changing an action the caller did not see. |
-| I9 | Versions are contiguous: `1..n`. Replay fails loudly on any gap or duplicate. |
-| I10 | `action_type = OTHER` requires a non-empty note. |
-
-`ActionType` enum: `PRICE_REDUCTION`, `PROMOTE`, `TRANSFER`, `AUCTION`, `WHOLESALE`, `HOLD`, `OTHER`.
-
-### Lifecycle
+`ActionType`: `PRICE_REDUCTION`, `PROMOTE`, `TRANSFER`, `AUCTION`, `WHOLESALE`, `HOLD`, `OTHER` (D9).
 
 ```mermaid
 stateDiagram-v2
-  [*] --> InStock_NoAction: VehicleStocked
-  InStock_NoAction --> InStock_ActiveAction: VehicleActionProposed (aging only)
-  InStock_ActiveAction --> InStock_ActiveAction: VehicleActionRevised
-  InStock_ActiveAction --> InStock_NoAction: VehicleActionCancelled
-  InStock_NoAction --> Sold: VehicleSold
-  InStock_ActiveAction --> Sold: VehicleSold (closes action)
+  [*] --> InStock_NoAction: VehicleStockedEvent
+  InStock_NoAction --> InStock_ActiveAction: VehicleActionProposedEvent (aging only)
+  InStock_ActiveAction --> InStock_ActiveAction: VehicleActionRevisedEvent
+  InStock_ActiveAction --> InStock_NoAction: VehicleActionCancelledEvent
+  InStock_NoAction --> Sold: VehicleSoldEvent
+  InStock_ActiveAction --> Sold: VehicleSoldEvent (closes action)
   Sold --> [*]
 ```
 
-Aging is a predicate over (`InStock_*`, `stocked_on`, business date), not a state, so no event fires when a vehicle "turns 91".
+Aging is a predicate, not a state, so no event fires when a vehicle "turns 91".
 
-## 5. Events (schema_version = 1)
+## 5. Events
 
-Event type names are stable string constants, independent of Go type names.
+Stored `event_type` values are the Go struct names. They are **frozen** and pinned by `TestVehicleEventsUsePointerPayloads` (existing). Payloads are pointers, and the framework rejects value payloads (tested). Fields are *(to add)* to the existing empty structs. Adding fields to empty structs is backward compatible: nothing is persisted yet.
 
-| Event | Payload |
-|-------|---------|
-| `VehicleStocked` | `{vehicle_id, dealership_id, vin, make, model, model_year, stocked_on: "YYYY-MM-DD"}` |
-| `VehicleActionProposed` | `{action_id, action_type, note}` |
-| `VehicleActionRevised` | `{action_id, action_type, note}` (full new values, not a diff) |
-| `VehicleActionCancelled` | `{action_id, reason}` |
-| `VehicleSold` | `{sold_on: "YYYY-MM-DD", closed_action_id: uuid \| null}` |
+| `event_type` | Payload (JSON) |
+|---|---|
+| `VehicleStockedEvent` | `{dealership_id, vin, make, model, model_year, stocked_on: "YYYY-MM-DD"}` (vehicle ID is the envelope's `AggregateID`) |
+| `VehicleActionProposedEvent` | `{action_id, action_type, note}` |
+| `VehicleActionRevisedEvent` | `{action_id, action_type, note}` (full new values) |
+| `VehicleActionCancelledEvent` | `{action_id, reason}` |
+| `VehicleSoldEvent` | `{sold_on, closed_action_id}`; `closed_action_id` omitted when no action was active |
 
-Metadata (all events): `{command_id, actor_id, correlation_id, causation_id, idempotency_key?, traceparent?}`.
+Envelope (existing `eventsourcing.Event`): `ID` (= `es_event.id`, the unique event ID), `AggregateID`, `Version`, `EventType`, `Data`, `Metadata` (map: `actor_id`, `correlation_id`, `traceparent`), `CreatedAt` (unix seconds). Additive *(to add)*: `AggregateType`, `SchemaVersion` (0 is read as 1). Schema evolution: when a payload changes shape, bump the version for that type and upcast on read inside the event repo's decode step. Stored rows are never rewritten.
 
-Design notes:
-- Events record **facts in business terms**. They carry no derived values (no `age_days`, no `is_aging`).
-- `closed_action_id` on `VehicleSold` makes the history explicit. The projector does not need to infer which action the sale closed.
-- Actor and time sit in metadata and the event row (`occurred_at`), not duplicated in every payload.
-- Schema evolution: the decoder dispatches on `(event_type, schema_version)`. Upcasters transform old versions to the current struct. Stored events are never rewritten.
+Payloads hold business facts only. No `age_days`, no `is_aging`.
+
+## 6. Phase 1 deviations from the design text above
+
+| Earlier text | Implemented | Reason |
+|---|---|---|
+| `vehicle_id` in the `VehicleStockedEvent` payload | Not in payload; `VehicleID()` returns `AggregateID()` | One source of truth; no mismatch case to validate |
+| `closed_action_id: null` | `string`, `omitempty` | Avoids a pointer in the payload; empty means "none" |
+| `ErrVehicleNotFound`, `ErrVehicleAlreadyExists`, `ErrCorruptStream` | `ErrVehicleNotStocked`, `ErrVehicleAlreadyStocked`, `ErrInvalidEventSequence` | Matches the aggregate's view: "not found" is a store concern (`ErrAggregateNotFound`, existing) |
+| `ReviseAction` returns `(changed, error)` | returns `error`; callers check `IsUnsaved()` | Same shape as the other commands |
+| Snapshots disabled for vehicles | Snapshot JSON implemented and tested; enabling is a store-construction choice | Phase 1 brief required custom JSON with tests if needed |
+| `IsAging(status, stockedOn, bd)` free function | `(*VehicleInventoryAggregate).IsAging(bd)` + `domain.AgeInDays` | Brief asked for `IsAging(businessDate)` on the aggregate |
+| Command metadata (`actor_id`, …) attached by the application layer | Not yet: commands call `ApplyChange` without metadata | `ApplyChangeWithMetadata` takes a map; how commands receive it is decided in Phase 2 |

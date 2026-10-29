@@ -9,7 +9,7 @@ Base path `/v1`, JSON only. Dates are `YYYY-MM-DD`, timestamps are RFC 3339 UTC.
 | Header | Direction | Meaning |
 |---|---|---|
 | `X-Actor-Id` | request, **required on commands** | Stand-in for authenticated user (A8); recorded in event metadata |
-| `Idempotency-Key` | request, optional on POST | Replay-safe retries (04 §4); scoped per actor |
+| `Idempotency-Key` | request, optional on POST | Replay-safe retries; scoped per actor. **Implemented only if time allows** (04 §6, cut-list item 3). Otherwise it is ignored. |
 | `If-Match: "<version>"` | request, optional on action/sale commands | Rejects with 412 if the aggregate version differs |
 | `ETag: "<version>"` | response on vehicle resources | Aggregate version (from the write side on commands, the read model on reads) |
 | `X-Request-Id` / `traceparent` | both | Correlation; generated if absent |
@@ -66,9 +66,9 @@ One aggregate query over `ix_vehicle_dealer_status_stocked`: `count(*) FILTER (W
 
 **`GET /v1/dealerships/{dealershipId}/vehicles/{vehicleId}`** returns one vehicle (same item shape) plus `ETag`. Returns `404 VEHICLE_NOT_FOUND`, including when the vehicle belongs to another dealership.
 
-**`GET /v1/dealerships/{dealershipId}/vehicles/{vehicleId}/actions`** returns the action history (B6), oldest first, keyset-paginated on `aggregate_version`.
+**`GET /v1/dealerships/{dealershipId}/vehicles/{vehicleId}/actions`** returns the action history (B6), oldest first, keyset-paginated on `version`. `event_id` is `es_event.id`, and `occurred_at` is derived from `es_event.created_at` (unix seconds).
 ```json
-{ "data": [{ "event_id": "…", "version": 2, "action_id": "…", "change": "PROPOSED",
+{ "data": [{ "event_id": 1042, "version": 2, "action_id": "…", "change": "PROPOSED",
              "action_type": "PRICE_REDUCTION", "note": "…", "reason": null,
              "actor_id": "manager-42", "occurred_at": "…" }],
   "page": { "limit": 20, "has_more": false, "next_cursor": null } }

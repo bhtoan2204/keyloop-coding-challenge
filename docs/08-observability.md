@@ -5,7 +5,7 @@ Goal: an operator can answer three questions without attaching a debugger. *Is t
 ## Logs (`log/slog`, JSON to stdout)
 
 - One logger is built in `main` and passed down. A request- or record-scoped logger travels in `context`.
-- Standard fields: `service` (`api|projector|rebuild`), `trace_id`, `span_id`, `request_id`, `dealership_id`, `aggregate_id`, `aggregate_version`, `event_id`, `event_type`, `kafka.partition`, `kafka.offset`, `error.code`.
+- Standard fields: `service` (`api|projector|rebuild`), `trace_id`, `span_id`, `request_id`, `dealership_id`, `aggregate_id`, `version`, `event_id` (`es_event.id`), `event_type`, `kafka.partition`, `kafka.offset`, `error.code`.
 - Levels: `INFO` is one line per request (method, route template, status, duration) and per projector lifecycle event. `WARN` covers conflict retries, duplicates skipped in bulk and gap repairs. `ERROR` covers 5xx, halted partitions and rebuild failure. No PII beyond the VIN. Request bodies are not logged.
 
 ## Metrics (Prometheus, `/metrics`)
@@ -20,7 +20,7 @@ Goal: an operator can answer three questions without attaching a debugger. *Is t
 | `projection_duplicates_skipped_total` | counter | — | at-least-once behaviour visible |
 | `projection_gaps_repaired_total` | counter | — | should be 0; alert if > 0 |
 | `projection_halted` | gauge | `partition` | page on 1 |
-| `projection_lag_seconds` | gauge | `partition` | now − `occurred_at` of the last applied event |
+| `projection_lag_seconds` | gauge | `partition` | now − `es_event.created_at` of the last applied event (1 s resolution, R14) |
 | `projection_apply_duration_seconds` | histogram | — | PG tx latency |
 
 Kafka consumer-group lag is also visible in Kafka tooling because offsets are best-effort committed to Kafka (05 §4.1).

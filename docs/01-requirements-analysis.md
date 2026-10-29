@@ -45,7 +45,7 @@ The PDF does not require ES, CQRS, Kafka or Debezium. These come from our brief,
 | T1 | REST API with an OpenAPI 3.x specification that matches the implementation (enforced by a contract test). |
 | T2 | Persistent databases: MySQL 8 (event store, write side) and PostgreSQL (read model), both on Docker volumes. |
 | T3 | Event sourcing: the vehicle state is rebuilt only by replaying events. Commands produce events and never update current-state rows on the write side. |
-| T4 | Optimistic concurrency is enforced **by the database** (unique `(aggregate_id, aggregate_version)`). Multi-event commands are appended atomically. |
+| T4 | Optimistic concurrency is enforced **by the database**: the existing compare-and-set on `es_aggregate.version` inside the save transaction, plus the unique `(aggregate_id, version)` on `es_event`. Multi-event commands are appended atomically (one transaction). Verified on MySQL, not only SQLite. |
 | T5 | CDC: Debezium captures committed inserts from the event table and publishes them to Kafka. |
 | T6 | The projection consumer keeps per-aggregate order, ignores duplicates, detects gaps and out-of-order versions, commits state and progress atomically, recovers after restart, and can do a full rebuild from MySQL without needing Kafka retention. |
 | T7 | Aging is computed at query time from `stocked_on` and the dealership's business date. No `days_in_stock` column is stored. |

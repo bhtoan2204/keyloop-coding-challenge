@@ -1,142 +1,140 @@
-# 07 — Repository Structure, Implementation Plan, Critical Path
+# 07 — Implementation Plan (minimal-change roadmap)
 
-## 1. Repository structure
+Window: **Thursday 29 October → Wednesday 4 November 2026 (deadline).** Phase 0 (this reconciliation) is done on 29 Oct.
+
+Principles: extend the existing packages instead of adding parallel ones, and validate the existing framework on MySQL before building on it. Every phase ends with `go vet ./...` and `go test ./...` green, and the developer commits it. The AI does not commit. Every phase appends factual entries to [ai-log.md](ai-log.md) (D11).
+
+## 1. Repository structure (existing tree, with additions marked `+`)
 
 ```
-cmd/inventory/main.go            # subcommands: api | projector | migrate | rebuild | seed
+cmd/main.go                                   existing placeholder → subcommands api|projector|migrate|rebuild
+package/eventsourcing/                        existing framework (AggregateRoot, Event, serializer) — reuse
+  event.go                                    + AggregateType, SchemaVersion fields
 internal/
-  inventory/                     # the bounded context (module)
-    domain/                      # PURE: no I/O, no SQL, no HTTP, no clock
-      vehicle.go                 #   aggregate state + decide/apply
-      commands.go  events.go     #   command structs, event structs + type constants
-      codec.go                   #   (event_type, schema_version) ⇄ struct, upcasters
-      aging.go     date.go       #   AgeDays, IsAging, civil Date
-      errors.go                  #   typed domain errors
-    app/                         # use cases: load → decide → append, retries, business date
-      commands.go  queries.go
-    eventstore/                  # MySQL: Append, Load, ReadAll, ReadStream, idempotency, VIN
-    readmodel/                   # Postgres: list/detail/history queries, cursor
-    projection/                  # apply logic (PG tx), Kafka consumer, rebuild, gap repair
-    httpapi/                     # handlers, DTOs, error→problem mapping, middleware
-  platform/                      # cross-cutting, no business logic
-    config/  clock/  mysqlx/  pgx/  kafka/  telemetry/ (slog, otel, prometheus)
-migrations/
-  mysql/0001_event_store.up.sql …
-  postgres/0001_read_model.up.sql …
-api/openapi.yaml
-deploy/
-  debezium/inventory-connector.json
-  mysql/my.cnf  mysql/init-users.sql
-  prometheus/prometheus.yml
-docker-compose.yaml   Dockerfile   Makefile
-scripts/demo.sh   scripts/seed.json
-docs/
+  domain/
+    aggregates/vehicle_inventory.go           existing → + state, command methods, appliers
+    events/*.go                               existing empty structs → + payload fields
+    errors.go                                 existing → + domain errors
+    + date.go, aging.go, action.go            civil Date, aging rule, ActionType/Status
+  application/
+    command/                                  existing empty → handlers (load → method → Save, retry)
+    query/                                    existing empty → list/detail/history/summary
+    messaging/                                existing empty → Kafka CDC consumer
+  infrastructure/
+    eventstore/                               existing AggregateStore — reuse; snapshots off for vehicles
+      repos/                                  existing → + versioned Migrate, new columns, ReadAll/ReadStream
+      repos/migrations/{mysql,sqlite}/        + 0001 (= today's DDL), 0002 (additive columns)
+    projection/                               existing pipeline → tx + version check
+      projectors/                             existing stubs → VehicleProjector implemented; Outbox untouched
+    viewstore/                                existing interface → + Postgres implementation, migrations
+    cache/                                    existing stub — untouched, unwired
+  presentation/                               existing empty → HTTP handlers, problem+json
+package/redis/                                existing stub — untouched, unwired
+api/openapi.yaml                              +
+deploy/debezium/connector.json, deploy/mysql/ +
+docker-compose.yaml, Dockerfile, Makefile     existing empty files → filled
+docs/                                         this folder + system-design.md, demo.md, curl-examples.md, ai-log.md
 ```
 
-Dependency rule: `domain` imports nothing from the project. `app` imports `domain` and declares the small interfaces it needs (`EventStore`, `Clock`, `Dealerships`). The infra packages implement them. `httpapi` imports `app`. Interfaces are declared at the consumer only where there is a real second implementation (a test fake or the real DB). No generic repository or generic ES framework.
+Tests: the existing tests stay as they are. MySQL/Postgres integration tests sit behind the `integration` build tag and read `MYSQL_TEST_DSN` / `PG_TEST_DSN` (Compose services; testcontainers optional, 02 C11).
 
-Integration tests live next to their package behind the `integration` build tag and use testcontainers. `make test` runs unit tests only (fast, no Docker). `make test-integration` and `make e2e` need Docker.
+## 2. Phases
 
-Migration from the current scaffolding: `package/eventsourcing`, `internal/infrastructure/*`, `package/redis` and the GORM/SQLite dependencies are removed in M1. The aggregate-replay test cases worth keeping are ported to `domain` tests.
+### Phase 1 — Write side on MySQL + domain · Thu 29 – Fri 30 Oct
+Scope (only what the brief's Phase 1 lists):
+1. Add `gorm.io/driver/mysql`. Compose service `mysql` only (binlog settings already present for later CDC). Makefile targets `test`, `test-integration`, `mysql-up`.
+2. Versioned `repos.Migrate`: `0001` is today's DDL, `0002` adds `es_event.aggregate_type` and `es_event.schema_version` (04 §4). `Event` gains the matching fields. `Append` writes them and `Get` reads them.
+3. **Validate the existing store on MySQL:** let the existing `eventstore` tests' `openDB` use MySQL when `MYSQL_TEST_DSN` is set. All 10 existing behaviours then run on both engines.
+4. MySQL concurrency tests (H1): N goroutines saving the same existing aggregate from the same base version, and N goroutines creating the same new aggregate. Fix only what the tests show (04 §5).
+5. Domain: payload fields, `Date`/aging, errors, `VehicleInventoryAggregate` state, command methods and appliers (03). The vehicle store is built with snapshot interval 0.
 
-## 2. Milestones and acceptance tests
+Acceptance tests:
+- existing 17 tests still green (SQLite)
+- existing 10 event-store tests green on MySQL
+- concurrency: exactly 1 winner, all losers get `ErrConcurrencyConflict` (not a raw 1213/1205), versions contiguous
+- multi-event save is all-or-nothing on MySQL (failure injected on the 2nd insert)
+- migration: a DB created by the **current** `Migrate` is upgraded by the new one without error; old rows read back with `schema_version = 1`
+- domain unit tests: every invariant I1–I10 has a reject case and an accept case; aging 89/90/91, time zone, DST, leap day; replay of corrupt history fails; command methods leave no pending event on error; identical revise records nothing
+- the existing `TestVehicleEventsUsePointerPayloads` still pins the event names
 
-Each milestone ends green (`go vet`, `golangci-lint`, its tests) and is committed.
+### Phase 2 — Commands + write API · Sat 31 Oct
+- `application/command`: load → command method → `Save`, retry ×3 on `ErrConcurrencyConflict`, `If-Match` check, business date from the dealership time zone, metadata (`actor_id`, `correlation_id`).
+- `presentation`: POST/PUT command endpoints (06), problem+json, `X-Actor-Id`. `cmd/main.go api|migrate`.
+- **Parallel, time-boxed to 2 h:** Debezium spike. Compose `kafka` (KRaft) + `connect`, register the connector, and see an `es_event` row arrive keyed by `aggregate_id`. Save one message as a golden file.
+- Tests: handler tests (error → HTTP mapping); MySQL integration test of 20 concurrent `ProposeAction` → 1 × 201, 19 × 409 `ACTION_ALREADY_ACTIVE`.
 
-**Every milestone also appends to `docs/ai-log.md` (D11).** The PDF makes "AI engineering & verification" a primary criterion, so evidence is recorded as it happens. Per entry: what was delegated to the AI, what came back, how it was verified (which test or command and its result), and what was **rejected or corrected and why**. Example already available from this planning session: the AI first proposed acceptance criteria without the PDF (which it had missed because the file is untracked). The developer pointed to the file, and the criteria were re-based on it. That added the summary endpoint, the "real-time" target and the README-section requirement.
+### Phase 3 — Read model + business E2E without Kafka · Sun 1 Nov
+- Postgres schema + `ViewStore` implementation. `Projector` signature change and `VehicleProjector`. `Projection.Apply` with tx + version check (05 §4).
+- `repos.ReadAll` + `main rebuild` / catch-up (D14). `application/query` + GET endpoints (list, detail, history, summary).
+- **Milestone (end of 1 Nov): PDF business criteria B1–B6 demonstrable through the API**, with the read model fed by catch-up.
+- Tests: projection duplicate/gap/unknown-event; summary counts = list counts; filters, `aging=true` at 90 vs 91 via `as_of`; keyset pages over 250 rows equal one unpaginated query; limit 20/100/101; the same aging fixture as Phase 1 run in SQL; rebuild produces the same read model as incremental apply.
 
-### M0 — Infrastructure spike (de-risk CDC) · day 1 AM
-- Compose: MySQL 8 (binlog config), Kafka KRaft, Debezium Connect, Postgres. Hand-written migration for `event_store`. Connector registration container.
-- **Exit**: a manual `INSERT` into `event_store` shows up in `kafka-console-consumer` with **key = aggregate_id** and a decodable value. Capture this message as a golden file for M4.
+### Phase 4 — Live CDC transport · Mon 2 Nov
+- `application/messaging` consumer (per-partition sequential, offset commit after the PG commit). Decode the Debezium row into `eventsourcing.Event` via the serializer. Full Compose stack with startup ordering.
+- Tests: golden-message decode; E2E: command → visible in the read API (≤ 2 s p95, B7) → stop the projector → more commands → restart → catches up → `rebuild` → identical.
+- If the spike failed: ship the catch-up reader as the transport behind the same consumer interface, and document the commit-order caveat (02 §1).
 
-### M1 — Domain · day 1 PM
-- Aggregate, commands, events, codec, aging, errors, Clock. Remove the old scaffolding.
-- **Tests (unit, table-driven, given-events/when-command/then-events-or-error)**:
-  - every invariant I1–I10 has a rejecting case and an accepting case
-  - aging boundary: 89, 90 → not aging; 91 → aging; sold vehicle never aging; time-zone case (UTC instant that is a different date in `Australia/Sydney` vs `America/Los_Angeles`); leap day; year boundary
-  - replay: version gap and duplicate version fail; unknown event type fails
-  - codec round-trip for every event; upcaster hook test (fake v0 → v1)
-  - revise with identical values emits no events
+### Phase 5 — Contract, observability, packaging · Tue 3 Nov
+- `api/openapi.yaml` + Swagger UI, curl examples, seed command, slog / Prometheus / OTel (08), Dockerfile, Makefile, README build/run/test.
 
-### M2 — Event store + command use cases · day 2
-- MySQL migrations, grants and triggers. Append (multi-row, one tx), Load, VIN reservation, idempotency, error mapping (1062/1213/1205), retry loop.
-- **Tests (integration, MySQL testcontainer)**:
-  - append + load round-trip; multi-event command is all-or-nothing (inject a failure on the 2nd row and assert 0 rows)
-  - **concurrency**: 20 goroutines `ProposeAction` on one aging vehicle → exactly 1 success, 19 `ACTION_ALREADY_ACTIVE`, stream versions contiguous 1..2
-  - 20 goroutines `ReviseAction` with the same `If-Match` → exactly 1 success, 19 `VERSION_MISMATCH`
-  - 10 concurrent `StockVehicle` with the same VIN → exactly 1 success
-  - idempotency: same key + same body → identical replay and no new event; same key + different body → 422; concurrent same-key requests → 1 event
-  - `UPDATE`/`DELETE` on `event_store` as the app user fails
-
-### M3 — Read model + queries · day 3 AM
-- Postgres migrations, list/detail/history/**summary** queries, cursor, business-date resolution.
-- **Tests (integration, Postgres)**: summary counts match the list endpoint's counts for the same `as_of` (in stock, `aging=true`, aging with no action); each filter alone and combined; `aging=true` boundary (90 vs 91) using `as_of`; every sort, both directions; keyset pages over 250 rows equal one unpaginated query (no duplicates or omissions, including tie-breaks on equal `stocked_on`); limit default 20, max 100, 101 → 400; cursor tampering → 400; **the same aging fixture as M1 gives the same answers** in SQL; `EXPLAIN` uses the indexes on a 10k-row seed.
-
-### M4 — Projector · day 3 PM – day 4 AM
-- Apply logic (PG tx with checkpoint), franz-go consumer with seek-on-assign, gap repair, halt-on-poison, rebuild with an advisory lock.
-- **Tests**:
-  - unit/integration on `apply` (no Kafka): duplicate is ignored; v1..v4 in order is correct; v1,v3 triggers a repair from a MySQL stub/container; unknown type halts and rolls back; `VehicleSold` closes the action in history
-  - decode the M0 golden Debezium message
-  - **crash recovery**: apply a record, kill before `COMMIT` → re-delivery applies once; after `COMMIT` → skipped; final state equals the expected state
-  - **rebuild equivalence**: generate 500 random valid command sequences, then (a) live-project and (b) truncate + rebuild → both read models are byte-identical (compared with `ORDER BY` dumps)
-  - Kafka integration (testcontainers Kafka): restart the consumer mid-stream → no loss, no double-apply
-
-### M5 — HTTP API + OpenAPI · day 4 PM – day 5 AM
-- Handlers, middleware (request ID, logging, recovery, tracing, metrics), problem+json, `openapi.yaml`, Swagger UI.
-- **Tests**: handler tests with `httptest` against fakes for the error mapping table; the **contract test** validates every integration response against `openapi.yaml`; `X-Actor-Id` missing → 400.
-
-### M6 — End-to-end, observability, seed · day 5 PM
-- `docker compose up` runs the whole stack. `inventory seed` loads ~60 vehicles across 2 dealerships with back-dated `stocked_on` (some at exactly 90/91 days). Metrics, traces and the Compose `observability` profile.
-- **E2E test (`make e2e`)**: compose up → stock → propose → poll the read API until `version` matches (≤ 10 s) → stop the projector → issue commands → start the projector → read model catches up → `rebuild` → identical results. **B7 check**: 200 sequential commands, then assert p95 command-commit → visible-in-read-API ≤ 2 s and report the measured number in the README.
-
-### M7 — Documentation & demo · day 6
-- `docs/system-design.md` (P1) with sections in PDF order: architecture diagram, component roles, data flow, technologies + justification (including the simplest-viable-design comparison, R10), observability, **"How GenAI assisted the design phase"** (drawn from `ai-log.md` entries for this planning stage), and assumptions (01 §3).
-- `README.md` (P2): prereqs, `make up`, `make test`, `make test-integration`, `make e2e`, link to cURL examples and Swagger UI, and the **"AI Collaboration Narrative" section** covering strategy for guiding the AI, verification and refinement process, and how final quality was ensured. It is condensed from `ai-log.md` with concrete examples of corrections. No reconstructed or invented activity.
-- `docs/demo.md`: video outline with timings per the PDF (intro + scenario ~0:45 · design walkthrough ~2:00 · AI story 1–2 min · live demo ~3:00 · learnings/challenges ~1:00).
-
-### Day 7 — Buffer
-Hardening, review pass, `golangci-lint` clean-up, re-run all tests from a clean clone, record the demo video.
+### Phase 6 — Deliverables · Wed 4 Nov (deadline)
+- `docs/system-design.md` (P1, including the GenAI-in-design section from `ai-log.md`), the README **AI Collaboration Narrative** section (P2), `docs/demo.md` video outline (P4).
+- Final check from a clean clone: `make up`, `make test`, `make test-integration`, `make e2e`. Record the actual outputs.
 
 ## 3. Critical path
 
 ```mermaid
 gantt
   dateFormat  YYYY-MM-DD
-  axisFormat  %a
-  section Week
-  M0 CDC spike            :crit, m0, 2026-11-02, 0.5d
-  M1 Domain               :crit, m1, after m0, 0.5d
-  M2 Event store + cmds   :crit, m2, after m1, 1d
-  M3 Read model queries   :m3, after m2, 0.5d
-  M4 Projector            :crit, m4, after m3, 1d
-  M5 HTTP + OpenAPI       :m5, after m4, 1d
-  M6 E2E in compose       :crit, m6, after m5, 0.5d
-  M7 Docs + demo          :crit, m7, after m6, 1d
-  Buffer                  :after m7, 1d
+  axisFormat  %a %d
+  section Critical (business first)
+  P0 Docs reconciliation        :done, p0, 2026-10-29, 0.5d
+  P1 MySQL write side + domain  :crit, p1, after p0, 1.5d
+  P2 Commands + write API       :crit, p2, after p1, 1d
+  P3 Read model + business E2E  :crit, p3, after p2, 1d
+  P4 Kafka/Debezium transport   :crit, p4, after p3, 1d
+  P5 OpenAPI, observability     :p5, after p4, 1d
+  P6 SDD, README, demo          :crit, p6, after p5, 1d
+  section De-risk
+  Debezium spike (2h)           :spike, 2026-10-31, 0.25d
 ```
 
-The critical chain is **CDC wiring → event store → projector → E2E**. Every other piece can be tested in isolation, but those can only be proven together. That is why M0 comes first: if Debezium misbehaves on day 1 there is still time to fix it. Without the spike it would surface on day 5.
+The chain is **MySQL write side → commands → read model → business E2E**. It delivers every Keyloop-mandatory criterion by 1 Nov, independent of Kafka. Debezium/Kafka (self-imposed) follows on 2 Nov, de-risked by the 31 Oct spike. There is **no buffer day**: the cut list is the buffer.
 
-**Contingency** if M0 is still red at the end of day 1: keep the same event store and projector code, and temporarily feed the projector from a MySQL poller that reads `ReadAll(after global_position)` with a safety lag. The `apply` logic and its tests are source-agnostic, so this swaps only the transport. Debezium stays the target, and the trade-off (02 §1) is documented if the fallback ever ships.
+## 4. Cut list (apply in order when a phase overruns)
 
-## 4. Cut list (in order, if behind schedule)
+1. Re-enabling snapshots for vehicles (stays disabled).
+2. Compose observability profile (Jaeger/Prometheus containers). Instrumentation stays.
+3. `Idempotency-Key` store. Domain-rule idempotency remains.
+4. VIN reservation (D4).
+5. Automatic gap repair (D6). Detect + halt remains.
+6. Kafka offsets in Postgres (D5). Per-aggregate version remains.
+7. `make_model` sort.
+8. OpenAPI contract test. The spec remains.
+9. Kafka transport itself, as a last resort: ship the catch-up transport (Phase 4 fallback) and document it.
 
-1. Compose `observability` profile (Jaeger/Prometheus containers). Instrumentation stays.
-2. `Idempotency-Key` store. Natural idempotency through domain rules remains (04 §4).
-3. `make_model` sort. `age_desc` and `age_asc` remain.
-4. Kafka-level testcontainers test. `apply` tests + E2E remain.
-5. OpenAPI contract test. The spec is still hand-checked.
+**Never cut:** B1–B7; MySQL OCC/concurrency tests; projector duplicate handling and gap detection; rebuild from MySQL; aging boundary tests; README, SDD, AI narrative.
 
-Never cut: any B1–B6 criterion, the OCC concurrency test, projector idempotency and gap handling, rebuild, the aging boundary tests, the README and design doc.
-
-## 5. Definition of done (maps to PDF deliverables P1–P4 and brief §9)
+## 5. Definition of done
 
 | Deliverable | Evidence |
 |---|---|
-| P1 System Design Document | `docs/system-design.md`: diagram, component roles, data flow, tech + justification, observability, GenAI-in-design section, assumptions |
-| P2 Working code + README | `git clone && make up` works on a clean machine. README build/run/test steps verified by following them literally. **AI Collaboration Narrative section in README.** |
-| P3 Core business logic tests | `make test` (domain: invariants, aging boundary) + `make test-integration` + `make e2e` green |
-| P4 Video | `docs/demo.md` outline + `scripts/demo.sh`: summary tiles → aging list → propose/revise → history → kill projector → catch-up → rebuild |
-| Client stub | `api/openapi.yaml` (contract test green) + `docs/curl-examples.md` |
-| Migrations, Compose | `migrations/`, `docker-compose.yaml` |
-| Observability | `docs/08-observability.md`, metrics visible at `/metrics` |
+| P1 System Design Document | `docs/system-design.md`: diagram, components, data flow, tech + justification, observability, GenAI-in-design, assumptions |
+| P2 Code + README | Clean clone → `make up` works. README steps followed literally. AI Collaboration Narrative section. |
+| P3 Core business logic tests | `make test` + `make test-integration` + `make e2e` green, actual output recorded |
+| P4 Video | `docs/demo.md` + `scripts/demo.sh` |
+| Client stub | `api/openapi.yaml` + `docs/curl-examples.md` |
+
+## 6. Risks and open decisions for Phase 1
+
+| ID | Item | Recommendation |
+|----|------|----------------|
+| O1 | Append-only **triggers** on MySQL would break the existing corruption-simulation tests (`TestReplayErrors`, the snapshot tests use `UPDATE`/`DELETE es_event`) once they run on MySQL | Enforce append-only by **grants only** in Phase 1. Add triggers later, only if those tests are kept SQLite-only. |
+| O2 | H1 deadlock (04 §5) is unverified | Write the concurrency test first. Pick the fix (skip `CreateIfNotExist` for existing aggregates and/or map 1213/1205) only after seeing the result. |
+| O3 | MySQL test harness: Compose MySQL + DSN env vs testcontainers (rootless Podman here) | DSN env + Compose |
+| O4 | Run the existing event-store tests against MySQL by parametrising `openDB` | Yes, because it validates the framework without duplicating tests |
+| O5 | `CreatedAt` precision (unix seconds) | Keep. Revisit only if the lag metric needs sub-second resolution. |
+| O6 | Postgres driver for the read side (Phase 3) | Decide before Phase 3: `gorm.io/driver/postgres` (consistent with the write side) or `pgx` |
+| O7 | D3 (propose only on aging vehicles) | Confirm |
+| O8 | Versioned migration refactor vs simply editing `schema.sql` (nothing is deployed yet) | Versioned. It is small, and it is the only honest answer to "migration compatibility". |
+| R | `AggregateRoot.ApplyChange` uses `time.Now().Unix()` | Tests must not assert exact timestamps. A clock injection can be added later, non-breaking. |
