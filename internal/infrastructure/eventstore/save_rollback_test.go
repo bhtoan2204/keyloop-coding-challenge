@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 func TestSaveRollsBackWhenALaterEventFails(t *testing.T) {

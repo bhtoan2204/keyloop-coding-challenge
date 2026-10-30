@@ -103,7 +103,7 @@ Baseline verification (run 2026-10-29, Go 1.26.5): `go vet ./...` is clean. `go 
 | `Projection` / `Projector` | **Reuse.** Narrow change: the `Projector.Handle` signature gains a transaction-scoped `viewstore.ViewStore` argument (05 §4.1) | signature change on 2 stubs |
 | `ViewStore` | **Extend** the interface with `WithTransaction`, `AggregateVersion`, and read-model writes and queries. Postgres implementation. | new implementation |
 | `application/{command,query,messaging}`, `presentation`, `cmd` | **Fill in** the existing empty packages | new code in existing packages |
-| `OutboxProjector`, `cache`, `package/redis` | **Leave untouched and unwired** | none |
+| `OutboxProjector`, `cache`, `package/redis` | **Leave untouched and unwired** (removed as dead code after Phase 7.1 at the developer's request) | none |
 
 ## 6. Risks and mitigations
 

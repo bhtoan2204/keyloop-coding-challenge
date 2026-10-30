@@ -3,7 +3,7 @@ package aggregates
 import (
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/events"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 var _ eventsourcing.Aggregate = (*VehicleInventoryAggregate)(nil)

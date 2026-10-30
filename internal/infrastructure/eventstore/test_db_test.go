@@ -1,6 +1,7 @@
 package eventstore_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -9,7 +10,7 @@ import (
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/testsupport/sqlitetest"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // openDB returns a migrated database for one test and openRawDB an empty one. The
@@ -89,4 +90,9 @@ func tableExists(t *testing.T, db *gorm.DB, table string) bool {
 		t.Fatal(err)
 	}
 	return n > 0
+}
+
+// retryable mirrors command.IsRetryable over the store's errors: reload and re-run.
+func retryable(err error) bool {
+	return errors.Is(err, eventstore.ErrConcurrencyConflict) || errors.Is(err, eventstore.ErrRetryable)
 }

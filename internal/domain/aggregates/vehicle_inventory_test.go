@@ -5,7 +5,7 @@ import (
 
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/events"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // Event registration and serialization are checked separately from domain

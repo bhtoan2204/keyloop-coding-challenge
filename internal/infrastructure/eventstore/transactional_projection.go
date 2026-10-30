@@ -5,7 +5,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // TransactionalProjection updates a read model inside the transaction that appends the

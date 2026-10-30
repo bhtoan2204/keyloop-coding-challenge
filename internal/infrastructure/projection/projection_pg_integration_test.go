@@ -19,7 +19,7 @@ import (
 	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
 	"keyloop-coding-challenge/internal/infrastructure/viewstore"
 	"keyloop-coding-challenge/internal/testsupport/pgtest"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 
 	"gorm.io/gorm"
 )

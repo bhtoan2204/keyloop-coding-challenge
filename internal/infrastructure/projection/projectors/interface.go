@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"keyloop-coding-challenge/internal/application/projection"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // Projector applies one event to the read model through the transaction-bound store

@@ -7,7 +7,7 @@ import (
 
 	ports "keyloop-coding-challenge/internal/application/projection"
 	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 var (

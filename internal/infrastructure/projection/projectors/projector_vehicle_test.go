@@ -9,7 +9,7 @@ import (
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/events"
 	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 var at = time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)

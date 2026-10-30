@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // VehicleStore is the persistence port the commands use (implemented by

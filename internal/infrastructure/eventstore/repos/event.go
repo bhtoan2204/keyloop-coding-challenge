@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 
 	"gorm.io/gorm"
 )

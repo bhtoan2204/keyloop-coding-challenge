@@ -8,7 +8,7 @@ import (
 
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 func TestGetRejectsUnsupportedSchemaVersion(t *testing.T) {

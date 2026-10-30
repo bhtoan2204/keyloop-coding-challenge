@@ -9,7 +9,7 @@ import (
 	"keyloop-coding-challenge/internal/application/command"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 var _ command.VehicleStore = (*Store)(nil)

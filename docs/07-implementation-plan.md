@@ -27,11 +27,11 @@ internal/
       repos/                                  existing → + versioned Migrate, new columns, ReadAll/ReadStream
       repos/migrations/{mysql,sqlite}/        + 0001 (= today's DDL), 0002 (additive columns)
     projection/                               existing pipeline → tx + version check
-      projectors/                             existing stubs → VehicleProjector implemented; Outbox untouched
+      projectors/                             existing stubs → VehicleProjector implemented; Outbox untouched (removed after Phase 7.1)
     viewstore/                                existing interface → + Postgres implementation, migrations
     cache/                                    existing stub — untouched, unwired
   presentation/                               existing empty → HTTP handlers, problem+json
-package/redis/                                existing stub — untouched, unwired
+package/redis/                                existing stub — untouched, unwired (removed after Phase 7.1)
 api/openapi.yaml                              +
 deploy/debezium/connector.json, deploy/mysql/ +
 docker-compose.yaml, Dockerfile, Makefile     existing empty files → filled

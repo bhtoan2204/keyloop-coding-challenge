@@ -71,7 +71,6 @@ Not implemented: Idempotency-Key, authentication, VIN uniqueness (D4), OpenTelem
 | List filters | named scopes in `repositories/vehicle_filters.go` (add a scope, do not concatenate SQL) |
 | Read model in the command transaction | `eventstore.TransactionalProjection` via `eventstore.WithProjection`, implemented by `projection.CommandProjection` |
 | Rebuild | `projection.Runner.Rebuild` over `viewstore.Postgres.RunExclusive` and `repos.EventStore.ReadAll` |
-| Leave unwired, do not delete | `projectors/projector_outbox.go`, `internal/infrastructure/cache`, `package/redis` |
 
 ## Source organization
 Follow `.claude/rules/source-organization.md`:

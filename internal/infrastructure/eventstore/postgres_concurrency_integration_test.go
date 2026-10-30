@@ -150,7 +150,7 @@ func TestPostgresNoLostUpdates(t *testing.T) {
 				if err == nil {
 					return
 				}
-				if !eventstore.IsRetryable(err) {
+				if !retryable(err) {
 					errs[i] = err
 					return
 				}

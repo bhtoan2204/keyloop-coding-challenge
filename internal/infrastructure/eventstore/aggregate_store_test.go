@@ -10,7 +10,7 @@ import (
 
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 
 	"gorm.io/gorm"
 )
@@ -179,7 +179,7 @@ func TestDatabaseErrorIsNotConcurrencyConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = store.Save(context.Background(), agg)
-	if err == nil || errors.Is(err, eventstore.ErrConcurrencyConflict) || eventstore.IsRetryable(err) {
+	if err == nil || errors.Is(err, eventstore.ErrConcurrencyConflict) || retryable(err) {
 		t.Fatalf("got %v", err)
 	}
 	if !agg.IsUnsaved() {

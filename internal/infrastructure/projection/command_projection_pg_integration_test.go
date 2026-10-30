@@ -17,7 +17,7 @@ import (
 	"keyloop-coding-challenge/internal/infrastructure/projection"
 	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
 	"keyloop-coding-challenge/internal/infrastructure/viewstore"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 var businessDate = domain.NewDate(2026, 10, 29)

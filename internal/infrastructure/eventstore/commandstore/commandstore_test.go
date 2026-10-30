@@ -10,7 +10,7 @@ import (
 	"keyloop-coding-challenge/internal/application/command"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/commandstore"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // failingStore returns err from every call.

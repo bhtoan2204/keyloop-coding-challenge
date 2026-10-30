@@ -10,7 +10,7 @@ import (
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // TestSnapshotJSONRoundTrip restores every business field. businessState compares the

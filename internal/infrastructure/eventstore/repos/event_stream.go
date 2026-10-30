@@ -7,7 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // ReadAll streams every stored event to fn, ordered by (aggregate_id, version), in

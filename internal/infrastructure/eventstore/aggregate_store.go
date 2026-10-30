@@ -7,7 +7,7 @@ import (
 	"reflect"
 
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 var (
@@ -17,7 +17,11 @@ var (
 	// ErrNestedSave: Save must own the outermost transaction. Inside a caller's
 	// transaction it could only commit a savepoint, and acknowledging the pending events
 	// (Root.Update) before the outer transaction commits could lose them.
-	ErrNestedSave            = errors.New("aggregate store: save inside an existing transaction")
+	ErrNestedSave = errors.New("aggregate store: save inside an existing transaction")
+	// After ErrConcurrencyConflict or ErrRetryable a save may succeed if the caller
+	// reloads the aggregate, re-runs the command and saves again (command.IsRetryable).
+	// The store never retries by itself: the pending events were decided on stale
+	// state and must be recomputed, not re-sent.
 	ErrConcurrencyConflict   = repos.ErrConcurrencyConflict
 	ErrAggregateNotFound     = repos.ErrAggregateNotFound
 	ErrAggregateTypeMismatch = repos.ErrAggregateTypeMismatch
@@ -26,16 +30,6 @@ var (
 
 	ErrUnsupportedSchemaVersion = repos.ErrUnsupportedSchemaVersion
 )
-
-// IsRetryable reports whether a failed Save may succeed if the caller reloads the
-// aggregate, re-runs the command against the fresh state and saves again. The store
-// never retries by itself: after a conflict the pending events were decided on stale
-// state and must be recomputed, not re-sent.
-func IsRetryable(err error) bool {
-	return errors.Is(err, ErrConcurrencyConflict) || errors.Is(err, ErrRetryable)
-}
-
-const defaultSnapshotInterval = 10
 
 type AggregateStore interface {
 	Get(ctx context.Context, aggregateID string, agg eventsourcing.Aggregate) error
@@ -47,10 +41,6 @@ type aggregateStore struct {
 	repo             repos.EventStore
 	snapshotInterval int
 	projection       TransactionalProjection
-}
-
-func NewAggregateStore(repositories repos.Repos) AggregateStore {
-	return NewAggregateStoreWithSnapshotInterval(repositories, defaultSnapshotInterval)
 }
 
 func NewAggregateStoreWithSnapshotInterval(repositories repos.Repos, interval int, opts ...Option) AggregateStore {

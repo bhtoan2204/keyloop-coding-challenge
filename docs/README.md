@@ -43,7 +43,7 @@ IDs are stable. Reversed or downgraded decisions keep their ID so the history st
 | ID | Decision | Status | Where |
 |----|----------|--------|-------|
 | D1 | ~~Replace GORM + SQLite with `database/sql`/`pgx`~~ → **Keep GORM for the event store.** Keep the SQLite tests as fast unit-level tests and add database-backed integration tests. (The GORM MySQL driver added in Phase 2 was replaced by the PostgreSQL driver in Phase 7, D16.) | **Reversed** | 02 §4, 04 |
-| D2 | ~~Drop snapshots, `es_aggregate`, serializer, outbox, Redis/cache stubs~~ → **Keep all.** Snapshots are **disabled for `VehicleInventoryAggregate`** (interval 0) because of a verified state-loss hazard (04 §7). The outbox, cache and Redis stubs stay in place, unwired. | **Reversed** | 02 §4, 04 §7 |
+| D2 | ~~Drop snapshots, `es_aggregate`, serializer, outbox, Redis/cache stubs~~ → **Keep all.** Snapshots are **disabled for `VehicleInventoryAggregate`** (interval 0) because of a verified state-loss hazard (04 §7). The outbox, cache and Redis stubs stayed in place, unwired, until the developer removed them as dead code after Phase 7.1. | **Reversed** | 02 §4, 04 §7 |
 | D3 | A new action may only be **proposed** for a vehicle that is aging at the business date | Proposed | 01 A6, 03 |
 | D4 | Active-VIN uniqueness reservation table | **Cut** (not implemented; disclosed) | 04 §6 |
 | D5 | Projection progress = the per-aggregate version stored in the same Postgres tx as the state (**mandatory**). Storing Kafka offsets in Postgres too is **optional**. | Downgraded; Kafka part **superseded** (D16) | 05 §4 |

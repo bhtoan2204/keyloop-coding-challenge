@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 func TestReadAllStreamsHistoryInAggregateVersionOrder(t *testing.T) {

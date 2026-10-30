@@ -7,7 +7,7 @@ import (
 
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/events"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // replay rebuilds a fresh aggregate from history, as AggregateStore.Get does.

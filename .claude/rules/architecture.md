@@ -41,5 +41,6 @@ paths:
 - **Errors:** wrap with `%w` and context (aggregate ID, version). Domain errors are sentinels in
   `internal/domain/errors.go`; map them to HTTP only in `internal/presentation/httpkit`.
 - **Dependencies:** add a module only in the phase that plans it (`docs/07`). No Redis, message broker or
-  extra services (Phase 7 removed MySQL, Kafka and Debezium). Do not wire `OutboxProjector`, `cache` or `package/redis`, and do not delete them.
+  extra services (Phase 7 removed MySQL, Kafka and Debezium). The unwired outbox,
+  cache and Redis stubs were removed as dead code; do not reintroduce them without a planned need.
 - **Docs follow code:** when the implementation deviates from `docs/0x`, record it in that doc.

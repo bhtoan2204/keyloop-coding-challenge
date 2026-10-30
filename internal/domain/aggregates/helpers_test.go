@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"keyloop-coding-challenge/internal/domain"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 const (

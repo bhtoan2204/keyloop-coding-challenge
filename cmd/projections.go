@@ -13,7 +13,7 @@ import (
 	"keyloop-coding-challenge/internal/infrastructure/projection"
 	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
 	"keyloop-coding-challenge/internal/infrastructure/viewstore"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // runRebuild replaces the read model with a replay of the whole event store, in one

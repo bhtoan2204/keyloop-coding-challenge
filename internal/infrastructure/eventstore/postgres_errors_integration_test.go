@@ -13,7 +13,7 @@ import (
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/testsupport/pgtest"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 // lockedAggregate stores aggregate "inv" at version 1 and returns a store whose
@@ -67,7 +67,7 @@ func TestPostgresLockTimeoutIsRetryableAndSaveCanBeRetried(t *testing.T) {
 	addQty(t, agg, 1)
 
 	err := store.Save(context.Background(), agg)
-	if !errors.Is(err, eventstore.ErrRetryable) || errors.Is(err, eventstore.ErrConcurrencyConflict) || !eventstore.IsRetryable(err) {
+	if !errors.Is(err, eventstore.ErrRetryable) || errors.Is(err, eventstore.ErrConcurrencyConflict) || !retryable(err) {
 		t.Fatalf("want ErrRetryable (lock not available), got %v", err)
 	}
 	if !agg.IsUnsaved() || agg.BaseVersion() != 1 {
@@ -91,7 +91,7 @@ func TestPostgresContextErrorsAreNotRetryable(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		err := store.Save(ctx, agg)
-		if !errors.Is(err, context.Canceled) || eventstore.IsRetryable(err) {
+		if !errors.Is(err, context.Canceled) || retryable(err) {
 			t.Fatalf("got %v", err)
 		}
 		if !agg.IsUnsaved() {
@@ -106,7 +106,7 @@ func TestPostgresContextErrorsAreNotRetryable(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		defer cancel()
 		err := store.Save(ctx, agg)
-		if eventstore.IsRetryable(err) || err == nil {
+		if retryable(err) || err == nil {
 			t.Fatalf("got %v", err)
 		}
 		if !errors.Is(err, context.DeadlineExceeded) && !repos.IsUnavailable(err) {

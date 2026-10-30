@@ -20,7 +20,7 @@ import (
 	"keyloop-coding-challenge/internal/infrastructure/viewstore"
 	"keyloop-coding-challenge/internal/presentation"
 	"keyloop-coding-challenge/internal/testsupport/pgtest"
-	"keyloop-coding-challenge/package/eventsourcing"
+	"keyloop-coding-challenge/pkg/eventsourcing"
 )
 
 type postgresAPI struct {
