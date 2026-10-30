@@ -182,16 +182,23 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
-  # Read-only PostgreSQL role for the API's queries.
+  # PostgreSQL roles: read-only for the API's queries, and the projection writer (DML on
+  # the projected tables, TRUNCATE for rebuilds; no superuser, no schema changes) for the
+  # projector. Only `migrate` uses the image-created superuser.
   postgres-grants:
     image: docker.io/library/postgres:17
     entrypoint: ["sh", "-c"]
     command:
       - |
         set -e
-        case "$$POSTGRES_READER_PASSWORD" in ""|*[!A-Za-z0-9]*) echo "passwords must be non-empty letters and digits" >&2; exit 1;; esac
+        for p in "$$POSTGRES_READER_PASSWORD" "$$POSTGRES_PROJECTOR_PASSWORD"; do
+          case "$$p" in ""|*[!A-Za-z0-9]*) echo "passwords must be non-empty letters and digits" >&2; exit 1;; esac
+        done
         sed -e "s/{{database}}/$$POSTGRES_DB/g" -e "s/{{reader_user}}/$$POSTGRES_READER_USER/g" \
             -e "s/{{reader_password}}/$$POSTGRES_READER_PASSWORD/g" /deploy/postgres/grants.sql \
+          | psql -v ON_ERROR_STOP=1 -q -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+        sed -e "s/{{database}}/$$POSTGRES_DB/g" -e "s/{{projector_user}}/$$POSTGRES_PROJECTOR_USER/g" \
+            -e "s/{{projector_password}}/$$POSTGRES_PROJECTOR_PASSWORD/g" /deploy/postgres/projector-grants.sql \
           | psql -v ON_ERROR_STOP=1 -q -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-inventory_read}
@@ -199,6 +206,8 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_READER_USER: ${POSTGRES_READER_USER:-inventory_reader}
       POSTGRES_READER_PASSWORD: ${POSTGRES_READER_PASSWORD:?set POSTGRES_READER_PASSWORD in .env}
+      POSTGRES_PROJECTOR_USER: ${POSTGRES_PROJECTOR_USER:-inventory_projector}
+      POSTGRES_PROJECTOR_PASSWORD: ${POSTGRES_PROJECTOR_PASSWORD:-}
     volumes:
       - ./deploy:/deploy:ro
     depends_on:
@@ -290,8 +299,8 @@ services:
       MYSQL_APP_PASSWORD: ${MYSQL_APP_PASSWORD:?set MYSQL_APP_PASSWORD in .env}
       POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB:-inventory_read}
-      POSTGRES_USER: ${POSTGRES_USER:-inventory}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_PROJECTOR_USER: ${POSTGRES_PROJECTOR_USER:-inventory_projector}
+      POSTGRES_PROJECTOR_PASSWORD: ${POSTGRES_PROJECTOR_PASSWORD:-}
       KAFKA_BROKERS: kafka:29092
       KAFKA_TOPIC: inventory.inventory.es_event
       KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-inventory-projector}

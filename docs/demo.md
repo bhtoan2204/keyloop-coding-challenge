@@ -118,7 +118,6 @@ Summarise the README's narrative, using `docs/ai-log.md` for specifics:
   - authentication and per-dealership authorisation;
   - `Idempotency-Key`;
   - VIN uniqueness;
-  - a dependency refresh (pgx, the Go toolchain);
   - a read-only MySQL user for the projector;
   - tracing export and alerts;
   - load testing.

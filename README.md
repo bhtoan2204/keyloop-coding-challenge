@@ -39,7 +39,7 @@ Requirements:
 
 - Docker with Compose v2, or Podman with podman-compose;
 - `make` and `curl`;
-- Go 1.26 only to run the tests;
+- Go 1.26 only to run the tests (`go.mod` pins `toolchain go1.26.10`; the `go` command downloads it automatically);
 - free local ports 3306, 5432, 9092, 8083, 8080 and 8081.
 
 ```bash
@@ -139,8 +139,7 @@ docs/                         design documents, curl examples, demo, AI log
   - authentication: `X-Actor-Id` is a demo-only, unauthenticated identity used for audit, not authorization;
   - `Idempotency-Key`;
   - VIN uniqueness among in-stock vehicles;
-  - tracing export;
-  - a non-superuser PostgreSQL role for the projector (it writes as the image-created superuser).
+  - tracing export.
 - **Further limitations** are listed in [docs/system-design.md §16](docs/system-design.md#16-limitations-and-future-improvements).
 
 ## AI Collaboration Narrative
@@ -193,6 +192,7 @@ Each one is in the log with its fix.
 - **Requirements:** the PDF's requirements were mapped to acceptance criteria first (`docs/01`). The mandatory business flow was built and tested on the write and read sides before any Kafka work, so the self-imposed CDC pipeline could be cut if time ran short.
 - **Pipeline design:** Debezium/Kafka was added on the existing projection, with explicit at-least-once and bootstrap reasoning, and tested on the real stack.
 - **Final phase:** packaging, the API contract, observability and documentation. A clean-copy start was run, followed by the end-to-end flow, a consumer restart, a rebuild comparison and a full restart.
+- **Final hardening:** `govulncheck` findings were removed with minimum patch upgrades (Go 1.26.10, pgx 5.9.2, x/text 0.41.0, edwards25519 1.1.1). The projector moved off the PostgreSQL superuser to a restricted projection-writer role. Both were verified with the full test suites on a fresh stack.
 
 The developer's interventions are recorded too:
 

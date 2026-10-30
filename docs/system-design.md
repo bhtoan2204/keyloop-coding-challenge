@@ -151,7 +151,7 @@ projection_aggregate(aggregate_id PK, version, last_event_id)                 --
 projection_run(kind, started_at, finished_at, events_read, events_applied)    -- sync/rebuild audit
 ```
 
-- **Writes:** only the projection writes, as the schema owner. The API reads as a role with `SELECT` on four tables.
+- **Writes:** only the projection writes, as the projection-writer role `inventory_projector` (no superuser, no schema changes). The API reads as a role with `SELECT` on four tables. Migrations alone use the admin account.
 - **Queries:**
   - age and aging are computed in Go with the domain rule at the business date;
   - the filters are translated to sargable `stocked_on` bounds;
@@ -248,10 +248,11 @@ Measured on this machine (WSL2, rootless Podman, single host): command → row v
 - **No authentication.** `X-Actor-Id` is an unauthenticated, demo-only identity: required on commands, validated against a safe charset, stored for audit, **never** used for authorization. Production would use an authenticated principal (OIDC/JWT) and per-dealership authorisation.
 - **Least privilege:**
   - the API writes as a MySQL user without `UPDATE`/`DELETE` on `es_event` and reads PostgreSQL as a read-only role;
-  - the Debezium account has only replication privileges plus `SELECT` on `es_event`.
+  - the Debezium account has only replication privileges plus `SELECT` on `es_event`;
+  - the projector and `sync-projections`/`rebuild-projections` write PostgreSQL as `inventory_projector` (`deploy/postgres/projector-grants.sql`). It is not a superuser and not the owner. It has `SELECT, INSERT, UPDATE, TRUNCATE` on the three projected tables, `SELECT, INSERT` on `projection_run`, and nothing on `dealership` or the migration table. An integration test runs rebuild, sync and live apply as this role and checks that schema changes, reference-data writes, `DELETE`, `COPY … TO PROGRAM` and `CREATE ROLE` are refused;
+  - only `migrate` (and the grant jobs) use the superuser that the postgres image creates.
 - **Least-privilege gaps (known issues):**
   - the projector reads MySQL as the application user, which can `INSERT` events;
-  - the projector and the projection commands write PostgreSQL as `POSTGRES_USER`, which the postgres image creates as a **superuser**. A process that applies records from an unauthenticated broker should use a non-superuser role with DML on the projection tables only;
   - MySQL `root` is reachable from the Compose network (`root@'%'`).
 - **Grant scripts:** the init jobs refuse empty passwords and anything other than letters and digits, because passwords are substituted into SQL. Each run re-applies the password (`ALTER USER` / `ALTER ROLE`), so rotating it in `.env` takes effect. Root's password reaches the mysql client through `MYSQL_PWD`, not the command line.
 - **Input handling:**
@@ -265,12 +266,12 @@ Measured on this machine (WSL2, rootless Podman, single host): command → row v
 - **Swagger UI** (`/docs`) loads its assets from jsDelivr, pinned to one version, with Subresource Integrity and a strict Content-Security-Policy (no `unsafe-eval`; the one inline script is allowed by hash). The page was checked to render in headless Chromium without violations.
 - **Metrics labels are bounded** (route patterns, and methods outside the standard set fold into `OTHER`), so clients cannot grow the series count.
 - **Unauthenticated infrastructure:** Kafka, Connect and the projector's `/status` and `/metrics` have no authentication, which is acceptable only on a private network.
-- **Dependencies (`govulncheck`, Phase 6):** 17 reachable findings with the local Go 1.26.5 toolchain.
-  - **Standard library:** 15 findings. Fixed in 1.26.6 to 1.26.10.
-  - **`golang.org/x/text` v0.40.0:** GO-2026-6629, fixed in v0.41.0. The Prometheus client raised `x/text` from v0.21.0, which removed an older finding.
-  - **`pgx` v5.6.0:** GO-2026-5004, fixed in v5.9.2. Low exploitability here: no simple-protocol mode and no dollar-quoted literals in the Go SQL; this is an inference, not proven.
-  - **Image toolchain:** the image builds with Go 1.26.9, so it carries every standard-library fix except GO-2026-6809 (1.26.10). The tests run on 1.26.5, so the shipped binary is built by a newer patch release than the tested one.
-  - **Deliberately not upgraded** (§16): the Go toolchain, pgx and x/text.
+- **Dependencies:** `govulncheck ./...` reports **no vulnerabilities** (reachable or imported) after the final hardening.
+  - **Go toolchain:** `go.mod` pins `toolchain go1.26.10` (the language minimum stays `go 1.26.5`), so tests and the image use the same patched release. The image builds from `golang:1.26.10-alpine3.24`. This fixed 15 reachable standard-library findings.
+  - **`pgx/v5`** 5.6.0 → 5.9.2: GO-2026-5004. The vulnerable call path was reachable in principle, but the code never uses the simple protocol or dollar-quoted literals.
+  - **`golang.org/x/text`** 0.40.0 → 0.41.0: GO-2026-6629.
+  - **`filippo.io/edwards25519`** 1.1.0 → 1.1.1: GO-2026-4503. Imported via the MySQL driver; not reachable.
+  - **All are the minimum fixing versions.** None is a major upgrade.
 
 ## 14. Observability
 
@@ -304,8 +305,7 @@ Measured on this machine (WSL2, rootless Podman, single host): command → row v
 - **Reference data is duplicated:** dealership data is seeded in MySQL and PostgreSQL. Adding a dealership requires both.
 - **No correction events:** for example a wrong `stocked_on` cannot be corrected (planned `VehicleStockInDateCorrected`).
 - **Read-model version:** the detail `ETag` can lag the write side briefly. A `412` from it is resolved by re-reading.
-- **Dependency upgrades not done:** pgx and the Go toolchain (`govulncheck` findings).
-- **Least privilege for the projector:** it should use a read-only MySQL user and a non-superuser PostgreSQL role (it uses the image-created superuser today).
+- **Least privilege for the projector's MySQL access:** it should use a read-only MySQL user; it reads `es_event` as the application user today.
 - **Query outages:** queries map a read-model outage to `500 INTERNAL`, not `503`; only a timeout gives `503`.
 - **Connector configuration:** `deploy/debezium/es-event-connector.json` hard-codes the `inventory` database and the `debezium` user. Changing `MYSQL_DATABASE` or `DEBEZIUM_MYSQL_USER` in `.env` therefore also requires editing it.
 - **Compose images:** the infrastructure images are pinned by tag, not by digest, and have no resource limits.

@@ -351,3 +351,55 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
   - the dev stack was stopped twice and restarted for the clean-start runs; `compose up` recreated the dev MySQL container after its health check changed, and the data volumes were kept;
   - the clean projects' containers and volumes were removed afterwards (0 left).
 - **Not done by the AI:** no commit or push.
+
+## 2026-10-30 — Final hardening: dependencies, PostgreSQL least privilege, packaging re-verification
+
+- **Delegated:** a focused hardening pass on `300f3d0`. No redesign or reorganisation.
+- **Dependencies.** The baseline `govulncheck ./...` (Go 1.26.5) reported 17 reachable findings.
+
+  | Findings | Vulnerable | Fixed | Example call path into the vulnerable code |
+  |---|---|---|---|
+  | 15 standard library | 1.26.5 | 1.26.6, 1.26.9 or 1.26.10 | net/http, crypto/tls, net/url, net/textproto, encoding/asn1, crypto/x509; e.g. `httpkit.DecodeJSON` → `net/textproto.ReadMIMEHeader` |
+  | GO-2026-5004 | `pgx/v5` 5.6.0 | 5.9.2 | `repos.ReadSnapshot` → `pgx/internal/sanitize` |
+  | GO-2026-6629 | `x/text` 0.40.0 | 0.41.0 | `repos.Migrate` → `x/text/secure/precis` |
+
+  - **Upgrades applied** (minimum fixing versions, no major versions):
+    - `toolchain go1.26.10` in `go.mod` (the language minimum stays `go 1.26.5`);
+    - the image builder moved to `golang:1.26.10-alpine3.24`, pinned by digest;
+    - `pgx/v5` 5.9.2, which also dropped the indirect `golang.org/x/crypto`;
+    - `x/text` 0.41.0.
+  - **One more finding after that.** A package-level finding (GO-2026-4503 in `filippo.io/edwards25519` v1.1.0, via the MySQL driver, not reachable) was patched to v1.1.1.
+  - **Result:** `govulncheck ./...` reports "No vulnerabilities found" and `go mod verify` passes.
+  - **Note:** go1.26.10 was 3 days old. It was taken because it is the only release with every standard-library fix, and the user asked for a patched toolchain.
+- **PostgreSQL least privilege.** New `deploy/postgres/projector-grants.sql`: role `inventory_projector`.
+  - **Granted:** `NOSUPERUSER`; `SELECT, INSERT, UPDATE, TRUNCATE` on `inventory_vehicle`, `vehicle_action_history`, `projection_aggregate`; `SELECT, INSERT` on `projection_run` plus its sequence.
+  - **Not granted:** `DELETE`, `dealership`, the migration table, and DDL.
+  - **Who uses it:** `projector`, `sync-projections` and `rebuild-projections` connect as `POSTGRES_PROJECTOR_USER` (`PG_PROJECTOR_DSN` override). `migrate` alone keeps the superuser.
+  - **Where it is created:** compose `postgres-grants` and `make pg-grants` create both roles (passwords: non-empty, letters and digits).
+  - **Runtime and config change:** host workflows need `POSTGRES_PROJECTOR_PASSWORD` in `.env` and a `make pg-grants` re-run. The projector container no longer receives the superuser password.
+  - **Test:** `TestProjectorRoleRunsProjectionsWithoutAdminRights` runs rebuild (TRUNCATE), sync and live apply as the role. It checks `rolsuper = false`, and that `CREATE TABLE`, `ALTER`, `DROP`, writes to `dealership`, `DELETE`, migration-table writes, `COPY … TO PROGRAM` and `CREATE ROLE` all fail with 42501. Mutation checks: removing `TRUNCATE` broke the rebuild, and adding `DELETE` failed the denial check. Both were caught.
+- **Environment event.** `/tmp` was cleared between sessions, which removed the session scratchpad that held the randomly generated dev-stack passwords.
+  - The existing dev containers and volumes (`keyloop_*`) were **left untouched**, but they can no longer be authenticated to.
+  - All verification used a fresh Compose project `keyloop-verify`: a copy of the working tree without `.env`, a new random alphanumeric `.env`, and its own volumes. It was removed afterwards.
+- **AI mistakes this pass:**
+  - (1) A crash-restart check used `podman kill` and a `curl` without timeout. Podman treats `kill` as a manual stop (no restart), and the rootless port forwarder accepts connections while the container is down, so the check hung until its time limit. It was redone by SIGKILLing the container's host PID with `curl -m 2`.
+  - (2) None of the earlier issues recurred: no destructive git, no `pgrep` self-kill.
+- **Verified (this session, Go 1.26.10):**
+  - **Static checks:** `gofmt` clean, `go vet ./...` clean, `make check` exit 0 (34 ok lines, 316 PASS lines).
+  - **Integration:** `make test-integration` exit 0 (165 top-level PASS, 0 FAIL/SKIP, including the new role test and `TestReaderRoleIsReadOnly`); integration suite under `-race` exit 0 (17 packages ok).
+  - **Pipeline:** `make test-pipeline` 9/9 PASS.
+  - **E2E:** `make e2e` PASS (aging 89/90/91 with the `as_of` turn, filters, pagination, action lifecycle, sale, propagation, error mapping, summary).
+  - **Packaging, on the verify stack:**
+    - `make stack-up` exit 0 in 77 s, with the image rebuilt;
+    - the binary in the image reports `go1.26.10`; the image runs as user `nonroot`;
+    - the only PostgreSQL sessions are `inventory_projector` and `inventory_reader`, neither a superuser;
+    - no password value is in the saved image tar or in any container log;
+    - graceful projector stop (exit 0, "stopped", partitions revoked); events written while it was down were caught up, with no duplicated history;
+    - `compose run --rm --no-deps projector rebuild-projections` ran as the restricted role and produced an identical read-model hash (17 rows);
+    - SIGKILL of the API process → restarted by `restart: unless-stopped` (RestartCount 1) and ready again;
+    - all five init jobs re-ran with exit 0.
+  - **Docs updated:** `docs/system-design.md`, `docs/05`, `README.md`, `.env.example`, `CLAUDE.md`, `docs/demo.md`.
+- **Not verified:**
+  - **Docker Compose v2.** Not installed: `docker` and `docker-compose` here are Podman and podman-compose wrappers. `docker compose up -d --build` therefore remains unverified on Docker. Under podman-compose it is known not to work, because of the `--requires` limitation found in Phase 6.
+  - **No video was recorded.**
+- **Not done by the AI:** no commit or push.

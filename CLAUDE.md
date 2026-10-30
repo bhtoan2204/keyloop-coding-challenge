@@ -112,7 +112,7 @@ go vet ./...
 go test -count=1 ./...         # unit + SQLite-backed store tests (needs cgo for go-sqlite3)
 go test -race -count=1 ./...
 make up && make test-integration          # real MySQL 8.4 + PostgreSQL 17; needs MYSQL_TEST_DSN and PG_TEST_DSN
-make migrate && make mysql-grants && make pg-grants && make run-api   # local API
+make migrate && make mysql-grants && make pg-grants && make run-api   # local API (pg-grants: reader + projector roles)
 make cdc-up && make debezium-grants connector && make run-projector   # live change feed (docs/05 §7)
 make sync-projections                     # point-in-time catch-up from MySQL (recovery; safe while projector runs)
 make test-pipeline                        # real MySQL+Debezium+Kafka+PG; also needs KAFKA_TEST_BROKERS, CONNECT_TEST_URL

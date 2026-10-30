@@ -295,7 +295,7 @@ sequenceDiagram
 
 ### 6.6 Security
 - **API:** queries use the read-only role from `deploy/postgres/grants.sql` (`make pg-grants`), which has `SELECT` on `dealership`, `inventory_vehicle`, `vehicle_action_history` and `projection_run` only. Verified: INSERT, UPDATE, DELETE, TRUNCATE, CREATE and reading `projection_aggregate` all fail with `42501`.
-- **Projection commands** use the schema owner for PostgreSQL, and the restricted MySQL app user for `ReadAll` (it only needs `SELECT` on `es_event`).
+- **Projection commands and the projector** write PostgreSQL as `inventory_projector` (`deploy/postgres/projector-grants.sql`; final hardening). That role has DML and `TRUNCATE` on the projected tables, is not a superuser, and cannot change the schema. They read MySQL as the restricted app user (`ReadAll` needs only `SELECT` on `es_event`).
 
 ### 6.7 Limitations and operational risks (accepted for Phase 4)
 - **Not real-time.** A sync re-reads the full history (O(total events)) and keeps one long MySQL snapshot, which holds back InnoDB purge, plus one PostgreSQL transaction.

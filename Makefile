@@ -166,11 +166,17 @@ pg-wait:
 		sleep 2; \
 	done; echo "postgres did not become ready"; exit 1
 
-## Creates the read-only role used by the API's queries. Run after `make migrate`.
+## Creates the PostgreSQL roles: the read-only role of the API's queries and the
+## projection writer of the projector and sync/rebuild-projections (no superuser, no
+## schema changes). Run after `make migrate`.
 pg-grants:
 	@test -n "$$POSTGRES_READER_PASSWORD" || { echo "set POSTGRES_READER_PASSWORD in .env"; exit 1; }
+	@test -n "$$POSTGRES_PROJECTOR_PASSWORD" || { echo "set POSTGRES_PROJECTOR_PASSWORD in .env"; exit 1; }
 	@sed -e "s/{{database}}/$${POSTGRES_DB:-inventory_read}/g" -e "s/{{reader_user}}/$${POSTGRES_READER_USER:-inventory_reader}/g" \
 		-e "s/{{reader_password}}/$$POSTGRES_READER_PASSWORD/g" deploy/postgres/grants.sql \
+		| $(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 -q -U "$${POSTGRES_USER:-inventory}" -d "$${POSTGRES_DB:-inventory_read}"
+	@sed -e "s/{{database}}/$${POSTGRES_DB:-inventory_read}/g" -e "s/{{projector_user}}/$${POSTGRES_PROJECTOR_USER:-inventory_projector}/g" \
+		-e "s/{{projector_password}}/$$POSTGRES_PROJECTOR_PASSWORD/g" deploy/postgres/projector-grants.sql \
 		| $(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 -q -U "$${POSTGRES_USER:-inventory}" -d "$${POSTGRES_DB:-inventory_read}"
 
 ## Creates the restricted application user and grants it. Run after the schema is migrated.

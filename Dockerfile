@@ -1,7 +1,7 @@
 # Inventory service image: one static binary for every subcommand
 # (api, projector, migrate, sync-projections, rebuild-projections, healthcheck).
 
-FROM docker.io/library/golang:1.26.9-alpine3.24@sha256:397ecc648150dd585f1734dfcd8d1bb4746664e54464191d77ad0ecffaf38bdb AS build
+FROM docker.io/library/golang:1.26.10-alpine3.24@sha256:d1f3216ef30257c850cc136ba42a359ccd9d3e75f19b2c276e520c0b4ef327ce AS build
 WORKDIR /src
 # Dependencies first, so source edits do not invalidate the module cache layer.
 COPY go.mod go.sum ./

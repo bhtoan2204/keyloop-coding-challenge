@@ -41,7 +41,7 @@ func runProjector(ctx context.Context, log *slog.Logger) error {
 	if sqlDB, err := mysqlDB.DB(); err == nil {
 		defer sqlDB.Close()
 	}
-	pg, err := openPostgres(ctx, "PG_DSN", "POSTGRES_USER", "inventory", "POSTGRES_PASSWORD")
+	pg, err := openPostgres(ctx, "PG_PROJECTOR_DSN", "POSTGRES_PROJECTOR_USER", "inventory_projector", "POSTGRES_PROJECTOR_PASSWORD")
 	if err != nil {
 		return err
 	}
