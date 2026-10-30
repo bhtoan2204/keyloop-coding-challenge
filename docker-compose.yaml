@@ -1,46 +1,24 @@
-# The whole system: MySQL event store (write side), PostgreSQL read model, Kafka (KRaft)
-# and Debezium (Kafka Connect) streaming es_event from the binlog, plus the inventory
-# API and projector. One-shot init services migrate the schemas, create the restricted
-# accounts, create the change-feed topic and register the connector, in that order.
+# The whole system: one PostgreSQL database (schemas event_store and read_model) and the
+# inventory API, which appends events and updates the read model in one transaction.
+# One-shot init services migrate the schemas and then create the restricted roles.
 #
 #   docker compose up -d --build     everything (see README "Run with Docker")
-#   make up / make cdc-up            infrastructure only, for running Go on the host
+#   make up                          PostgreSQL only, for running Go on the host
+#   docker compose --profile tools run --rm --no-deps rebuild  rebuild the read model from the event store
 #
 # Configuration and secrets come from .env (see .env.example); none are baked into the
 # image. Every published port is bound to 127.0.0.1 only.
+#
+# Volumes of the earlier MySQL/Kafka stack (mysql-data, kafka-data) are no longer
+# declared but are NOT removed: see docs/mysql-import.md for importing that history.
 name: keyloop
 
-# api and projector reuse the image built for migrate (the first app service started).
+# api and rebuild reuse the image built for migrate (the first app service started).
 x-inventory-app: &inventory-app
   image: localhost/keyloop-inventory:local
   pull_policy: never
 
 services:
-  mysql:
-    image: docker.io/library/mysql:8.4
-    command:
-      # Binary log settings required by Debezium (ROW format is the 8.4 default). The
-      # binlog must outlive any connector downtime, or the connector re-snapshots.
-      - --server-id=1
-      - --gtid-mode=ON
-      - --enforce-gtid-consistency=ON
-      - --binlog-row-image=FULL
-      - --binlog-expire-logs-seconds=259200
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env (see .env.example)}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-inventory}
-    ports:
-      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
-    volumes:
-      - mysql-data:/var/lib/mysql
-    # InnoDB needs more than the default 10 s to shut down cleanly under load.
-    stop_grace_period: 60s
-    healthcheck:
-      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysqladmin ping -h 127.0.0.1 -uroot --silent"]
-      interval: 3s
-      timeout: 3s
-      retries: 40
-
   postgres:
     image: docker.io/library/postgres:17
     environment:
@@ -58,199 +36,63 @@ services:
       timeout: 3s
       retries: 40
 
-  # Single-node KRaft broker (combined broker + controller). INTERNAL is used inside
-  # the Compose network (Kafka Connect), HOST by the projector on the host.
-  kafka:
-    image: docker.io/apache/kafka:4.3.1
-    environment:
-      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-AORBiTG5Tj6Quvb_RpDJ9A}
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
-      KAFKA_LISTENERS: INTERNAL://:29092,CONTROLLER://:29093,HOST://:9092
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,HOST://127.0.0.1:${KAFKA_PORT:-9092}
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-      # Topics are created explicitly: the change-feed topic by the kafka-topic init
-      # service (or, on the host workflow, by the connector's topic.creation.*), Connect's
-      # internal topics by Connect.
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-    ports:
-      - "127.0.0.1:${KAFKA_PORT:-9092}:9092"
-    volumes:
-      - kafka-data:/var/lib/kafka/data
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 >/dev/null 2>&1"]
-      interval: 5s
-      timeout: 10s
-      retries: 30
-
-  # Kafka Connect with the Debezium MySQL connector. Its configuration, offsets and
-  # status live in Kafka topics; the connector is registered by the connector init
-  # service (or `make connector` on the host workflow).
-  connect:
-    image: quay.io/debezium/connect:3.6.2.Final
-    depends_on:
-      kafka:
-        condition: service_healthy
-      mysql:
-        condition: service_healthy
-    environment:
-      BOOTSTRAP_SERVERS: kafka:29092
-      GROUP_ID: inventory-connect
-      CONFIG_STORAGE_TOPIC: connect_configs
-      OFFSET_STORAGE_TOPIC: connect_offsets
-      STATUS_STORAGE_TOPIC: connect_statuses
-      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
-      # Connector configs reference ${env:DEBEZIUM_MYSQL_PASSWORD}: the secret is never
-      # stored in the connector config topic or returned by the REST API.
-      CONNECT_CONFIG_PROVIDERS: env
-      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
-      # Not `:?`: Compose resolves the whole file, and `make up` (MySQL + PostgreSQL
-      # only) must work without it. `make cdc-up` checks it instead.
-      DEBEZIUM_MYSQL_PASSWORD: ${DEBEZIUM_MYSQL_PASSWORD:-}
-    ports:
-      - "127.0.0.1:${CONNECT_PORT:-8083}:8083"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors >/dev/null"]
-      interval: 5s
-      timeout: 5s
-      retries: 40
-
   # --- one-shot initialisation (idempotent; safe to re-run) -------------------------
 
+  # Schema owner: the only service that uses the image-created superuser for the app.
   migrate:
     <<: *inventory-app
     build:
       context: .
     command: ["migrate"]
     environment:
-      MYSQL_HOST: mysql
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-inventory}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
       POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB:-inventory_read}
       POSTGRES_USER: ${POSTGRES_USER:-inventory}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     depends_on:
-      mysql:
-        condition: service_healthy
       postgres:
         condition: service_healthy
     restart: "no"
 
-  # Restricted MySQL accounts: the application user (no UPDATE/DELETE on es_event) and
-  # the Debezium connector user. Uses the mysql image only as a client.
-  mysql-grants:
-    image: docker.io/library/mysql:8.4
-    entrypoint: ["sh", "-c"]
-    # Passwords are substituted into SQL text, so only letters and digits are accepted
-    # (no quoting or injection issues); an empty one is refused. MYSQL_PWD keeps the root
-    # password out of the process arguments.
-    command:
-      - |
-        set -e
-        for p in "$$MYSQL_APP_PASSWORD" "$$DEBEZIUM_MYSQL_PASSWORD"; do
-          case "$$p" in ""|*[!A-Za-z0-9]*) echo "passwords must be non-empty letters and digits" >&2; exit 1;; esac
-        done
-        export MYSQL_PWD="$$MYSQL_ROOT_PASSWORD"
-        sed -e "s/{{database}}/$$MYSQL_DATABASE/g" -e "s/{{app_user}}/$$MYSQL_APP_USER/g" \
-            -e "s/{{app_password}}/$$MYSQL_APP_PASSWORD/g" /deploy/mysql/grants.sql \
-          | mysql -h mysql -uroot
-        sed -e "s/{{database}}/$$MYSQL_DATABASE/g" -e "s/{{debezium_user}}/$$DEBEZIUM_MYSQL_USER/g" \
-            -e "s/{{debezium_password}}/$$DEBEZIUM_MYSQL_PASSWORD/g" /deploy/mysql/debezium-grants.sql \
-          | mysql -h mysql -uroot
-    environment:
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-inventory}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
-      MYSQL_APP_USER: ${MYSQL_APP_USER:-inventory_app}
-      MYSQL_APP_PASSWORD: ${MYSQL_APP_PASSWORD:?set MYSQL_APP_PASSWORD in .env}
-      DEBEZIUM_MYSQL_USER: ${DEBEZIUM_MYSQL_USER:-debezium}
-      DEBEZIUM_MYSQL_PASSWORD: ${DEBEZIUM_MYSQL_PASSWORD:-}
-    volumes:
-      - ./deploy:/deploy:ro
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-    restart: "no"
-
-  # PostgreSQL roles: read-only for the API's queries, and the projection writer (DML on
-  # the projected tables, TRUNCATE for rebuilds; no superuser, no schema changes) for the
-  # projector. Only `migrate` uses the image-created superuser.
+  # Restricted roles (deploy/postgres): the application writer (append-only es_event,
+  # read-model DML, no DDL), the read-only query role and the rebuild role (TRUNCATE of
+  # the read model, SELECT on es_event). None is a superuser.
   postgres-grants:
     image: docker.io/library/postgres:17
     entrypoint: ["sh", "-c"]
+    # Names and passwords are substituted into SQL text run by the superuser, so names
+    # must be plain lower-case identifiers and passwords letters and digits (no quoting
+    # or injection issues); empty values are refused.
     command:
       - |
         set -e
-        for p in "$$POSTGRES_READER_PASSWORD" "$$POSTGRES_PROJECTOR_PASSWORD"; do
+        for n in "$$POSTGRES_DB" "$$POSTGRES_APP_USER" "$$POSTGRES_READER_USER" "$$POSTGRES_REBUILD_USER"; do
+          case "$$n" in ""|[!a-z_]*|*[!a-z0-9_]*) echo "database and role names must be lower-case identifiers" >&2; exit 1;; esac
+        done
+        for p in "$$POSTGRES_APP_PASSWORD" "$$POSTGRES_READER_PASSWORD" "$$POSTGRES_REBUILD_PASSWORD"; do
           case "$$p" in ""|*[!A-Za-z0-9]*) echo "passwords must be non-empty letters and digits" >&2; exit 1;; esac
         done
-        sed -e "s/{{database}}/$$POSTGRES_DB/g" -e "s/{{reader_user}}/$$POSTGRES_READER_USER/g" \
-            -e "s/{{reader_password}}/$$POSTGRES_READER_PASSWORD/g" /deploy/postgres/grants.sql \
-          | psql -v ON_ERROR_STOP=1 -q -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
-        sed -e "s/{{database}}/$$POSTGRES_DB/g" -e "s/{{projector_user}}/$$POSTGRES_PROJECTOR_USER/g" \
-            -e "s/{{projector_password}}/$$POSTGRES_PROJECTOR_PASSWORD/g" /deploy/postgres/projector-grants.sql \
-          | psql -v ON_ERROR_STOP=1 -q -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+        apply() {
+          sed -e "s/{{database}}/$$POSTGRES_DB/g" -e "s/{{$$2_user}}/$$3/g" -e "s/{{$$2_password}}/$$4/g" "/deploy/postgres/$$1" \
+            | psql -v ON_ERROR_STOP=1 -q -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+        }
+        apply app-grants.sql app "$$POSTGRES_APP_USER" "$$POSTGRES_APP_PASSWORD"
+        apply grants.sql reader "$$POSTGRES_READER_USER" "$$POSTGRES_READER_PASSWORD"
+        apply rebuild-grants.sql rebuild "$$POSTGRES_REBUILD_USER" "$$POSTGRES_REBUILD_PASSWORD"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-inventory_read}
       POSTGRES_USER: ${POSTGRES_USER:-inventory}
       PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-inventory_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?set POSTGRES_APP_PASSWORD in .env}
       POSTGRES_READER_USER: ${POSTGRES_READER_USER:-inventory_reader}
       POSTGRES_READER_PASSWORD: ${POSTGRES_READER_PASSWORD:?set POSTGRES_READER_PASSWORD in .env}
-      POSTGRES_PROJECTOR_USER: ${POSTGRES_PROJECTOR_USER:-inventory_projector}
-      POSTGRES_PROJECTOR_PASSWORD: ${POSTGRES_PROJECTOR_PASSWORD:-}
+      POSTGRES_REBUILD_USER: ${POSTGRES_REBUILD_USER:-inventory_rebuild}
+      POSTGRES_REBUILD_PASSWORD: ${POSTGRES_REBUILD_PASSWORD:?set POSTGRES_REBUILD_PASSWORD in .env}
     volumes:
       - ./deploy:/deploy:ro
     depends_on:
       migrate:
-        condition: service_completed_successfully
-    restart: "no"
-
-  # The change-feed topic is created explicitly (3 partitions, 7-day retention) rather
-  # than by the connector's first record, so the projector can join its consumer group
-  # and report ready before the first vehicle is stocked.
-  kafka-topic:
-    image: docker.io/apache/kafka:4.3.1
-    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
-    command:
-      - --bootstrap-server=kafka:29092
-      - --create
-      - --if-not-exists
-      - --topic=inventory.inventory.es_event
-      - --partitions=3
-      - --replication-factor=1
-      - --config=retention.ms=604800000
-    depends_on:
-      kafka:
-        condition: service_healthy
-    restart: "no"
-
-  # Registers (or updates) the es_event connector; PUT of the config is idempotent.
-  connector:
-    image: quay.io/debezium/connect:3.6.2.Final
-    entrypoint: ["sh", "-c"]
-    command:
-      - >-
-        curl -fsS -X PUT -H 'Content-Type: application/json'
-        --data @/deploy/debezium/es-event-connector.json
-        http://connect:8083/connectors/es-event-cdc/config
-    volumes:
-      - ./deploy:/deploy:ro
-    depends_on:
-      connect:
-        condition: service_healthy
-      mysql-grants:
-        condition: service_completed_successfully
-      kafka-topic:
         condition: service_completed_successfully
     restart: "no"
 
@@ -262,12 +104,10 @@ services:
     environment:
       HTTP_ADDR: 0.0.0.0:8080
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      MYSQL_HOST: mysql
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-inventory}
-      MYSQL_APP_USER: ${MYSQL_APP_USER:-inventory_app}
-      MYSQL_APP_PASSWORD: ${MYSQL_APP_PASSWORD:?set MYSQL_APP_PASSWORD in .env}
       POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB:-inventory_read}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-inventory_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?set POSTGRES_APP_PASSWORD in .env}
       POSTGRES_READER_USER: ${POSTGRES_READER_USER:-inventory_reader}
       POSTGRES_READER_PASSWORD: ${POSTGRES_READER_PASSWORD:?set POSTGRES_READER_PASSWORD in .env}
     ports:
@@ -279,52 +119,27 @@ services:
       retries: 20
       start_period: 20s
     depends_on:
-      mysql-grants:
-        condition: service_completed_successfully
       postgres-grants:
         condition: service_completed_successfully
     restart: unless-stopped
     # SIGTERM lets in-flight requests finish (up to 10 s, see cmd/http_server.go).
     stop_grace_period: 20s
 
-  projector:
+  # Recovery tool, not started by `up`: `docker compose --profile tools run --rm --no-deps rebuild`.
+  rebuild:
     <<: *inventory-app
-    command: ["projector"]
+    profiles: ["tools"]
+    command: ["rebuild-projections"]
     environment:
-      PROJECTOR_HTTP_ADDR: 0.0.0.0:8081
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      MYSQL_HOST: mysql
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-inventory}
-      MYSQL_APP_USER: ${MYSQL_APP_USER:-inventory_app}
-      MYSQL_APP_PASSWORD: ${MYSQL_APP_PASSWORD:?set MYSQL_APP_PASSWORD in .env}
       POSTGRES_HOST: postgres
       POSTGRES_DB: ${POSTGRES_DB:-inventory_read}
-      POSTGRES_PROJECTOR_USER: ${POSTGRES_PROJECTOR_USER:-inventory_projector}
-      POSTGRES_PROJECTOR_PASSWORD: ${POSTGRES_PROJECTOR_PASSWORD:-}
-      KAFKA_BROKERS: kafka:29092
-      KAFKA_TOPIC: inventory.inventory.es_event
-      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-inventory-projector}
-      PROJECTOR_STARTUP_SYNC: "true"
-    ports:
-      - "127.0.0.1:${PROJECTOR_PORT:-8081}:8081"
-    healthcheck:
-      test: ["CMD", "/inventory", "healthcheck", "http://127.0.0.1:8081/readyz"]
-      interval: 5s
-      timeout: 5s
-      retries: 30
-      # The startup sync reads the whole MySQL history before the first poll.
-      start_period: 60s
+      POSTGRES_REBUILD_USER: ${POSTGRES_REBUILD_USER:-inventory_rebuild}
+      POSTGRES_REBUILD_PASSWORD: ${POSTGRES_REBUILD_PASSWORD:?set POSTGRES_REBUILD_PASSWORD in .env}
     depends_on:
       postgres-grants:
         condition: service_completed_successfully
-      connector:
-        condition: service_completed_successfully
-    restart: unless-stopped
-    # SIGTERM drains the record in progress (bounded by its 30 s apply timeout), commits
-    # its offset and leaves the consumer group.
-    stop_grace_period: 45s
+    restart: "no"
 
 volumes:
-  mysql-data:
   postgres-data:
-  kafka-data:

@@ -10,52 +10,39 @@ import (
 	"keyloop-coding-challenge/package/eventsourcing"
 )
 
-// ReadAll streams every stored event to fn, ordered by (aggregate_id, version), all
-// from ONE consistent snapshot of the event store (MySQL: START TRANSACTION WITH
-// CONSISTENT SNAPSHOT, READ ONLY).
+// ReadAll streams every stored event to fn, ordered by (aggregate_id, version), in
+// keyset batches on the unique (aggregate_id, version) index.
 //
-// Why a snapshot and not an es_event.id cursor: AUTO_INCREMENT ids are assigned at
-// insert time, not commit time, so "id > last seen" across separate reads can skip a
-// transaction that committed late. Within one snapshot every committed event is
-// visible, and because writers of one aggregate are serialised by the version CAS,
-// the snapshot always holds a contiguous prefix 1..n of each stream.
+// It runs on the caller's connection and transaction and does not start its own: the
+// rebuild calls it inside its run transaction while holding the projection lock
+// exclusively. Every command takes that lock (shared) before it touches the event
+// store and keeps it until commit, so no event can commit while the run reads, and the
+// batches see one stable history even under READ COMMITTED. Ordering never relies on
+// es_event.id: ids are allocated at insert, not at commit.
 func (r *eventRepo) ReadAll(ctx context.Context, batchSize int, fn func(eventsourcing.Event) error) error {
 	if batchSize <= 0 {
 		batchSize = 500
 	}
-	return r.db.WithContext(ctx).Connection(func(conn *gorm.DB) error {
-		begin := "BEGIN"
-		if conn.Dialector.Name() == "mysql" {
-			begin = "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY"
+	afterID, afterVersion := "", 0
+	for {
+		n, err := r.readBatch(ctx, r.db, afterID, afterVersion, batchSize, func(evt eventsourcing.Event) error {
+			afterID, afterVersion = evt.AggregateID, evt.Version
+			return fn(evt)
+		})
+		if err != nil {
+			return err
 		}
-		if err := conn.Exec(begin).Error; err != nil {
-			return fmt.Errorf("read all: begin snapshot: %w", err)
+		if n < batchSize {
+			return nil
 		}
-		// Roll back even if ctx was cancelled; otherwise the pooled connection would be
-		// returned still inside the read-only snapshot transaction.
-		defer conn.WithContext(context.WithoutCancel(ctx)).Exec("ROLLBACK")
-
-		afterID, afterVersion := "", 0
-		for {
-			n, err := r.readBatch(ctx, conn, afterID, afterVersion, batchSize, func(evt eventsourcing.Event) error {
-				afterID, afterVersion = evt.AggregateID, evt.Version
-				return fn(evt)
-			})
-			if err != nil {
-				return err
-			}
-			if n < batchSize {
-				return nil
-			}
-		}
-	})
+	}
 }
 
 func (r *eventRepo) readBatch(ctx context.Context, conn *gorm.DB, afterID string, afterVersion, limit int,
 	fn func(eventsourcing.Event) error) (int, error) {
 	rows, err := conn.WithContext(ctx).Raw(`
 		SELECT id, aggregate_id, aggregate_type, event_type, version, schema_version, data, metadata, created_at
-		FROM es_event
+		FROM event_store.es_event
 		WHERE (aggregate_id, version) > (?, ?)
 		ORDER BY aggregate_id, version
 		LIMIT ?`, afterID, afterVersion, limit).Rows()
@@ -82,7 +69,7 @@ func (r *eventRepo) ReadStream(ctx context.Context, aggregateID string, afterVer
 	}
 	rows, err := r.db.WithContext(ctx).Raw(`
 		SELECT id, aggregate_id, aggregate_type, event_type, version, schema_version, data, metadata, created_at
-		FROM es_event
+		FROM event_store.es_event
 		WHERE aggregate_id = ?
 			AND version > ?
 			AND version <= ?

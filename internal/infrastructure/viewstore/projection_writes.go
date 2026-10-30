@@ -7,6 +7,18 @@ import (
 	"fmt"
 )
 
+// LockProjectionShared takes the projection lock in shared mode until the transaction
+// ends. Commands take it before any event-store lock; a rebuild takes it exclusively.
+func (p *Postgres) LockProjectionShared(ctx context.Context) error {
+	if !p.inTx {
+		return ErrNotInTransaction
+	}
+	if err := p.db.WithContext(ctx).Exec(`SELECT pg_advisory_xact_lock_shared(?, 0)`, lockClassProjection).Error; err != nil {
+		return fmt.Errorf("lock projection: %w", err)
+	}
+	return nil
+}
+
 func (p *Postgres) LockAggregate(ctx context.Context, aggregateID string) (int, error) {
 	if !p.inTx {
 		return 0, ErrNotInTransaction
@@ -21,7 +33,7 @@ func (p *Postgres) LockAggregate(ctx context.Context, aggregateID string) (int, 
 		}
 	}
 	var version int
-	err := p.db.WithContext(ctx).Raw(`SELECT version FROM projection_aggregate WHERE aggregate_id = ?`, aggregateID).
+	err := p.db.WithContext(ctx).Raw(`SELECT version FROM read_model.projection_aggregate WHERE aggregate_id = ?`, aggregateID).
 		Row().Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
@@ -37,14 +49,14 @@ func (p *Postgres) SetAppliedVersion(ctx context.Context, aggregateID string, ve
 		return ErrNotInTransaction
 	}
 	return p.db.WithContext(ctx).Exec(`
-		INSERT INTO projection_aggregate(aggregate_id, version, last_event_id, updated_at) VALUES (?, ?, ?, now())
+		INSERT INTO read_model.projection_aggregate(aggregate_id, version, last_event_id, updated_at) VALUES (?, ?, ?, now())
 		ON CONFLICT (aggregate_id) DO UPDATE
 			SET version = EXCLUDED.version, last_event_id = EXCLUDED.last_event_id, updated_at = EXCLUDED.updated_at`,
 		aggregateID, version, eventID).Error
 }
 
 func (p *Postgres) Vehicle(ctx context.Context, vehicleID string) (*VehicleRow, error) {
-	rows, err := p.db.WithContext(ctx).Raw(`SELECT `+vehicleColumns+` FROM inventory_vehicle WHERE vehicle_id = ?`, vehicleID).Rows()
+	rows, err := p.db.WithContext(ctx).Raw(`SELECT `+vehicleColumns+` FROM read_model.inventory_vehicle WHERE vehicle_id = ?`, vehicleID).Rows()
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +76,7 @@ func (p *Postgres) SaveVehicle(ctx context.Context, r VehicleRow) error {
 		return ErrNotInTransaction
 	}
 	return p.db.WithContext(ctx).Exec(`
-		INSERT INTO inventory_vehicle(`+vehicleColumns+`)
+		INSERT INTO read_model.inventory_vehicle(`+vehicleColumns+`)
 		VALUES (?, ?, ?, ?, ?, ?, CAST(? AS date), ?, CAST(? AS date), ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (vehicle_id) DO UPDATE SET
 			dealership_id = EXCLUDED.dealership_id, vin = EXCLUDED.vin, make = EXCLUDED.make,
@@ -85,7 +97,7 @@ func (p *Postgres) AppendHistory(ctx context.Context, h HistoryRow) error {
 		return ErrNotInTransaction
 	}
 	return p.db.WithContext(ctx).Exec(`
-		INSERT INTO vehicle_action_history(vehicle_id, version, event_id, action_id, change, action_type,
+		INSERT INTO read_model.vehicle_action_history(vehicle_id, version, event_id, action_id, change, action_type,
 			note, reason, actor_id, correlation_id, occurred_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		h.VehicleID, h.Version, h.EventID, h.ActionID, h.Change, string(h.ActionType),

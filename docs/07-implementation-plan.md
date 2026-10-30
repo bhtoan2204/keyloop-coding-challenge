@@ -2,6 +2,8 @@
 
 Window: **Thursday 29 October → Wednesday 4 November 2026 (deadline).** Phase 0 (this reconciliation) is done on 29 Oct.
 
+> **Superseded in Phase 7 (architecture).** This plan targeted MySQL → Debezium → Kafka → PostgreSQL, and it is kept as the record of how Phases 1–6 were planned and delivered. Phase 7 replaced that pipeline with one PostgreSQL database: see [§7](#7-phase-7-postgresql-only). Current commands and layout: [README](../README.md).
+
 Principles: extend the existing packages instead of adding parallel ones, and validate the existing framework on MySQL before building on it. Every phase ends with `go vet ./...` and `go test ./...` green, and the developer commits it. The AI does not commit. Every phase appends factual entries to [ai-log.md](ai-log.md) (D11).
 
 ## 1. Repository structure (existing tree, with additions marked `+`)
@@ -36,7 +38,7 @@ docker-compose.yaml, Dockerfile, Makefile     existing empty files → filled
 docs/                                         this folder + system-design.md, demo.md, curl-examples.md, ai-log.md
 ```
 
-Tests: the existing tests stay as they are. MySQL/Postgres integration tests sit behind the `integration` build tag and read `MYSQL_TEST_DSN` / `PG_TEST_DSN` (Compose services; testcontainers optional, 02 C11).
+Tests: the existing tests stay as they are. MySQL/Postgres integration tests sit behind the `integration` build tag and read `MYSQL_TEST_DSN` / `PG_TEST_DSN` (Compose services; testcontainers optional, 02 C11). *Since Phase 7: only `PG_TEST_DSN`.*
 
 ## 2. Phases
 
@@ -53,7 +55,9 @@ Tests: the existing tests stay as they are. MySQL/Postgres integration tests sit
 > | Phase 5 | Live change feed: Kafka (KRaft) + Debezium in Compose, `application/messaging` consumer, Kafka transport, startup sync, gap repair from MySQL, `main projector`, pipeline tests (`05` §7) | uncommitted |
 > | Phase 5 | committed `53462bc`; presentation refactor (Phase 5.5) committed `ee7bdff` | committed |
 > | Phase 6 | Dockerfile, full Compose stack (`make stack-up`), OpenAPI 3.1 served at `/openapi.yaml` and `/docs`, Prometheus `/metrics`, E2E test, README with AI narrative, SDD, demo outline, curl examples | uncommitted |
-> | Not done | Video recording (outline only), OpenTelemetry export, Idempotency-Key, VIN reservation (D4), Kafka offsets in PostgreSQL (D5) | — |
+> | Phase 6 + final hardening | committed (dependencies, PostgreSQL least privilege for the projector; see `git log`) | committed |
+> | Phase 7 | PostgreSQL only: event store in schema `event_store`, read model in `read_model`, projection in the command transaction; MySQL, Debezium, Kafka, projector and `sync-projections` removed; in-place read-model upgrade; one-off MySQL import script (§7) | uncommitted |
+> | Not done | Video recording (outline only), OpenTelemetry export, Idempotency-Key, VIN reservation (D4). Kafka offsets in PostgreSQL (D5) became moot in Phase 7. | — |
 >
 > Phase numbers below are the original plan. Dates are unchanged.
 
@@ -140,7 +144,7 @@ The chain is **MySQL write side → commands → read model → business E2E**. 
 | P1 System Design Document | `docs/system-design.md`: diagram, components, data flow, tech + justification, observability, GenAI-in-design, assumptions |
 | P2 Code + README | Clean clone → `make up` works. README steps followed literally. AI Collaboration Narrative section. |
 | P3 Core business logic tests | `make test` + `make test-integration` + `make e2e` green, actual output recorded |
-| P4 Video | `docs/demo.md` + `scripts/demo.sh` |
+| P4 Video | `docs/demo.md` (no `scripts/demo.sh` was written) |
 | Client stub | `api/openapi.yaml` + `docs/curl-examples.md` |
 
 ## 6. Risks and open decisions for Phase 1
@@ -156,3 +160,20 @@ The chain is **MySQL write side → commands → read model → business E2E**. 
 | O7 | D3 (propose only on aging vehicles) | Confirm |
 | O8 | Versioned migration refactor vs simply editing `schema.sql` (nothing is deployed yet) | Versioned. It is small, and it is the only honest answer to "migration compatibility". |
 | R | `AggregateRoot.ApplyChange` uses `time.Now().Unix()` | Tests must not assert exact timestamps. A clock injection can be added later, non-breaking. |
+
+## 7. Phase 7: PostgreSQL only
+
+**Decision.** The developer decided to simplify to one PostgreSQL database, because the CDC pipeline's operational cost outweighed its benefit at this scale and immediate read-after-write matters for the manager UI (02 §9, D16).
+
+**Scope delivered (uncommitted at the time of writing):**
+
+- Event store on PostgreSQL in schema `event_store` (04 §9); read model in schema `read_model` of the same database (05 §8); every table name schema-qualified; SQLite unit tests use an attached `event_store` database.
+- One transaction per command save: projection lock, CAS, append with `RETURNING id`, projection, optional snapshot (`eventstore.WithProjection`, `projection.CommandProjection`).
+- `rebuild-projections` in one transaction under the exclusive projection lock, as a new rebuild role.
+- Roles: writer `inventory_app`, reader `inventory_reader`, rebuild `inventory_rebuild` (`deploy/postgres/*.sql`); `inventory_projector` and all MySQL accounts removed.
+- `migrate`: `event_store` v1–v2 and `read_model` v1, including the in-place upgrade of the Phase 4–6 `public` tables.
+- Removed: MySQL, Debezium, Kafka, Kafka Connect, `projector`, `sync-projections`, `/status`, `inventory_projection_*` metrics, `internal/application/messaging`, `internal/infrastructure/kafka`, `internal/pipeline`, `make test-pipeline` and the MySQL/CDC make targets. Old volumes (`mysql-data`, `kafka-data`) are no longer declared but not deleted.
+- Explicit one-off import of the MySQL history: `deploy/import/mysql-history.sh` ([mysql-import.md](mysql-import.md)).
+- REST contract unchanged except its consistency statements; `internal/e2e` asserts immediate read-after-write.
+
+**Never cut (updated):** B1–B7; PostgreSQL OCC/concurrency tests; atomic rollback of events and read model together; projection version check; rebuild from the event store; aging boundary tests; README, SDD, AI narrative.

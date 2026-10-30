@@ -12,6 +12,8 @@ import (
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/commandstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
+	"keyloop-coding-challenge/internal/infrastructure/projection"
+	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
 	"keyloop-coding-challenge/internal/infrastructure/referencedata"
 	"keyloop-coding-challenge/internal/infrastructure/viewstore"
 	"keyloop-coding-challenge/internal/presentation"
@@ -23,48 +25,51 @@ import (
 // add writes and stored JSON to keep compatible (docs/04 §7).
 const vehicleSnapshotInterval = 0
 
+// runAPI serves the REST API. Commands run as the application writer: one PostgreSQL
+// transaction appends the events and updates the read model. Queries run as the
+// read-only role.
 func runAPI(ctx context.Context, log *slog.Logger) error {
-	dsn, err := mysqlDSN("MYSQL_DSN", envOr("MYSQL_APP_USER", "inventory_app"), "MYSQL_APP_PASSWORD")
+	writer, err := openPostgres(ctx, "PG_APP_DSN", "POSTGRES_APP_USER", "inventory_app", "POSTGRES_APP_PASSWORD")
 	if err != nil {
 		return err
 	}
-	db, err := openMySQL(ctx, dsn)
+	writerDB, err := writer.DB()
 	if err != nil {
 		return err
 	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		return err
-	}
-	defer sqlDB.Close()
+	defer writerDB.Close()
 
 	serializer := eventsourcing.NewSerializer()
 	if err := serializer.RegisterAggregate(&aggregates.VehicleInventoryAggregate{}); err != nil {
 		return err
 	}
-	store := eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(db, serializer), vehicleSnapshotInterval)
+	store := eventstore.NewAggregateStoreWithSnapshotInterval(
+		repos.New(writer, serializer),
+		vehicleSnapshotInterval,
+		eventstore.WithProjection(projection.NewCommandProjection(&projectors.VehicleProjector{})),
+	)
 	commands := command.NewService(
 		commandstore.New(store),
-		referencedata.NewDealerships(db),
+		referencedata.NewDealerships(writer),
 		command.SystemClock{},
 		log,
 	)
 
-	pg, err := openPostgres(ctx, "PG_READ_DSN", "POSTGRES_READER_USER", "inventory_reader", "POSTGRES_READER_PASSWORD")
+	reader, err := openPostgres(ctx, "PG_READ_DSN", "POSTGRES_READER_USER", "inventory_reader", "POSTGRES_READER_PASSWORD")
 	if err != nil {
 		return err
 	}
-	pgDB, err := pg.DB()
+	readerDB, err := reader.DB()
 	if err != nil {
 		return err
 	}
-	defer pgDB.Close()
-	queries := query.NewService(viewstore.NewPostgres(pg), command.SystemClock{})
+	defer readerDB.Close()
+	queries := query.NewService(viewstore.NewPostgres(reader), command.SystemClock{})
 	ready := func(ctx context.Context) error {
-		if err := sqlDB.PingContext(ctx); err != nil {
+		if err := writerDB.PingContext(ctx); err != nil {
 			return err
 		}
-		return pgDB.PingContext(ctx)
+		return readerDB.PingContext(ctx)
 	}
 
 	srv := &http.Server{

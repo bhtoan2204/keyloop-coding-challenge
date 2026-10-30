@@ -2,9 +2,9 @@
 
 > **The authoritative contract is [`api/openapi.yaml`](../api/openapi.yaml)** (OpenAPI 3.1, served by the API at `/openapi.yaml` and `/docs`; `openapi_contract_test.go` checks every documented operation is routed). This document is the design note it was derived from; where they differ, the OpenAPI document and the code win.
 
-Per the PDF, the client layer is stubbed with this OpenAPI contract **and** runnable cURL examples (`docs/curl-examples.md`, exercised by `scripts/demo.sh`).
+Per the PDF, the client layer is stubbed with this OpenAPI contract **and** runnable cURL examples (`docs/curl-examples.md`).
 
-Base path `/v1`, JSON only. Dates are `YYYY-MM-DD`, timestamps are RFC 3339 UTC. The OpenAPI 3.1 spec lives at `api/openapi.yaml` and is served at `GET /openapi.yaml`, with Swagger UI at `/docs`. A contract test validates every handler response in the integration suite against the spec (kin-openapi).
+Base path `/v1`, JSON only. Dates are `YYYY-MM-DD`, timestamps are RFC 3339 UTC. The OpenAPI 3.1 spec lives at `api/openapi.yaml` and is served at `GET /openapi.yaml`, with Swagger UI at `/docs`. `openapi_contract_test.go` checks that every documented operation is routed (responses are not validated against the schema; the planned kin-openapi check was not added).
 
 ## Common headers
 
@@ -13,13 +13,13 @@ Base path `/v1`, JSON only. Dates are `YYYY-MM-DD`, timestamps are RFC 3339 UTC.
 | `X-Actor-Id` | request, **required on commands** | Stand-in for authenticated user (A8); recorded in event metadata |
 | `Idempotency-Key` | request, optional on POST | Replay-safe retries; scoped per actor. **Implemented only if time allows** (04 §6, cut-list item 3). Otherwise it is ignored. |
 | `If-Match: "<version>"` | request, optional on action/sale commands | Rejects with 412 if the aggregate version differs |
-| `ETag: "<version>"` | response on vehicle resources | Aggregate version (from the write side on commands, the read model on reads) |
+| `ETag: "<version>"` | response on vehicle resources | Aggregate version. On reads it is the read-model version, which is committed with the events, so it equals the write-side version. |
 | `X-Request-Id` / `traceparent` | both | Correlation; generated if absent |
 | `Idempotent-Replayed: true` | response | The response is a stored replay |
 
 ## Endpoints
 
-### Queries (read model, Postgres)
+### Queries (read model, PostgreSQL `read_model` schema)
 
 **`GET /v1/dealerships/{dealershipId}/vehicles`** lists inventory (B1, B2, B4).
 
@@ -76,9 +76,9 @@ One aggregate query over `ix_vehicle_dealer_status_stocked`: `count(*) FILTER (W
   "page": { "limit": 20, "has_more": false, "next_cursor": null } }
 ```
 
-### Commands (write side, MySQL event store)
+### Commands (write side, PostgreSQL `event_store` schema)
 
-All commands respond with the **post-command state computed from the aggregate**, plus `version`, so callers never have to wait for the projection.
+All commands respond with the **post-command state computed from the aggregate**, plus `version`. The read model is updated in the same transaction, so a following GET returns the same version.
 
 | Method & path | Body | Success | Domain errors |
 |---|---|---|---|
@@ -97,8 +97,8 @@ All command endpoints may also return: `400 VALIDATION_ERROR`, `404 VEHICLE_NOT_
 | Path | Purpose |
 |---|---|
 | `GET /healthz` | liveness (process up) |
-| `GET /readyz` | readiness: MySQL + Postgres ping (api); Kafka + Postgres + not halted (projector) |
-| `GET /metrics` | Prometheus (both processes, separate ports) |
+| `GET /readyz` | readiness: pings the writer and the reader PostgreSQL pools |
+| `GET /metrics` | Prometheus |
 | `GET /openapi.yaml`, `/docs` | spec, Swagger UI |
 
 ## Error format (RFC 9457 `application/problem+json`)
@@ -129,7 +129,7 @@ Implemented in `internal/presentation` (stdlib `net/http` routing) on top of `in
 | `PUT …/vehicles/{v}/actions/{actionId}` | `200` + `ETag` | Identical values are a no-op: `200`, same version, no event |
 | `POST …/vehicles/{v}/actions/{actionId}/cancel` | `200` + `ETag` | Body `{reason?}`. An empty body is allowed. |
 | `POST …/vehicles/{v}/sale` | `200` + `ETag` | Body `{sold_on}` |
-| `GET /healthz` / `GET /readyz` | `200` / `200` or `503` | Readiness pings MySQL (2 s timeout) and doesn't reveal why it failed. |
+| `GET /healthz` / `GET /readyz` | `200` / `200` or `503` | Readiness pings the writer and reader PostgreSQL pools (2 s timeout; MySQL until Phase 7) and doesn't reveal why it failed. |
 
 ### Response body
 
@@ -161,12 +161,12 @@ Deviation from the read-model shape above: no `proposed_at`, `updated_at` or `up
 | 409 | `CONCURRENCY_CONFLICT` | optimistic conflicts on all 3 attempts |
 | 412 | `VERSION_MISMATCH` | stale `If-Match` |
 | 413 / 415 | `BODY_TOO_LARGE` / `UNSUPPORTED_MEDIA_TYPE` | |
-| 503 | `UNAVAILABLE` + `Retry-After: 1` | database unreachable or connection lost, lock wait timeouts or deadlocks on every attempt, deadline exceeded. **Outcome unknown:** check the vehicle's version before retrying. |
+| 503 | `UNAVAILABLE` + `Retry-After: 1` | database unreachable or connection lost, server shutdown, statement cancelled; serialization failures, deadlocks or `lock_timeout` on every attempt; deadline exceeded. **Outcome unknown:** check the vehicle's version before retrying. |
 | 500 | `INTERNAL` | anything else, with a generic detail. The full error goes only to the log. |
 
 ### Retries and idempotency
 
-- **Server-side retry:** on an optimistic conflict, deadlock or lock wait timeout, the command service reloads the vehicle and re-runs the command on the fresh state. That's at most 3 attempts, stopping on context cancellation. The domain rule therefore decides the outcome: concurrent proposals give one `201` and `409 ACTION_ALREADY_ACTIVE` for the rest.
+- **Server-side retry:** on an optimistic conflict, or a PostgreSQL serialization failure (`40001`), deadlock (`40P01`) or lock-not-available (`55P03`), the command service reloads the vehicle and re-runs the command on the fresh state. That's at most 3 attempts, stopping on context cancellation. The domain rule therefore decides the outcome: concurrent proposals give one `201` and `409 ACTION_ALREADY_ACTIVE` for the rest.
 - **`If-Match` commands:** the version is re-checked on every attempt. A competing commit therefore ends in `412` and is never retried on newer state. A deadlock or lock wait with an unchanged version is re-run.
 - **Never retried:** domain rejections and connection failures, where the commit may or may not have happened.
 - **Deadline:** every request context has a 10 s timeout. Retries back off by 5–25 ms with jitter.
@@ -183,11 +183,11 @@ Deviation from the read-model shape above: no `proposed_at`, `updated_at` or `up
 - A wrong method on a known path returns `404 NOT_FOUND` (catch-all route), not `405`.
 - An empty chunked body without `Content-Type` on `/cancel` returns `415`.
 - A panic after headers were written cannot change the status.
-- Demo dealerships `d-001` and `d-002` are seeded by migration v3 in every environment.
+- Demo dealerships `d-001` and `d-002` are seeded in every environment (MySQL migration v3 then; `event_store` migration v2 since Phase 7).
 
 ## Phase 4 — query API as implemented (2026-10-29)
 
-All four endpoints read the **PostgreSQL read model only**. It is **eventually consistent** with the event store, and in Phase 4 it changes only when `sync-projections` (or `rebuild-projections`) runs. Compare the `version` returned by a command with the `version` of a query to tell whether the read model has caught up.
+All four endpoints read the **PostgreSQL read model** (`read_model` schema, plus `event_store.dealership` for the time zone) through the read-only role. *Superseded consistency statement:* in Phase 4 the read model was eventually consistent and changed only when `sync-projections` ran; in Phase 5–6 a Kafka projector followed the event store about 0.5 s behind. **Since Phase 7** each command updates the read model in its own transaction, so a query issued after a command's response returns that command's version.
 
 | Endpoint | Query parameters (unknown or repeated → `400 INVALID_QUERY`) |
 |---|---|
@@ -208,7 +208,7 @@ All four endpoints read the **PostgreSQL read model only**. It is **eventually c
 - `next_cursor` pins `as_of`, filters and sort. Reusing it with different parameters gives `400 INVALID_CURSOR`; the limit may change.
 - `sort` orders by `stocked_on`, which is the age order for in-stock vehicles. For `SOLD`/`ALL`, a sold vehicle's frozen `age_days` is not the sort key.
 - `as_of` overrides the business date for age and aging only. It is not time travel: statuses are current, and an `as_of` before `stocked_on` yields a negative `age_days`.
-- The detail `ETag` is the **read-model** version and may lag the write side until the next sync.
+- The detail `ETag` is the read-model version. Since Phase 7 it is committed together with the events, so it can be sent as `If-Match` immediately.
 
 **Errors:**
 - `404 DEALERSHIP_NOT_FOUND`;

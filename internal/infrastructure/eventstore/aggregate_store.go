@@ -13,7 +13,11 @@ import (
 var (
 	_ AggregateStore = (*aggregateStore)(nil)
 
-	ErrInvalidAggregate      = errors.New("aggregate must be a non-nil pointer")
+	ErrInvalidAggregate = errors.New("aggregate must be a non-nil pointer")
+	// ErrNestedSave: Save must own the outermost transaction. Inside a caller's
+	// transaction it could only commit a savepoint, and acknowledging the pending events
+	// (Root.Update) before the outer transaction commits could lose them.
+	ErrNestedSave            = errors.New("aggregate store: save inside an existing transaction")
 	ErrConcurrencyConflict   = repos.ErrConcurrencyConflict
 	ErrAggregateNotFound     = repos.ErrAggregateNotFound
 	ErrAggregateTypeMismatch = repos.ErrAggregateTypeMismatch
@@ -42,14 +46,22 @@ type AggregateStore interface {
 type aggregateStore struct {
 	repo             repos.EventStore
 	snapshotInterval int
+	projection       TransactionalProjection
 }
 
 func NewAggregateStore(repositories repos.Repos) AggregateStore {
 	return NewAggregateStoreWithSnapshotInterval(repositories, defaultSnapshotInterval)
 }
 
-func NewAggregateStoreWithSnapshotInterval(repositories repos.Repos, interval int) AggregateStore {
-	return &aggregateStore{repo: repositories.EventStore(), snapshotInterval: interval}
+func NewAggregateStoreWithSnapshotInterval(repositories repos.Repos, interval int, opts ...Option) AggregateStore {
+	as := &aggregateStore{
+		repo:             repositories.EventStore(),
+		snapshotInterval: interval,
+	}
+	for _, opt := range opts {
+		opt(as)
+	}
+	return as
 }
 
 func (as *aggregateStore) Get(ctx context.Context, aggregateID string, agg eventsourcing.Aggregate) error {
@@ -118,17 +130,34 @@ func (as *aggregateStore) SaveWithMetadata(ctx context.Context, agg eventsourcin
 	}
 	baseVersion := root.BaseVersion()
 	currentVersion := root.Version()
+	if as.repo.InTransaction() {
+		return ErrNestedSave
+	}
 
+	// One transaction: projection lock, create-if-missing, version CAS, appends (ids
+	// read back), read-model projection, optional snapshot. Any error rolls back all of it.
 	if err := as.repo.WithTransaction(ctx, func(txn repos.EventStore) error {
+		if as.projection != nil {
+			if err := as.projection.Lock(ctx, txn.DB()); err != nil {
+				return fmt.Errorf("lock projection for aggregate %s: %w", aggregateID, err)
+			}
+		}
 		if err := txn.CreateIfNotExist(ctx, aggregateID, root.AggregateType()); err != nil {
 			return fmt.Errorf("create aggregate %s: %w", aggregateID, err)
 		}
 		if err := txn.CheckAndUpdateVersion(ctx, agg); err != nil {
 			return err
 		}
-		for _, event := range events {
-			if err := txn.Append(ctx, event); err != nil {
+		for i := range events {
+			id, err := txn.Append(ctx, events[i])
+			if err != nil {
 				return fmt.Errorf("append event to aggregate %s: %w", aggregateID, err)
+			}
+			events[i].ID = id
+		}
+		if as.projection != nil {
+			if err := as.projection.Apply(ctx, txn.DB(), events); err != nil {
+				return fmt.Errorf("project aggregate %s: %w", aggregateID, err)
 			}
 		}
 		if as.shouldCreateSnapshot(baseVersion, currentVersion) {
@@ -140,6 +169,7 @@ func (as *aggregateStore) SaveWithMetadata(ctx context.Context, agg eventsourcin
 	}); err != nil {
 		return fmt.Errorf("save aggregate %s: %w", aggregateID, err)
 	}
+	// Only now, after the outermost commit, are the pending events acknowledged.
 	root.Update()
 	return nil
 }

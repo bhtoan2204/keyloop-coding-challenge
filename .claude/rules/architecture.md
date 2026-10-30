@@ -31,10 +31,15 @@ paths:
 - **No speculative abstraction:** one implementation = no interface, unless a test fake needs it.
   No generic repositories, registries or plugin points.
 - **Explicit transactions:** write-side multi-step persistence goes through `WithTransaction`.
-  Never span a transaction across MySQL and Postgres.
+  One command = one PostgreSQL transaction that covers the `event_store` append and the
+  `read_model` update (`eventstore.WithProjection`). Never open a second connection or a nested
+  save inside it; take the projection advisory lock before any event-store row lock.
+- **Schemas and roles:** every table name in SQL is schema-qualified (`event_store.*`,
+  `read_model.*`). Queries run on the read-only pool; commands on the writer pool; rebuild as the
+  rebuild role; DDL only in `migrate` (admin).
 - **Context:** every I/O function takes `ctx context.Context` first and passes it down.
 - **Errors:** wrap with `%w` and context (aggregate ID, version). Domain errors are sentinels in
   `internal/domain/errors.go`; map them to HTTP only in `internal/presentation/httpkit`.
-- **Dependencies:** add a module only in the phase that plans it (`docs/07`). No Redis or extra
-  services. Do not wire `OutboxProjector`, `cache` or `package/redis`, and do not delete them.
+- **Dependencies:** add a module only in the phase that plans it (`docs/07`). No Redis, message broker or
+  extra services (Phase 7 removed MySQL, Kafka and Debezium). Do not wire `OutboxProjector`, `cache` or `package/redis`, and do not delete them.
 - **Docs follow code:** when the implementation deviates from `docs/0x`, record it in that doc.

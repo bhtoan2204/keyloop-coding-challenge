@@ -1,6 +1,8 @@
 # 05 — Read Model, CDC and Projection
 
-Current code: `internal/infrastructure/projection` (a `Projection` pipeline, the `Projector` interface, and stubs `VehicleProjector`/`OutboxProjector`) and `internal/infrastructure/viewstore` (a `ViewStore` interface with `Save(ctx, ev)`). **There is no Postgres code, Kafka code or read-model schema yet.** Everything below is proposed unless marked *existing*.
+> **Superseded in Phase 7 (CDC and asynchronous projection).** Since Phase 7 the read model is the `read_model` schema of the same PostgreSQL database as the event store, and each command updates it in its own transaction. **The current design is [§8](#8-phase-7-projection-in-the-command-transaction-current).** §1–2 (schema and query-time aging) and §6.1–6.3 and §6.5 still describe the read model and queries, apart from the schema prefix and the dealership table. The CDC, Kafka, projector, sync and eventual-consistency material in §3–5, §6.4, §6.6–6.7 and §7 is kept as history of Phases 4–6.
+
+*Original planning note (Phase 0):* current code: `internal/infrastructure/projection` (a `Projection` pipeline, the `Projector` interface, and stubs `VehicleProjector`/`OutboxProjector`) and `internal/infrastructure/viewstore` (a `ViewStore` interface with `Save(ctx, ev)`). **There is no Postgres code, Kafka code or read-model schema yet.** Everything below is proposed unless marked *existing*.
 
 ## 1. PostgreSQL schema *(to add)*
 
@@ -97,7 +99,7 @@ Bracketed predicates are emitted only when the filter is present. `age_days > 90
 
 The cursor is base64url JSON `{sort, last, as_of, filter_hash}`. It pins `as_of`, so paging across midnight stays consistent, and a filter mismatch returns 400. Limit default 20, max 100.
 
-## 3. CDC: Debezium → Kafka *(original plan; as implemented in §7)*
+## 3. CDC: Debezium → Kafka *(original plan; as implemented in §7; superseded in Phase 7)*
 
 ```json
 {
@@ -161,6 +163,8 @@ The `errgroup` branch of `runStage` (stages with more than one projector) is **n
 
 ### 4.2 Ordering, progress and restart
 
+*Superseded in Phase 7 (no Kafka); see §8.*
+
 - Kafka orders events within a partition, and the key keeps each vehicle in one partition. The consumer processes **each partition sequentially**.
 - **Progress, mandatory:** `inventory_vehicle.version` is committed in the same transaction as the state change. Re-delivery after a crash is therefore harmless: either the whole tx was lost and the record is re-applied, or it committed and the record is skipped as a duplicate.
 - The Kafka offset is committed to Kafka **after** the Postgres commit (at-least-once).
@@ -174,6 +178,8 @@ The `errgroup` branch of `runStage` (stages with more than one projector) is **n
 - Unknown `aggregate_type_event_type` in the serializer (existing `Type()` returns `ok=false`) is handled the same way: halt, never skip.
 
 ### 4.4 Rebuild and catch-up (does not depend on Kafka retention; D14)
+
+*Superseded in Phase 7: the rebuild now reads `event_store` in its own PostgreSQL transaction; see §8.4.*
 
 `main rebuild` (and the early E2E feed before Kafka exists):
 
@@ -208,6 +214,8 @@ sequenceDiagram
 ```
 
 ## 5. Consistency model
+
+*Superseded in Phase 7: the read model is updated with the events and read-after-write is immediate; see §8.5.*
 
 - **Write side:** strongly consistent per aggregate. The CAS + unique key serialise appends, and command responses reflect committed state.
 - **Read side:** **eventually consistent** and **monotonic per aggregate** (the version check means a row never moves backwards). There is no cross-aggregate snapshot consistency. Lag is exposed by `projection_lag_seconds` and the per-vehicle `version`.
@@ -253,6 +261,8 @@ sequenceDiagram
 
 ### 6.4 Sync and rebuild (Phase 4 synchronisation boundary)
 
+*Superseded in Phase 7: `sync-projections` was removed and the rebuild reads PostgreSQL `event_store`; see §8.4.*
+
 `main sync-projections` / `main rebuild-projections` (`make sync-projections`, `make rebuild-projections`):
 
 1. **Run lock:** take a PostgreSQL transaction and `pg_try_advisory_xact_lock(projection)` **exclusively**. If any run or applier holds the lock, the command fails with `ErrRunInProgress`.
@@ -275,7 +285,7 @@ sequenceDiagram
 - `TRUNCATE` takes an exclusive table lock, so queries wait during a rebuild and never see a partial read model.
 
 ### 6.5 Queries (`internal/application/query` + `viewstore/*_query.go`)
-- **Business date:** today in the dealership's IANA zone (from the PG `dealership` table; the read side never reads MySQL), or `as_of`.
+- **Business date:** today in the dealership's IANA zone (from the PG `dealership` table; since Phase 7 `event_store.dealership`, the only copy), or `as_of`.
 - **Ages are computed in Go** with the domain rule: `age_days`, and `is_aging = IN_STOCK ∧ age > 90`. A sold vehicle's age is `sold_on − stocked_on`.
 - **Filters are sargable:**
   - `min_age_days` → `stocked_on <= bd − min`;
@@ -294,10 +304,14 @@ sequenceDiagram
 - **Summary:** one aggregate query with `count(*) FILTER (…)`, using the same cutoff as the list (tested equal to list counts).
 
 ### 6.6 Security
+
+*Superseded in Phase 7: `inventory_projector` and the MySQL app user are gone; roles are in §8.6.*
 - **API:** queries use the read-only role from `deploy/postgres/grants.sql` (`make pg-grants`), which has `SELECT` on `dealership`, `inventory_vehicle`, `vehicle_action_history` and `projection_run` only. Verified: INSERT, UPDATE, DELETE, TRUNCATE, CREATE and reading `projection_aggregate` all fail with `42501`.
 - **Projection commands and the projector** write PostgreSQL as `inventory_projector` (`deploy/postgres/projector-grants.sql`; final hardening). That role has DML and `TRUNCATE` on the projected tables, is not a superuser, and cannot change the schema. They read MySQL as the restricted app user (`ReadAll` needs only `SELECT` on `es_event`).
 
 ### 6.7 Limitations and operational risks (accepted for Phase 4)
+
+*Phase 7: the sync, lag, `ETag` lag and duplicated reference data items no longer apply. The rebuild still blocks queries (and now commands) while it runs; the sort and `as_of` semantics are unchanged.*
 - **Not real-time.** A sync re-reads the full history (O(total events)) and keeps one long MySQL snapshot, which holds back InnoDB purge, plus one PostgreSQL transaction.
 - **A rebuild blocks queries for its duration.** `TRUNCATE` holds an exclusive lock, there is no statement timeout on queries, and `/readyz` stays ready.
 - **One bad event halts the whole run** (gap, unknown type, FK violation): the run is a single transaction. This is intended "halt, never skip" behaviour, and the operator must fix the cause.
@@ -310,6 +324,8 @@ sequenceDiagram
 - No `make_model` sort, no total count.
 
 ## 7. Phase 5 — live change feed, as implemented (2026-10-29)
+
+> **Superseded in Phase 7.** MySQL, Debezium, Kafka, the projector process, `internal/application/messaging`, `internal/infrastructure/kafka` and the pipeline tests were removed. This section is the record of what Phases 5–6 ran and verified. See §8.
 
 **Status:** implemented and verified on MySQL 8.4.13, Debezium 3.6.2.Final (Kafka Connect 4.3.0), Apache Kafka 4.3.1 (KRaft) and PostgreSQL 17.11. The read model follows the event store continuously; no manual sync is needed in normal operation.
 
@@ -530,3 +546,82 @@ Data-loss resync (§7.4) is the same sync as mechanism 1, run while consuming.
 - **Kafka, Connect and the projector's `/status`** (which shows raw error strings) are plaintext and unauthenticated, bound to 127.0.0.1 only.
 - **`make debezium-grants` substitutes the password into SQL with `sed`,** as `make mysql-grants` already does. A password containing `/`, `&` or `'` breaks it, so use alphanumeric passwords.
 - **Data-loss resync is verified with a fake transport only.** Kafka retention expiry was not reproduced on the real stack.
+
+## 8. Phase 7: projection in the command transaction (current)
+
+The developer decided to replace the CDC pipeline with a synchronous projection in one PostgreSQL database (02 §9, D16). The projection code itself (`Projection.Apply`, `VehicleProjector`, `ViewStore`) is the same one the CDC consumer and the rebuild used; only who calls it, and in which transaction, changed.
+
+### 8.1 Schema (`internal/infrastructure/viewstore/{schema.go,read_model_ddl.go,legacy_upgrade.go}`)
+
+Schema `read_model`, in the same database as `event_store`:
+
+- `inventory_vehicle` (as §6.2), with its foreign key `dealership_id → event_store.dealership`: there is one dealership table now, not one per database;
+- `vehicle_action_history` (PK `(vehicle_id, version)`, `event_id` = `es_event.id`);
+- `projection_aggregate(aggregate_id, version, last_event_id, updated_at)`;
+- `projection_run(run_id, kind, started_at, finished_at, events_read, events_applied)` (old `sync` rows may remain from the earlier design);
+- `read_model.schema_migrations`.
+
+Migrations: versioned, one transaction per version, under `pg_advisory_xact_lock(52001, 0)` (also the bootstrap `CREATE SCHEMA`), and a database newer than the build is refused. They run after the event-store migrations (the foreign key needs `event_store.dealership`).
+
+**Upgrade in place of the Phase 4–6 layout.** If `public` holds all four earlier tables (`inventory_vehicle`, `vehicle_action_history`, `projection_aggregate`, `projection_run`), `migrate` moves them with `ALTER TABLE … SET SCHEMA read_model` (rows, indexes and sequences kept) and re-points the dealership foreign key at `event_store.dealership`. `public.dealership` and `public.rm_schema_migrations` are left untouched; nothing is dropped. A partial earlier layout is refused rather than guessed at. The upgrade runs in the migration transaction, so a failure (for example a projected dealership missing from `event_store.dealership`) leaves the database unchanged. Tested in `legacy_upgrade_pg_integration_test.go`.
+
+### 8.2 Command path (`projection/command_projection.go`, `eventstore/transactional_projection.go`)
+
+`cmd api` builds the store with `eventstore.WithProjection(projection.NewCommandProjection(&projectors.VehicleProjector{}))`. In every save (04 §9.3):
+
+1. `Lock`: `pg_advisory_xact_lock_shared(52003, 0)`, before the event-store rows are touched.
+2. After the CAS and the appends (with their real `es_event.id` values), `Apply` wraps the same `*gorm.DB` transaction in a `viewstore.Postgres` and calls `Projection.Apply` for each event. No savepoints: any error aborts the whole transaction.
+3. `Projection.Apply` per event: per-vehicle advisory lock (`52002`, `hashtext(aggregate_id)`), read the applied version, then
+   - `version = applied + 1` → projectors run, `SetAppliedVersion`;
+   - `version > applied + 1` → `ErrVersionGap`;
+   - `version ≤ applied` → `Projection.Apply` reports a duplicate; `CommandProjection` turns it into `ErrVersionGap` ("already projected"), because in a command it means the read model is **ahead** of the event store (e.g. restored separately), and committing would hide the divergence.
+4. Any failure rolls back the events, the CAS and the read model together; the aggregate keeps its pending events.
+
+### 8.3 Lock order
+
+Commands: projection lock (shared) → `es_aggregate` row (insert/CAS) → per-vehicle advisory lock and read-model rows. Rebuild: projection lock (exclusive, try-lock) → `TRUNCATE` → read-model rows. Both take the projection lock first, so a rebuild never waits for event-store rows held by a command, and no cycle can form between them.
+
+### 8.4 Rebuild (`projection/runner.go`, `viewstore/projection_runs.go`, `cmd/projections.go`)
+
+`rebuild-projections` (`make rebuild-projections`, `docker compose --profile tools run --rm --no-deps rebuild`) runs as the rebuild role `inventory_rebuild` in ONE transaction:
+
+1. `pg_try_advisory_xact_lock(52003, 0)`. If another rebuild runs or any command holds the lock shared, it fails at once with `ErrRunInProgress`. Commands that arrive during the rebuild wait for it.
+2. `TRUNCATE read_model.vehicle_action_history, inventory_vehicle, projection_aggregate`.
+3. `repos.EventStore.ReadAll` on the same transaction: every event ordered by `(aggregate_id, version)` in keyset batches of 500, each applied through `Projection.Apply` (exclusive mode: no per-vehicle locks).
+4. Insert a `projection_run` row; commit.
+
+Any failure rolls back everything, so the old read model stays. Because commands hold the shared lock from before their CAS until commit, no event can commit while the rebuild holds the exclusive lock, so its READ COMMITTED batch reads see one stable history. Running it again gives the same read model. `TRUNCATE` takes an exclusive table lock, so queries also wait until the rebuild commits and never see a partial model.
+
+Use it for recovery, after the one-off MySQL import ([mysql-import.md](mysql-import.md)), or after changing a projector.
+
+### 8.5 Consistency model
+
+- **Write side:** strongly consistent per vehicle (CAS + unique key), unchanged.
+- **Read side:** updated in the same transaction as the events. No event commits without its read-model update and vice versa. The read model is no longer eventually consistent, and there is no lag metric because there is no lag.
+- **Read-your-writes:** immediate. Queries use a separate read-only pool against the same primary; once a command has returned, a GET sees its version, and the detail `ETag` can be used as `If-Match` at once. The `version` in `projection_aggregate` equals `es_aggregate.version` after every commit.
+- **Aging:** still computed at query time from `stocked_on` and the dealership business date; never stored.
+
+### 8.6 Roles
+
+| Role | Used by | Read-model rights |
+|---|---|---|
+| `inventory_app` (`app-grants.sql`) | `api` commands | `SELECT/INSERT/UPDATE` on `inventory_vehicle`, `projection_aggregate`; `SELECT/INSERT` on `vehicle_action_history`; plus the event-store rights in 04 §9.6 |
+| `inventory_reader` (`grants.sql`) | `api` queries | `SELECT` on `inventory_vehicle`, `vehicle_action_history`, `projection_run`, and `event_store.dealership`; no access to `es_event` |
+| `inventory_rebuild` (`rebuild-grants.sql`) | `rebuild-projections` | `SELECT/INSERT/UPDATE/TRUNCATE` on the three projected tables; `SELECT/INSERT` on `projection_run`; `SELECT` on `es_event`; cannot write events |
+
+None is a superuser or can change the schema; only `migrate` (admin) does.
+
+### 8.7 Tests (PostgreSQL, `-tags integration`, `PG_TEST_DSN`)
+
+- `projection/command_projection_pg_integration_test.go`: a projection failure rolls back the events and the CAS and keeps the pending events; a read model ahead of the event store fails the save; a rebuild interleaved with concurrent commands.
+- `presentation/postgres_read_after_write_integration_test.go`: a GET right after each command returns the projected version equal to the aggregate version, and history `event_id` equals `es_event.id`.
+- `presentation/postgres_*_integration_test.go`: command lifecycle, rejections (incl. the 89/90/91-day boundary), concurrent proposals, a failed transaction under `lock_timeout` → 503 with no events and no read-model change, rebuild equality, least-privilege roles.
+- `viewstore/legacy_upgrade_pg_integration_test.go`: upgrade preserves rows, fails atomically, refuses a partial layout.
+- `internal/e2e`: the business flow against a running stack asserts immediate read-after-write (no polling).
+
+### 8.8 Limitations
+
+- The projection runs on each command's critical path: latency and lock scope per command grow with projection cost.
+- A rebuild blocks commands (and queries) for its duration; it is O(total events). No shadow-table rebuild.
+- One PostgreSQL primary for everything. Read replicas are not used, because a replica would reintroduce lag for the reads routed to it.
+- No change feed for other consumers.

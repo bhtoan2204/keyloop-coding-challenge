@@ -1,4 +1,4 @@
-// Package presentation composes the HTTP handlers of the API and projector processes.
+// Package presentation composes the HTTP handler of the API process.
 // The endpoints live in the commands, queries and probes subpackages; httpkit holds
 // the shared transport (middleware, request parsing, problem responses).
 package presentation
@@ -28,22 +28,6 @@ func NewHandler(cmds CommandService, qs QueryService, ready ReadinessCheck, log 
 	if qs != nil {
 		queries.Register(mux, qs, log)
 	}
-	return withFallbackAndMiddleware(mux, log)
-}
-
-// NewProbeHandler serves the probes of the projection consumer process: /healthz
-// (process alive), /readyz (503 while bootstrapping, while the broker is unreachable
-// or while a partition is halted on a failing record), /status (progress detail) and
-// /metrics.
-func NewProbeHandler(ready ReadinessCheck, status ConsumerStatus, log *slog.Logger) http.Handler {
-	mux := http.NewServeMux()
-	probes.Register(mux, ready, log)
-	probes.RegisterStatus(mux, status)
-	// The consumer collector goes on its own registry: a process (or test) may build
-	// several probe handlers, and a collector can be registered only once per registry.
-	consumer := prometheus.NewRegistry()
-	consumer.MustRegister(probes.NewConsumerCollector(status))
-	probes.RegisterMetrics(mux, prometheus.Gatherers{prometheus.DefaultGatherer, consumer})
 	return withFallbackAndMiddleware(mux, log)
 }
 

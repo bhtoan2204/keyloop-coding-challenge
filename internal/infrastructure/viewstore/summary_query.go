@@ -20,7 +20,7 @@ func (p *Postgres) Summary(ctx context.Context, dealershipID string, businessDat
 		       count(*) FILTER (WHERE status = 'IN_STOCK' AND stocked_on <= CAST(? AS date)),
 		       count(*) FILTER (WHERE status = 'IN_STOCK' AND stocked_on <= CAST(? AS date) AND action_id IS NULL),
 		       min(stocked_on) FILTER (WHERE status = 'IN_STOCK')
-		FROM inventory_vehicle WHERE dealership_id = ?`, cutoff, cutoff, dealershipID).
+		FROM read_model.inventory_vehicle WHERE dealership_id = ?`, cutoff, cutoff, dealershipID).
 		Row().Scan(&s.InStock, &s.Aging, &s.AgingWithoutAction, &oldest)
 	if err != nil {
 		return s, fmt.Errorf("inventory summary: %w", err)

@@ -5,14 +5,12 @@ import (
 	"strings"
 	"testing"
 
+	"keyloop-coding-challenge/internal/testsupport/sqlitetest"
+
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/package/eventsourcing"
-
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // TestSnapshotJSONRoundTrip restores every business field. businessState compares the
@@ -59,15 +57,7 @@ func TestSnapshotStoresNoDerivedValues(t *testing.T) {
 // check that a vehicle restored from a snapshot equals the vehicle that was saved,
 // even when the events covered by the snapshot are no longer readable.
 func TestSnapshotThroughAggregateStore(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open("file:vehicle_snapshot?mode=memory&cache=shared"), &gorm.Config{Logger: logger.Discard})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = sqlDB.Close() })
+	db := sqlitetest.Open(t)
 	if err := repos.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
@@ -87,14 +77,14 @@ func TestSnapshotThroughAggregateStore(t *testing.T) {
 	mustDo(t, store.Save(ctx, a)) // version 3: replayed on top of the snapshot
 
 	var snapshots int64
-	if err := db.Raw(`SELECT COUNT(*) FROM es_aggregate_snapshot WHERE aggregate_id = ? AND version = 2`, testVehicleID).Scan(&snapshots).Error; err != nil {
+	if err := db.Raw(`SELECT COUNT(*) FROM event_store.es_aggregate_snapshot WHERE aggregate_id = ? AND version = 2`, testVehicleID).Scan(&snapshots).Error; err != nil {
 		t.Fatal(err)
 	}
 	if snapshots != 1 {
 		t.Fatalf("snapshots at version 2: %d", snapshots)
 	}
 	// Remove the events the snapshot covers: the load must come from the snapshot.
-	if err := db.Exec(`DELETE FROM es_event WHERE aggregate_id = ? AND version <= 2`, testVehicleID).Error; err != nil {
+	if err := db.Exec(`DELETE FROM event_store.es_event WHERE aggregate_id = ? AND version <= 2`, testVehicleID).Error; err != nil {
 		t.Fatal(err)
 	}
 

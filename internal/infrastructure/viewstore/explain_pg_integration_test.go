@@ -8,6 +8,7 @@ import (
 
 	"keyloop-coding-challenge/internal/application/query"
 	"keyloop-coding-challenge/internal/domain"
+	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/testsupport/pgtest"
 )
 
@@ -18,18 +19,21 @@ import (
 // logged for information.
 func TestPrincipalQueriesCanUseTheirIndexes(t *testing.T) {
 	db, _ := pgtest.NewDatabase(t)
+	if err := repos.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
 	if err := Migrate(db); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Exec(`
-		INSERT INTO inventory_vehicle(vehicle_id, dealership_id, vin, make, model, model_year, stocked_on, status,
+		INSERT INTO read_model.inventory_vehicle(vehicle_id, dealership_id, vin, make, model, model_year, stocked_on, status,
 			sold_on, version, last_event_id, updated_at)
 		SELECT 'v' || i, CASE WHEN i % 2 = 0 THEN 'd-001' ELSE 'd-002' END, '1HGCM82633A004352',
 			(ARRAY['Toyota','Mazda','Ford'])[1 + i % 3], 'M' || (i % 7), 2023,
 			DATE '2026-10-29' - (i % 400), CASE WHEN i % 10 = 0 THEN 'SOLD' ELSE 'IN_STOCK' END,
 			CASE WHEN i % 10 = 0 THEN DATE '2026-10-29' - (i % 400) + 10 END, 1, i, now()
 		FROM generate_series(1, 5000) i;
-		ANALYZE inventory_vehicle;`).Error; err != nil {
+		ANALYZE read_model.inventory_vehicle;`).Error; err != nil {
 		t.Fatal(err)
 	}
 	bd := domain.NewDate(2026, 10, 29)

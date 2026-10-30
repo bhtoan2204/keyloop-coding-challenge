@@ -39,7 +39,7 @@ func ids(r response) []string {
 }
 
 // TestBusinessFlow covers the Keyloop scenario end to end: stock, aging boundary,
-// filters, pagination, the action lifecycle, sale, propagation and error mapping.
+// filters, pagination, the action lifecycle, sale, read-after-write and error mapping.
 func TestBusinessFlow(t *testing.T) {
 	c := newClient(t)
 	bd := today(t)
@@ -57,17 +57,15 @@ func TestBusinessFlow(t *testing.T) {
 	}
 	v120, v91, v90, v89 := "e2e-"+tag+"-120", "e2e-"+tag+"-91", "e2e-"+tag+"-90", "e2e-"+tag+"-89"
 
-	start := time.Now()
 	stock(v120, "Corolla", 120)
 	listOwn := func(c *client, extra string) response {
 		return c.expect(c.do("GET", dealer+"/vehicles?make="+url.QueryEscape(vehicleMake)+extra, nil, nil), http.StatusOK, "")
 	}
-	lag := c.eventually("the first stocked vehicle", func() bool { return len(ids(listOwn(c, ""))) == 1 })
-	t.Logf("stock → visible in the read model after %s (command started %s ago)", lag.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+	c.immediately("the first stocked vehicle", func() bool { return len(ids(listOwn(c, ""))) == 1 })
 	stock(v91, "Corolla", 91)
 	stock(v90, "Yaris", 90)
 	stock(v89, "Yaris", 89)
-	c.eventually("all four vehicles", func() bool { return len(ids(listOwn(c, ""))) == 4 })
+	c.immediately("all four vehicles", func() bool { return len(ids(listOwn(c, ""))) == 4 })
 
 	t.Run("aging boundary: more than 90 days, exactly 90 is not aging", func(t *testing.T) {
 		c := c.with(t)
@@ -137,7 +135,7 @@ func TestBusinessFlow(t *testing.T) {
 		}
 		c.expect(c.do("POST", vehicle+"/sale", map[string]string{"sold_on": bd.Format("2006-01-02")}, nil), http.StatusConflict, "VEHICLE_ALREADY_SOLD")
 
-		c.eventually("the sale", func() bool {
+		c.immediately("the sale", func() bool {
 			return c.do("GET", vehicle, nil, nil).body["status"] == "SOLD"
 		})
 		history := c.expect(c.do("GET", vehicle+"/actions", nil, nil), http.StatusOK, "")

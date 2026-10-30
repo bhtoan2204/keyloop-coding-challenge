@@ -14,42 +14,39 @@ If a doc disagrees with the code, trust the code. Report the mismatch and do not
 - Backend: REST API + persistent DB + OpenAPI/cURL. Deliverables: System Design Doc (with a GenAI section),
   README with build/run/test and an **AI Collaboration Narrative section**, core business-logic tests, 5–10 min video.
 
-**Self-imposed (justify, don't assume):** ES/CQRS, MySQL event store → Debezium → Kafka → PostgreSQL read model.
+**Self-imposed (justify, don't assume):** ES/CQRS on one PostgreSQL 17 database: schema `event_store` (write model)
+and schema `read_model` (read model), updated in the same transaction. Until Phase 7 the design was MySQL event store →
+Debezium → Kafka → projector → PostgreSQL; that history stays in `docs/02`, `04`, `05`, `07` (marked superseded).
 
 ## Current state (check with `git log`, `go test ./...`)
-Implemented and tested:
+Implemented and tested (runtime: PostgreSQL 17 + the `api` process + one-shot init jobs `migrate`, `postgres-grants`):
 - `package/eventsourcing`: `AggregateRoot` (versions, pending events, `ApplyChange`, `LoadFromHistory`), `Event`, serializer registry.
-- `internal/infrastructure/eventstore`: `AggregateStore` (Get/Save in one tx: create-if-missing → CAS on
-  `es_aggregate.version` → append `es_event` → optional snapshot), `repos` (GORM, raw SQL), versioned `Migrate`
-  (v1 original DDL, v2 `es_event.aggregate_type`/`schema_version`). **Verified on SQLite and MySQL 8.4**
-  (`docs/04` §8): concurrency, migrations/upgrade, error classes (`ErrConcurrencyConflict`, `ErrRetryable`,
-  `IsRetryable`), restricted app user (`deploy/mysql/grants.sql`).
 - `internal/domain`: `VehicleInventoryAggregate` (state, commands Stock/ProposeAction/ReviseAction/
   CancelAction/Sell, appliers, snapshot JSON), typed events, `Date`, `AgeInDays`, `IsAging`, domain errors.
-
+- `internal/infrastructure/eventstore`: `AggregateStore`. One transaction per save: projection lock (shared
+  advisory lock 52003) → create-if-missing → CAS on `event_store.es_aggregate.version` → `INSERT es_event … RETURNING id`
+  (ids written back into the events) → `TransactionalProjection.Apply` on the same `*gorm.DB` tx (`WithProjection`) →
+  optional snapshot → commit; `root.Update()` only after commit; nested save refused (`ErrNestedSave`). `repos`: GORM, raw
+  schema-qualified SQL, versioned `Migrate` (event_store v1 tables, v2 `dealership`, advisory lock 51001), error classes
+  (`ErrConcurrencyConflict`, `ErrRetryable` for 40001/40P01/55P03, `IsUnavailable` for 57014/57P0x/08xxx/network).
 - `internal/application/command`: command service (load → dealership ownership → If-Match → domain command at the
-  dealership business date → `SaveWithMetadata`; reload-and-retry ≤ 3 on `IsRetryable`). `internal/presentation`:
-  REST write API (5 commands, problem+json, `/healthz`, `/readyz`). `internal/infrastructure/referencedata`:
-  dealership time zones (migration v3). `cmd/main.go api|migrate` (`make migrate`, `make run-api`).
+  dealership business date → `SaveWithMetadata`; reload-and-retry ≤ 3 on retryable errors, never on unavailable).
+  `internal/infrastructure/referencedata`: dealership time zones from `event_store.dealership`.
+- Read side: `internal/infrastructure/viewstore` (`read_model` schema + migrations, incl. in-place upgrade of the
+  Phase 4–6 `public` layout, `legacy_upgrade.go`), `internal/infrastructure/projection` (`Projection.Apply`,
+  `VehicleProjector`, `CommandProjection` for the save transaction, `Runner.Rebuild`), `internal/application/query`,
+  `presentation/queries` (4 GET endpoints). The read model is updated atomically with the events: read-after-write is immediate.
+- `cmd`: `api`, `migrate`, `rebuild-projections` (one transaction, exclusive projection lock, rebuild role), `healthcheck URL`.
+- Roles (`deploy/postgres`): admin (`POSTGRES_USER`, migrate/grants only), writer `inventory_app` (`app-grants.sql`,
+  append-only `es_event`), reader `inventory_reader` (`grants.sql`), rebuild `inventory_rebuild` (`rebuild-grants.sql`).
+- Packaging and contract: multi-stage `Dockerfile` (distroless, nonroot), Compose stack with one-shot init services
+  (`make stack-up`), `api/openapi.yaml` (embedded; `/openapi.yaml`, `/docs`; `openapi_contract_test.go`), Prometheus
+  `/metrics` (`inventory_http_*`), `internal/e2e` (`make e2e`, asserts immediate read-after-write).
+  Submission docs: `README.md` (AI Collaboration Narrative), `docs/system-design.md`, `docs/demo.md`, `docs/curl-examples.md`.
+- One-off MySQL history import: `deploy/import/mysql-history.sh` (`docs/mysql-import.md`); explicit, never automatic.
 
-- Read side (Phase 4): `internal/infrastructure/viewstore` (PostgreSQL 17 read model + migrations),
-  `internal/infrastructure/projection` (`Projection.Apply`, `VehicleProjector`, `Runner` sync/rebuild from one
-  consistent MySQL snapshot via `repos.EventStore.ReadAll`), `internal/application/query`, `presentation/queries`
-  (4 GET endpoints). `cmd`: `sync-projections`, `rebuild-projections` (now bootstrap/recovery tools).
-- Live change feed (Phase 5, `docs/05` §7): Compose `kafka` (KRaft) + `connect` (Debezium 3.6.2, connector
-  `deploy/debezium/es-event-connector.json`, account `deploy/mysql/debezium-grants.sql`);
-  `internal/application/messaging` (consumer: Debezium decoding, per-partition processing, offset commit after the
-  PG commit, gap repair via `repos.EventStore.ReadStream`, startup sync, health); `internal/infrastructure/kafka`
-  (franz-go transport); `projection.ConsumerAdapter`; `cmd projector` with `/healthz`, `/readyz`, `/status`.
-  Pipeline tests: `internal/pipeline` (tags `integration pipeline`).
-
-- Packaging and contract (Phase 6): multi-stage `Dockerfile` (distroless, nonroot), full Compose stack with
-  one-shot init services (`make stack-up`, engine-independent), `api/openapi.yaml` (embedded; served at
-  `/openapi.yaml`, `/docs`; `openapi_contract_test.go` checks every documented operation is routed), Prometheus
-  `/metrics` on both processes, `internal/e2e` (`make e2e`, business flow against a running stack).
-  Submission docs: `README.md` (AI Collaboration Narrative), `docs/system-design.md`, `docs/demo.md`,
-  `docs/curl-examples.md`.
-
+Removed in Phase 7: MySQL, Debezium, Kafka, Kafka Connect, the `projector` process, `sync-projections`, `/status`,
+`internal/application/messaging`, `internal/infrastructure/kafka`, `internal/pipeline`.
 Not implemented: Idempotency-Key, authentication, VIN uniqueness (D4), OpenTelemetry export.
 `.env` is git-ignored; copy `.env.example`.
 
@@ -62,7 +59,8 @@ Not implemented: Idempotency-Key, authentication, VIN uniqueness (D4), OpenTelem
 | Store port for commands | `command.VehicleStore`, implemented by `eventstore/commandstore` (maps store errors to `command.Err*`) |
 | Transactions on the write side | `repos.EventStore.WithTransaction` |
 | Projection | `projection.Projection` + `projectors.Projector` + `viewstore.ViewStore` (narrow refactor per `docs/05` §4.1) |
-| Live consumer | `messaging.Consumer` with ports `Transport` (`kafka.Transport`), `Projector`/`Synchronizer` (`projection.ConsumerAdapter`), `EventHistory` (`repos.EventStore`) |
+| Read model in the command transaction | `eventstore.TransactionalProjection` via `eventstore.WithProjection`, implemented by `projection.CommandProjection` |
+| Rebuild | `projection.Runner.Rebuild` over `viewstore.Postgres.RunExclusive` and `repos.EventStore.ReadAll` |
 | Empty packages to fill | `internal/application/*`, `internal/presentation`, `cmd/main.go` |
 | Leave unwired, do not delete | `projectors/projector_outbox.go`, `internal/infrastructure/cache`, `package/redis` |
 
@@ -74,8 +72,8 @@ Follow `.claude/rules/source-organization.md`:
 - Packages: group related files into cohesive packages (no flat directories of unrelated features, no package
   per file). Children never import the parent; shared helpers never import features; no sideways imports.
   Small exported APIs; keep public entry points stable via aliases/facades.
-- Comments only where the code cannot speak (invariants, transactions, concurrency, replay/schema, Kafka
-  offsets and idempotency, security, trade-offs, workarounds, non-obvious contracts); drop narration.
+- Comments only where the code cannot speak (invariants, transactions, concurrency, replay/schema,
+  idempotency, security, trade-offs, workarounds, non-obvious contracts); drop narration.
 - Readability: one field per line in multiline struct literals, readable long calls, guard clauses;
   `gofmt` + `goimports -local keyloop-coding-challenge`.
 
@@ -85,7 +83,7 @@ Follow `.claude/rules/source-organization.md`:
 - `internal/application` orchestrates (load → command → save, retries, business date). Infrastructure implements its interfaces.
 - `internal/presentation` → `internal/application` only. No domain logic in handlers or SQL. Layout: root
   `router.go` composes `commands` (write endpoints), `queries` (read endpoints) and `probes` (healthz/readyz/
-  status) over the shared transport `httpkit`; `application_ports.go` keeps the public type names as aliases.
+  metrics) over the shared transport `httpkit`; `application_ports.go` keeps the public type names as aliases.
 - Add an interface only where there is a second implementation (real DB + test fake). No generic frameworks.
 
 ## Event Sourcing / CQRS here
@@ -94,10 +92,12 @@ Follow `.claude/rules/source-organization.md`:
 - Stored names are Go struct names (`VehicleInventoryAggregate`, `VehicleStockedEvent`, …) and are **frozen**.
 - OCC: CAS on `es_aggregate.version` + unique `(aggregate_id, version)`. Conflicts are retried by re-loading
   and re-running the command, never by re-inserting.
-- Read side: Debezium on `es_event` only, Kafka key = `aggregate_id`, one `Projection.Apply` tx per record (state,
-  history and applied version together), duplicates skipped, gaps repaired from MySQL or halted, never skipped.
-  Offsets are committed only after the PG commit. Rebuild/sync read MySQL, never Kafka.
-- Read side is eventually consistent; aging is computed at query time (never stored).
+- Read side: the command's save transaction applies its events through the same `Projection.Apply` a rebuild uses
+  (state, history and applied version with the events, no savepoints). A version already projected fails the save
+  (`ErrVersionGap`: read model ahead), a gap fails it too; nothing is skipped. Lock order: projection advisory lock
+  (shared for commands, exclusive for a rebuild) before any event-store row lock.
+- Rebuild reads `event_store` in the same transaction that truncates and rewrites `read_model`; a failure changes nothing.
+- The read model is consistent with the event store at every commit; aging is computed at query time (never stored).
 
 ## Business invariants (`internal/domain/aggregates/vehicle_inventory_*.go`)
 Stock once per aggregate · actions need IN_STOCK · propose needs aging (> 90 days at business date) ·
@@ -111,15 +111,13 @@ gofmt -l .                     # must print nothing
 go vet ./...
 go test -count=1 ./...         # unit + SQLite-backed store tests (needs cgo for go-sqlite3)
 go test -race -count=1 ./...
-make up && make test-integration          # real MySQL 8.4 + PostgreSQL 17; needs MYSQL_TEST_DSN and PG_TEST_DSN
-make migrate && make mysql-grants && make pg-grants && make run-api   # local API (pg-grants: reader + projector roles)
-make cdc-up && make debezium-grants connector && make run-projector   # live change feed (docs/05 §7)
-make sync-projections                     # point-in-time catch-up from MySQL (recovery; safe while projector runs)
-make test-pipeline                        # real MySQL+Debezium+Kafka+PG; also needs KAFKA_TEST_BROKERS, CONNECT_TEST_URL
-make check                                # fmt-check, vet (incl. integration, pipeline, e2e tags), test, test-race
+make up && make test-integration          # real PostgreSQL 17; needs PG_TEST_DSN (admin URL, no database)
+make up && make migrate && make pg-grants && make run-api   # local API (pg-grants: writer, reader, rebuild roles)
+make rebuild-projections                  # recovery: rebuild read_model from event_store in one transaction
+make check                                # fmt-check, vet (incl. integration, e2e tags), test, test-race
 make stack-up && make e2e                 # whole system in containers + business flow against it
 ```
-Integration tests fail (never skip) without `MYSQL_TEST_DSN`. The dev machine uses rootless Podman
+Integration tests fail (never skip) without `PG_TEST_DSN`; each creates and drops its own database and roles. The dev machine uses rootless Podman
 (`docker compose` → podman-compose); Testcontainers is not used.
 
 ## Workflow (one phase at a time, see `docs/07-implementation-plan.md`)

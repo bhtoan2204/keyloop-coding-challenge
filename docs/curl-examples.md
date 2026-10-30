@@ -48,7 +48,7 @@ curl -s -i -X POST $D/vehicles/veh-1001/actions -H "$ACTOR" -H "$JSON" -H 'If-Ma
   -d '{"action_type": "PRICE_REDUCTION", "note": "Reduce by 5%"}'
 # 201, Location: /v1/dealerships/d-001/vehicles/veh-1001/actions/<actionId>, ETag: "2"
 
-ACTION=$(curl -s $D/vehicles/veh-1001 | jq -r .current_action.action_id)   # once projected
+ACTION=$(curl -s $D/vehicles/veh-1001 | jq -r .current_action.action_id)   # visible immediately
 ```
 
 The `action_type` values are `PRICE_REDUCTION`, `PROMOTE`, `TRANSFER`, `AUCTION`, `WHOLESALE`,
@@ -66,10 +66,10 @@ curl -s -X POST $D/vehicles/veh-1001/actions/$ACTION/cancel -H "$ACTOR" -H "$JSO
 curl -s -X POST $D/vehicles/veh-1001/sale -H "$ACTOR" -H "$JSON" -d '{"sold_on": "2026-10-29"}' | jq '{status, sold_on, version}'
 ```
 
-## Queries (read model, eventually consistent)
+## Queries (read model)
 
-A GET right after a command can show the previous version for a short time (about 0.5 s
-locally). Compare `version`.
+The read model is updated in the same transaction as the command's events, so a GET right
+after a command returns the new `version`, and the detail `ETag` can be sent as `If-Match` at once.
 
 ```bash
 # Oldest stock first (default), 20 per page
@@ -92,7 +92,7 @@ curl -s "$D/vehicles?limit=2&cursor=$NEXT" | jq '.data[].vehicle_id'
 # What-if / boundary checks: compute ages at another business date
 curl -s "$D/vehicles?aging=true&as_of=2026-12-01" | jq '.data | length'
 
-# Detail (ETag = read-model version), action history (audit trail), dashboard summary
+# Detail (ETag = current version), action history (audit trail), dashboard summary
 curl -s -i "$D/vehicles/veh-1001"
 curl -s "$D/vehicles/veh-1001/actions" | jq '.data[] | {version, change, action_type, actor_id, correlation_id}'
 curl -s "$D/inventory/summary" | jq
@@ -126,9 +126,14 @@ curl -s -X POST $D/vehicles/veh-1001/actions -H "$ACTOR" -H "$JSON" -H 'If-Match
 ## Operations
 
 ```bash
-curl -s $API/healthz; curl -s $API/readyz                    # API: process alive / MySQL and PostgreSQL reachable
-curl -s http://127.0.0.1:8081/readyz                         # projector: bootstrapped, broker reachable, no halted partition
-curl -s http://127.0.0.1:8081/status | jq                    # projector progress: applied, duplicates, partitions, lag
-curl -s $API/metrics | grep inventory_http_requests_total    # Prometheus metrics (projector: inventory_projection_*)
+curl -s $API/healthz; curl -s $API/readyz                    # process alive / writer and reader PostgreSQL pools reachable
+curl -s $API/metrics | grep inventory_http_requests_total    # Prometheus metrics (inventory_http_*, Go, process)
 curl -s -H 'X-Request-Id: my-trace-1' -o /dev/null -D - $D/vehicles | grep -i x-request-id   # correlation ID is kept
+```
+
+Rebuild the read model from the event store (recovery; commands wait until it commits):
+
+```bash
+docker compose --profile tools run --rm --no-deps rebuild      # containers
+make rebuild-projections             # host (needs .env)
 ```

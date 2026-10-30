@@ -5,13 +5,13 @@ info:
   summary: Dealership inventory with automatic aging-stock detection and manager actions.
   description: |
     Commands (POST/PUT) are processed on the **write side**: they load the vehicle's event
-    stream from MySQL, run the business rules and append events atomically with optimistic
-    concurrency. Their responses reflect the **committed** state.
+    stream from the PostgreSQL event store, run the business rules and append events with
+    optimistic concurrency. The read model is updated **in the same transaction**, so a
+    command response reflects committed state that every later GET already shows.
 
-    Queries (GET) read the **PostgreSQL read model**, which Debezium/Kafka keeps up to date.
-    It is **eventually consistent**: a GET right after a command may still show the previous
-    version for a short time (about 0.5 s on the development machine). Compare the `version`
-    of a command response with the `version` you read.
+    Queries (GET) read the **read model** (schema `read_model` of the same PostgreSQL
+    database). Read-after-write is immediate: the `version` you read after a successful
+    command is at least the `version` the command returned.
 
     **Aging:** a vehicle is aging when it is `IN_STOCK` and more than 90 calendar days have
     passed since `stocked_on` (exactly 90 is not aging). Ages are computed at request time from
@@ -40,9 +40,9 @@ servers:
     description: Local (docker compose or `make run-api`)
 tags:
   - name: Commands
-    description: Write side (MySQL event store). Strongly consistent per vehicle.
+    description: Write side (PostgreSQL event store). Strongly consistent per vehicle.
   - name: Queries
-    description: Read side (PostgreSQL read model). Eventually consistent.
+    description: Read side (PostgreSQL read model), updated in the same transaction as the events.
   - name: Operations
     description: Probes, metrics and this document.
 
@@ -194,9 +194,9 @@ paths:
       operationId: getVehicle
       summary: Vehicle detail from the read model
       description: |
-        The `ETag` is the read-model version. It can lag the write side until the projector
-        has applied the latest events, so an `If-Match` built from it can return `412` for a
-        short time after a command.
+        The `ETag` is the vehicle's version. The read model is committed together with the
+        events, so it can be used for `If-Match` right away; `412` means another command has
+        changed the vehicle since this read.
       parameters:
         - $ref: '#/components/parameters/AsOf'
       responses:
@@ -482,7 +482,7 @@ paths:
     get:
       tags: [Operations]
       operationId: readyz
-      summary: Readiness (MySQL and PostgreSQL reachable within 2 s)
+      summary: Readiness (PostgreSQL reachable within 2 s by the writer and reader pools)
       responses:
         '200':
           $ref: '#/components/responses/ProbeOK'
@@ -502,7 +502,6 @@ paths:
       description: |
         `inventory_http_requests_total`, `inventory_http_request_duration_seconds` and
         `inventory_http_problems_total` by route pattern, plus Go runtime and process metrics.
-        The projector process serves the same endpoint with `inventory_projection_*` metrics.
       responses:
         '200':
           description: Prometheus text exposition format.
@@ -722,7 +721,7 @@ components:
             $ref: '#/components/schemas/Problem'
     Unavailable:
       description: |
-        `UNAVAILABLE` with `Retry-After: 1`. Commands: MySQL was unreachable, a transient
+        `UNAVAILABLE` with `Retry-After: 1`. Commands: PostgreSQL was unreachable, a transient
         database error persisted through the retries, or the request timed out (10 s); the
         outcome is unknown, so check the vehicle's state before retrying. Queries: only on the
         request timeout; a read model that cannot be reached returns `500 INTERNAL`.

@@ -6,25 +6,28 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
+func pgErr(code string) error {
+	return fmt.Errorf("append event: %w", &pgconn.PgError{Code: code, Message: "x"})
+}
+
 func TestClassifyTxError(t *testing.T) {
-	wrapped := func(n uint16) error {
-		return fmt.Errorf("append event: %w", &mysql.MySQLError{Number: n, Message: "x"})
-	}
 	cases := []struct {
 		name      string
 		err       error
 		retryable bool
 	}{
-		{"deadlock", wrapped(mysqlDeadlock), true},
-		{"lock wait timeout", wrapped(mysqlLockWaitTimeout), true},
-		{"duplicate entry", wrapped(mysqlDuplicateEntry), false},
-		{"other mysql error", wrapped(1146), false},
+		{"serialization failure", pgErr(sqlstateSerializationFailure), true},
+		{"deadlock", pgErr(sqlstateDeadlockDetected), true},
+		{"lock not available", pgErr(sqlstateLockNotAvailable), true},
+		{"unique violation", pgErr(sqlstateUniqueViolation), false},
+		{"undefined table", pgErr("42P01"), false},
 		{"optimistic conflict", fmt.Errorf("x: %w", ErrConcurrencyConflict), false},
 		{"context canceled", fmt.Errorf("x: %w", context.Canceled), false},
 		{"nil", nil, false},
@@ -38,47 +41,57 @@ func TestClassifyTxError(t *testing.T) {
 			if tc.err != nil && !errors.Is(got, tc.err) {
 				t.Fatalf("original error lost: %v", got)
 			}
-			if errors.Is(got, ErrConcurrencyConflict) != errors.Is(tc.err, ErrConcurrencyConflict) {
-				t.Fatalf("conflict classification changed: %v", got)
-			}
 		})
 	}
 }
 
 func TestIsDuplicateKey(t *testing.T) {
-	cases := map[string]struct {
+	cases := []struct {
 		err  error
 		want bool
 	}{
-		"mysql 1062":         {&mysql.MySQLError{Number: mysqlDuplicateEntry}, true},
-		"mysql other number": {&mysql.MySQLError{Number: mysqlDeadlock, Message: "Duplicate entry in text"}, false},
-		"sqlite unique":      {errors.New("UNIQUE constraint failed: es_event.aggregate_id"), true},
-		"unrelated":          {errors.New("connection refused"), false},
-		"nil":                {nil, false},
+		{pgErr(sqlstateUniqueViolation), true},
+		{pgErr("23503"), false}, // foreign key violation is not a duplicate
+		{errors.New("UNIQUE constraint failed: es_event.aggregate_id, es_event.version"), true},
+		{errors.New("no such table"), false},
+		{nil, false},
 	}
-	for name, tc := range cases {
+	for _, tc := range cases {
 		if got := isDuplicateKey(tc.err); got != tc.want {
-			t.Errorf("%s: got %v, want %v", name, got, tc.want)
+			t.Errorf("isDuplicateKey(%v) = %v, want %v", tc.err, got, tc.want)
 		}
 	}
 }
 
+// TestIsUnavailable: these errors leave the outcome of a COMMIT unknown, so they must
+// not be classified as retryable.
 func TestIsUnavailable(t *testing.T) {
-	cases := map[string]struct {
+	cases := []struct {
+		name string
 		err  error
 		want bool
 	}{
-		"bad conn":        {fmt.Errorf("x: %w", driver.ErrBadConn), true},
-		"invalid conn":    {fmt.Errorf("x: %w", mysql.ErrInvalidConn), true},
-		"conn done":       {fmt.Errorf("x: %w", sql.ErrConnDone), true},
-		"dial refused":    {fmt.Errorf("x: %w", &net.OpError{Op: "dial", Err: errors.New("connection refused")}), true},
-		"conflict":        {ErrConcurrencyConflict, false},
-		"duplicate entry": {&mysql.MySQLError{Number: mysqlDuplicateEntry}, false},
-		"nil":             {nil, false},
+		{"bad conn", driver.ErrBadConn, true},
+		{"conn done", fmt.Errorf("commit: %w", sql.ErrConnDone), true},
+		{"unexpected EOF", fmt.Errorf("commit: %w", io.ErrUnexpectedEOF), true},
+		{"network", &net.OpError{Op: "read", Err: errors.New("connection reset")}, true},
+		{"connect", &pgconn.ConnectError{}, true},
+		{"connection exception class", pgErr("08006"), true},
+		{"admin shutdown", pgErr(sqlstateAdminShutdown), true},
+		{"query canceled", pgErr(sqlstateQueryCanceled), true},
+		{"deadlock", pgErr(sqlstateDeadlockDetected), false},
+		{"unique violation", pgErr(sqlstateUniqueViolation), false},
+		{"conflict", ErrConcurrencyConflict, false},
+		{"nil", nil, false},
 	}
-	for name, tc := range cases {
-		if got := IsUnavailable(tc.err); got != tc.want {
-			t.Errorf("%s: got %v", name, got)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsUnavailable(tc.err); got != tc.want {
+				t.Fatalf("IsUnavailable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+			if tc.want && errors.Is(classifyTxError(tc.err), ErrRetryable) {
+				t.Fatalf("%v is unavailable but classified retryable", tc.err)
+			}
+		})
 	}
 }

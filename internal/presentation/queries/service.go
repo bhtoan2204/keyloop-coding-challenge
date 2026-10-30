@@ -8,8 +8,8 @@ import (
 )
 
 // Service is the read side used by the query endpoints (*query.Service). Responses
-// come from the PostgreSQL read model, which is eventually consistent with the event
-// store: the projector applies the change feed continuously.
+// come from the PostgreSQL read model, which commands update in the same transaction as
+// their events.
 type Service interface {
 	ListInventory(ctx context.Context, q query.ListInventory) (*query.InventoryPage, error)
 	GetVehicle(ctx context.Context, dealershipID, vehicleID string, asOf *domain.Date) (*query.VehicleResult, error)

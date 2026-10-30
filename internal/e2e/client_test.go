@@ -1,9 +1,9 @@
 //go:build e2e
 
 // Package e2e_test drives the Keyloop business flow against a running system (the
-// docker compose stack or `make run-api` + `make run-projector`): commands through
-// the API, propagation through Debezium/Kafka, reads from the read model. It fails
-// when E2E_BASE_URL's API is unreachable.
+// docker compose stack or `make run-api`): commands through the API, reads from the
+// read model the same transaction updated. It fails when E2E_BASE_URL's API is
+// unreachable.
 package e2e_test
 
 import (
@@ -103,17 +103,13 @@ func (c *client) expect(r response, status int, code string) response {
 	return r
 }
 
-// eventually polls the read model until cond holds: queries are eventually consistent.
-func (c *client) eventually(what string, cond func() bool) time.Duration {
+// immediately fails unless cond already holds: commands update the read model in their
+// own transaction, so a read after a successful write must see it without waiting.
+func (c *client) immediately(what string, cond func() bool) {
 	c.t.Helper()
-	start := time.Now()
-	for !cond() {
-		if time.Since(start) > 30*time.Second {
-			c.t.Fatalf("read model did not show %s within 30 s", what)
-		}
-		time.Sleep(50 * time.Millisecond)
+	if !cond() {
+		c.t.Fatalf("read model does not show %s right after the command", what)
 	}
-	return time.Since(start)
 }
 
 func randomTag(t *testing.T) string {

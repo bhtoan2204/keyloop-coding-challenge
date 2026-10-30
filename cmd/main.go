@@ -1,10 +1,8 @@
 // Command main runs the inventory service.
 //
-//	main migrate              apply MySQL event-store and PostgreSQL read-model migrations
-//	main api                  serve the REST API (commands: MySQL app user; queries: PG reader)
-//	main sync-projections     apply new events from MySQL to the read model (point in time)
-//	main rebuild-projections  rebuild the read model from the full MySQL history
-//	main projector            apply the live change feed (Debezium/Kafka) to the read model
+//	main migrate              apply the event_store and read_model migrations (admin role)
+//	main api                  serve the REST API (commands: writer role; queries: read-only role)
+//	main rebuild-projections  rebuild read_model from the full event_store history (rebuild role)
 //	main healthcheck URL      exit 0 when URL answers 2xx (container health checks)
 //
 // Configuration comes from the environment; see .env.example.
@@ -20,7 +18,7 @@ import (
 	_ "time/tzdata" // dealership time zones must resolve in minimal containers too
 )
 
-const usage = "usage: main api|migrate|sync-projections|rebuild-projections|projector|healthcheck URL"
+const usage = "usage: main api|migrate|rebuild-projections|healthcheck URL"
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -48,12 +46,8 @@ func run(args []string) int {
 		err = runAPI(ctx, log)
 	case "migrate":
 		err = runMigrate(ctx, log)
-	case "sync-projections":
-		err = runProjections(ctx, log, false)
 	case "rebuild-projections":
-		err = runProjections(ctx, log, true)
-	case "projector":
-		err = runProjector(ctx, log)
+		err = runRebuild(ctx, log)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q; %s\n", args[0], usage)
 		return 2

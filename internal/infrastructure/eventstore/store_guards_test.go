@@ -18,7 +18,7 @@ func TestGetRejectsUnsupportedSchemaVersion(t *testing.T) {
 	addQty(t, agg, 1)
 	mustSave(t, store, agg)
 	// A row as a newer release would write it after reshaping the payload.
-	mustExec(t, db, `UPDATE es_event SET schema_version = 2 WHERE aggregate_id = ? AND version = 2`, "inv")
+	mustExec(t, db, `UPDATE event_store.es_event SET schema_version = 2 WHERE aggregate_id = ? AND version = 2`, "inv")
 
 	err := store.Get(context.Background(), "inv", &qtyAggregate{})
 	if !errors.Is(err, eventstore.ErrUnsupportedSchemaVersion) {
@@ -31,7 +31,7 @@ func TestGetRejectsEventOfAnotherAggregateType(t *testing.T) {
 	agg := newQty(t, "inv")
 	addQty(t, agg, 1)
 	mustSave(t, store, agg)
-	mustExec(t, db, `UPDATE es_event SET aggregate_type = 'otherAggregate' WHERE aggregate_id = ?`, "inv")
+	mustExec(t, db, `UPDATE event_store.es_event SET aggregate_type = 'otherAggregate' WHERE aggregate_id = ?`, "inv")
 
 	err := store.Get(context.Background(), "inv", &qtyAggregate{})
 	if !errors.Is(err, eventstore.ErrAggregateTypeMismatch) {
@@ -43,7 +43,7 @@ func TestAppendRequiresAggregateType(t *testing.T) {
 	db, serializer, _ := newStore(t, 0)
 	es := repos.New(db, serializer).EventStore()
 	untyped := eventsourcing.Event{AggregateID: "inv", Version: 1, EventType: "qtyEvent", Data: &qtyEvent{Delta: 1}, CreatedAt: 1}
-	err := es.Append(context.Background(), untyped)
+	_, err := es.Append(context.Background(), untyped)
 	if err == nil || !strings.Contains(err.Error(), "aggregate type is required") {
 		t.Fatalf("got %v", err)
 	}
@@ -54,7 +54,7 @@ func TestAppendRequiresAggregateType(t *testing.T) {
 
 func TestMigrateRefusesNewerSchema(t *testing.T) {
 	db := openDB(t) // migrated to the latest known version
-	mustExec(t, db, `INSERT INTO es_schema_migrations(version, name) VALUES(99, 'from a newer release')`)
+	mustExec(t, db, `INSERT INTO event_store.schema_migrations(version, name) VALUES(99, 'from a newer release')`)
 	err := repos.Migrate(db)
 	if err == nil || !strings.Contains(err.Error(), "schema version 99") {
 		t.Fatalf("got %v", err)

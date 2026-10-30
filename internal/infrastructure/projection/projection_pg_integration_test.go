@@ -13,6 +13,7 @@ import (
 
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/events"
+	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/infrastructure/projection"
 	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
 	"keyloop-coding-challenge/internal/infrastructure/viewstore"
@@ -83,7 +84,7 @@ func vehicle(t *testing.T, db *gorm.DB, id string) *vehicleState {
 	var rows []vehicleState
 	if err := db.Raw(`SELECT status, coalesce(action_id,'') action_id, coalesce(action_type,'') action_type,
 		coalesce(action_note,'') action_note, coalesce(action_updated_by,'') action_updated_by, version, sold_on
-		FROM inventory_vehicle WHERE vehicle_id = ?`, id).Scan(&rows).Error; err != nil {
+		FROM read_model.inventory_vehicle WHERE vehicle_id = ?`, id).Scan(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
 	if len(rows) == 0 {
@@ -101,7 +102,7 @@ func history(t *testing.T, db *gorm.DB, id string) []historyRow {
 	t.Helper()
 	var rows []historyRow
 	if err := db.Raw(`SELECT version, change, action_id, action_type, note, reason, actor_id, correlation_id
-		FROM vehicle_action_history WHERE vehicle_id = ? ORDER BY version`, id).Scan(&rows).Error; err != nil {
+		FROM read_model.vehicle_action_history WHERE vehicle_id = ? ORDER BY version`, id).Scan(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
 	return rows
@@ -110,7 +111,7 @@ func history(t *testing.T, db *gorm.DB, id string) []historyRow {
 func appliedVersion(t *testing.T, db *gorm.DB, id string) int {
 	t.Helper()
 	var v []int
-	if err := db.Raw(`SELECT version FROM projection_aggregate WHERE aggregate_id = ?`, id).Scan(&v).Error; err != nil {
+	if err := db.Raw(`SELECT version FROM read_model.projection_aggregate WHERE aggregate_id = ?`, id).Scan(&v).Error; err != nil {
 		t.Fatal(err)
 	}
 	if len(v) == 0 {
@@ -266,10 +267,15 @@ func TestConcurrentDeliveryOfFirstAndLaterEvents(t *testing.T) {
 		}
 	}
 	var n int64
-	db.Raw(`SELECT count(*) FROM inventory_vehicle`).Scan(&n)
+	db.Raw(`SELECT count(*) FROM read_model.inventory_vehicle`).Scan(&n)
 	if n != 1 || len(history(t, db, "v1")) != 1 || appliedVersion(t, db, "v1") != 2 {
 		t.Fatalf("rows=%d history=%d", n, len(history(t, db, "v1")))
 	}
+}
+
+// source binds a fixed history to any run transaction, like repos.NewEventStore(tx, …).
+func source(events []eventsourcing.Event) func(*gorm.DB) projection.EventSource {
+	return func(*gorm.DB) projection.EventSource { return fakeSource{events: events} }
 }
 
 // fakeSource replays a fixed history like repos.EventStore.ReadAll.
@@ -311,14 +317,14 @@ func historyFor(vehicles int) []eventsourcing.Event {
 func dump(t *testing.T, db *gorm.DB) string {
 	t.Helper()
 	var vehicles, histories []map[string]interface{}
-	if err := db.Raw(`SELECT * FROM inventory_vehicle ORDER BY vehicle_id`).Scan(&vehicles).Error; err != nil {
+	if err := db.Raw(`SELECT * FROM read_model.inventory_vehicle ORDER BY vehicle_id`).Scan(&vehicles).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Raw(`SELECT * FROM vehicle_action_history ORDER BY vehicle_id, version`).Scan(&histories).Error; err != nil {
+	if err := db.Raw(`SELECT * FROM read_model.vehicle_action_history ORDER BY vehicle_id, version`).Scan(&histories).Error; err != nil {
 		t.Fatal(err)
 	}
 	var applied []map[string]interface{}
-	if err := db.Raw(`SELECT aggregate_id, version, last_event_id FROM projection_aggregate ORDER BY aggregate_id`).Scan(&applied).Error; err != nil {
+	if err := db.Raw(`SELECT aggregate_id, version, last_event_id FROM read_model.projection_aggregate ORDER BY aggregate_id`).Scan(&applied).Error; err != nil {
 		t.Fatal(err)
 	}
 	return fmt.Sprint(vehicles, histories, applied)
@@ -331,7 +337,7 @@ func TestRebuildEqualsIncrementalAndIsRepeatable(t *testing.T) {
 	mustApply(t, live, evs...)
 
 	rebuiltDB, _ := migratedDB(t)
-	runner := projection.NewRunner(fakeSource{evs}, viewstore.NewPostgres(rebuiltDB), &projectors.VehicleProjector{})
+	runner := projection.NewRunner(source(evs), viewstore.NewPostgres(rebuiltDB), &projectors.VehicleProjector{})
 	res, err := runner.Rebuild(ctx)
 	if err != nil || res.Read != len(evs) || res.Applied != len(evs) {
 		t.Fatalf("rebuild: %+v %v", res, err)
@@ -340,40 +346,17 @@ func TestRebuildEqualsIncrementalAndIsRepeatable(t *testing.T) {
 	if got := dump(t, rebuiltDB); got != want {
 		t.Fatalf("rebuilt read model differs from incremental projection")
 	}
-	// Repeatable: a second rebuild gives the same state; a sync applies nothing new.
+	// Repeatable: a second rebuild gives the same state.
 	if res, err := runner.Rebuild(ctx); err != nil || res.Applied != len(evs) {
 		t.Fatalf("second rebuild: %+v %v", res, err)
 	}
 	if got := dump(t, rebuiltDB); got != want {
 		t.Fatal("second rebuild changed the read model")
 	}
-	if res, err := runner.Sync(ctx); err != nil || res.Applied != 0 || res.Read != len(evs) {
-		t.Fatalf("sync after rebuild: %+v %v", res, err)
-	}
 	var runs int64
-	rebuiltDB.Raw(`SELECT count(*) FROM projection_run`).Scan(&runs)
-	if runs != 3 {
+	rebuiltDB.Raw(`SELECT count(*) FROM read_model.projection_run`).Scan(&runs)
+	if runs != 2 {
 		t.Fatalf("runs recorded: %d", runs)
-	}
-}
-
-func TestSyncAppliesOnlyNewEvents(t *testing.T) {
-	db, _ := migratedDB(t)
-	evs := historyFor(10)
-	half := len(evs) / 2
-	// The first half of a history is not a per-aggregate prefix in general; use whole
-	// vehicles: everything before the first event of the vehicle at index half.
-	cut := half
-	for cut < len(evs) && evs[cut].Version != 1 {
-		cut++
-	}
-	store := viewstore.NewPostgres(db)
-	if res, err := projection.NewRunner(fakeSource{evs[:cut]}, store, &projectors.VehicleProjector{}).Sync(ctx); err != nil || res.Applied != cut {
-		t.Fatalf("first sync: %+v %v", res, err)
-	}
-	res, err := projection.NewRunner(fakeSource{evs}, store, &projectors.VehicleProjector{}).Sync(ctx)
-	if err != nil || res.Applied != len(evs)-cut {
-		t.Fatalf("second sync: %+v %v", res, err)
 	}
 }
 
@@ -381,14 +364,14 @@ func TestFailedRunRollsBackEverything(t *testing.T) {
 	db, _ := migratedDB(t)
 	store := viewstore.NewPostgres(db)
 	good := historyFor(5)
-	if _, err := projection.NewRunner(fakeSource{good}, store, &projectors.VehicleProjector{}).Rebuild(ctx); err != nil {
+	if _, err := projection.NewRunner(source(good), store, &projectors.VehicleProjector{}).Rebuild(ctx); err != nil {
 		t.Fatal(err)
 	}
 	before := dump(t, db)
 
 	bad := append(append([]eventsourcing.Event{}, historyFor(8)...), eventsourcing.Event{
 		ID: 999, AggregateID: "veh-000", Version: 99, EventType: "X", Data: &struct{}{}}) // gap at the very end
-	if _, err := projection.NewRunner(fakeSource{bad}, store, &projectors.VehicleProjector{}).Rebuild(ctx); !errors.Is(err, projection.ErrVersionGap) {
+	if _, err := projection.NewRunner(source(bad), store, &projectors.VehicleProjector{}).Rebuild(ctx); !errors.Is(err, projection.ErrVersionGap) {
 		t.Fatalf("got %v", err)
 	}
 	if after := dump(t, db); after != before {
@@ -402,7 +385,7 @@ func TestConcurrentRunsAreRejected(t *testing.T) {
 	holding, release := make(chan struct{}), make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := store.RunExclusive(ctx, "rebuild", true, func(viewstore.ViewStore) (int, int, error) {
+		_, _, err := store.RunExclusive(ctx, "rebuild", true, func(*viewstore.Postgres) (int, int, error) {
 			close(holding)
 			<-release
 			return 0, 0, nil
@@ -414,7 +397,7 @@ func TestConcurrentRunsAreRejected(t *testing.T) {
 	// TRUNCATE instead of failing fast.
 	secondCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if _, err := projection.NewRunner(fakeSource{historyFor(2)}, store, &projectors.VehicleProjector{}).Rebuild(secondCtx); !errors.Is(err, viewstore.ErrRunInProgress) {
+	if _, err := projection.NewRunner(source(historyFor(2)), store, &projectors.VehicleProjector{}).Rebuild(secondCtx); !errors.Is(err, viewstore.ErrRunInProgress) {
 		t.Fatalf("second run: %v", err)
 	}
 	close(release)
@@ -426,6 +409,9 @@ func TestConcurrentRunsAreRejected(t *testing.T) {
 func migratedDB(t *testing.T) (*gorm.DB, string) {
 	t.Helper()
 	db, dsn := pgtest.NewDatabase(t)
+	if err := repos.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
 	if err := viewstore.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +432,7 @@ func TestRunAndAppliersExcludeEachOther(t *testing.T) {
 	holding, release := make(chan struct{}), make(chan struct{})
 	runDone := make(chan error, 1)
 	go func() {
-		_, _, err := store.RunExclusive(ctx, "sync", false, func(viewstore.ViewStore) (int, int, error) {
+		_, _, err := store.RunExclusive(ctx, "sync", false, func(*viewstore.Postgres) (int, int, error) {
 			close(holding)
 			<-release
 			return 0, 0, nil
@@ -481,7 +467,7 @@ func TestRunAndAppliersExcludeEachOther(t *testing.T) {
 		})
 	}()
 	<-inTx
-	if _, _, err := store.RunExclusive(ctx, "sync", false, func(viewstore.ViewStore) (int, int, error) { return 0, 0, nil }); !errors.Is(err, viewstore.ErrRunInProgress) {
+	if _, _, err := store.RunExclusive(ctx, "sync", false, func(*viewstore.Postgres) (int, int, error) { return 0, 0, nil }); !errors.Is(err, viewstore.ErrRunInProgress) {
 		t.Fatalf("run during an applier: %v", err)
 	}
 	close(done)

@@ -1,5 +1,5 @@
 // Package referencedata reads reference data owned by other systems; the write side
-// only holds a read-only copy (seeded by repos.Migrate, version 3).
+// only holds a read-only copy (event_store.dealership, seeded by repos.Migrate version 2).
 package referencedata
 
 import (
@@ -25,7 +25,7 @@ func NewDealerships(db *gorm.DB) *Dealerships {
 
 func (d *Dealerships) Location(ctx context.Context, dealershipID string) (*time.Location, error) {
 	var timezone string
-	err := d.db.WithContext(ctx).Raw(`SELECT timezone FROM dealership WHERE dealership_id = ?`, dealershipID).
+	err := d.db.WithContext(ctx).Raw(`SELECT timezone FROM event_store.dealership WHERE dealership_id = ?`, dealershipID).
 		Row().Scan(&timezone)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", command.ErrDealershipNotFound, dealershipID)

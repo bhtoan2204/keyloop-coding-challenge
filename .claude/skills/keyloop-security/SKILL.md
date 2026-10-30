@@ -1,6 +1,6 @@
 ---
 name: keyloop-security
-description: Security review of the Keyloop inventory backend — input validation, SQL injection and query construction, MySQL/Postgres privileges and append-only grants, secrets and credentials in code/config/logs, API trust boundaries and actor identity (X-Actor-Id), dependency and container security. Reports findings without changing anything. Use when SQL, HTTP handlers, config, Compose/Dockerfile or dependencies change.
+description: Security review of the Keyloop inventory backend — input validation, SQL injection and query construction, PostgreSQL roles and append-only grants, secrets and credentials in code/config/logs, API trust boundaries and actor identity (X-Actor-Id), dependency and container security. Reports findings without changing anything. Use when SQL, HTTP handlers, config, Compose/Dockerfile or dependencies change.
 argument-hint: "[path or base ref, default whole repo]"
 disallowed-tools: Edit, Write, NotebookEdit
 ---
@@ -14,8 +14,11 @@ Scope: `$ARGUMENTS` (if empty, the whole repository). Report only; never rotate 
 2. **SQL safety:** all queries parameterised (`?` / `$n`); no `fmt.Sprintf` with user data in SQL;
    ORDER BY / sort fields chosen from an allowlist; LIKE patterns escaped.
    `grep -rn "Sprintf" --include=*.go internal | grep -i -E "select|insert|update|delete|order by"`.
-3. **Database privileges:** app user has no UPDATE/DELETE on `es_event`; projector uses a read-only
-   MySQL user; Debezium user has only replication grants; no root DSNs in app config.
+3. **Database privileges** (`deploy/postgres/*.sql`): the writer `inventory_app` has no
+   UPDATE/DELETE/TRUNCATE on `event_store.es_event` and no DDL; the reader `inventory_reader` has
+   SELECT on the read-model tables and `event_store.dealership` only (not `es_event`); the rebuild
+   role `inventory_rebuild` can read `es_event` but not write events; none is a superuser; the admin
+   (`POSTGRES_USER`) is used only by `migrate` and the grant jobs; no admin DSN in the `api` config.
 4. **Secrets:** search tracked and untracked files for credentials, tokens, private keys, DSNs with
    passwords (`git grep -n -I -E "(password|passwd|secret|token|api[_-]?key|BEGIN .*PRIVATE)"`).
    `.env` must not contain real secrets; only `.env.example` documents variables.

@@ -1,4 +1,5 @@
 // Package query contains the read-side application services. They read the
-// PostgreSQL read model only (never the MySQL event store) and are independent of the
-// command side. The read model is eventually consistent with the event store.
+// read_model schema (plus the event_store.dealership reference data, never the event
+// history) and are independent of the command side. Commands update the read model in
+// the same transaction as their events.
 package query

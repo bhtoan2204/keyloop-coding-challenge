@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/infrastructure/viewstore"
 	"keyloop-coding-challenge/internal/testsupport/pgtest"
 
@@ -19,6 +20,9 @@ import (
 // the API uses: queries work, every write is refused.
 func TestReaderRoleIsReadOnly(t *testing.T) {
 	db, dsn := pgtest.NewDatabase(t)
+	if err := repos.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
 	if err := viewstore.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
@@ -42,15 +46,15 @@ func TestReaderRoleIsReadOnly(t *testing.T) {
 	ru.User = url.UserPassword(user, password)
 	reader := pgtest.Open(t, ru.String())
 	var n int
-	if err := reader.Raw(`SELECT count(*) FROM inventory_vehicle`).Scan(&n).Error; err != nil {
+	if err := reader.Raw(`SELECT count(*) FROM read_model.inventory_vehicle`).Scan(&n).Error; err != nil {
 		t.Fatalf("reader cannot query: %v", err)
 	}
 	for _, stmt := range []string{
-		`INSERT INTO dealership VALUES ('d-x', 'x', 'UTC')`,
-		`UPDATE dealership SET name = 'x'`,
-		`DELETE FROM inventory_vehicle`,
-		`TRUNCATE inventory_vehicle`,
-		`SELECT * FROM projection_aggregate`,
+		`INSERT INTO event_store.dealership VALUES ('d-x', 'x', 'UTC')`,
+		`UPDATE event_store.dealership SET name = 'x'`,
+		`DELETE FROM read_model.inventory_vehicle`,
+		`TRUNCATE read_model.inventory_vehicle`,
+		`SELECT * FROM read_model.projection_aggregate`,
 		`CREATE TABLE x (id int)`,
 	} {
 		err := reader.Exec(stmt).Error

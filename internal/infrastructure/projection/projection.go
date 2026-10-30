@@ -18,12 +18,12 @@ var (
 	ErrUnsupportedSchemaVersion = errors.New("unsupported event schema version")
 )
 
-// Projection applies events to the read model. The same Apply is used by the
-// rebuild/sync commands and, later, by the CDC consumer.
+// Projection applies events to the read model. The same Apply is used by commands
+// (inside their save transaction) and by the rebuild.
 type Projection interface {
-	// Apply applies ev in its own transaction. Inside a sync/rebuild run (exclusive
-	// mode) it joins the run's transaction instead, without a savepoint. It returns
-	// applied=false for a duplicate (version already applied).
+	// Apply applies ev in its own transaction, or joins the store's transaction when the
+	// store is bound to one (a command's save, a rebuild run), without a savepoint. It
+	// returns applied=false for a duplicate (version already applied).
 	Apply(ctx context.Context, ev eventsourcing.Event) (applied bool, err error)
 }
 

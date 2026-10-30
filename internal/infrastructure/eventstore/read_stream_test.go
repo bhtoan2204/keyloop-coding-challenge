@@ -52,7 +52,7 @@ func TestReadStreamRejectsUndecodableRows(t *testing.T) {
 	agg := newQty(t, "a")
 	addQty(t, agg, 1)
 	mustSave(t, store, agg)
-	if err := db.Exec(`UPDATE es_event SET schema_version = 2`).Error; err != nil {
+	if err := db.Exec(`UPDATE event_store.es_event SET schema_version = 2`).Error; err != nil {
 		t.Fatal(err)
 	}
 	_, err := repos.New(db, serializer).EventStore().ReadStream(context.Background(), "a", 0, 1)

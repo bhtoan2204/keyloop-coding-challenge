@@ -30,7 +30,7 @@ func (r *eventRepo) Get(ctx context.Context, aggregateID string, fromVersion, to
 
 	rows, err := r.db.WithContext(ctx).Raw(`
 		SELECT id, aggregate_id, aggregate_type, event_type, version, schema_version, data, metadata, created_at
-		FROM es_event
+		FROM event_store.es_event
 		WHERE aggregate_id = ?
 			AND version > ?
 			AND version <= ?
@@ -69,35 +69,40 @@ func (r *eventRepo) Get(ctx context.Context, aggregateID string, fromVersion, to
 	return nil
 }
 
-func (r *eventRepo) Append(ctx context.Context, e eventsourcing.Event) error {
-	// Every row must be decodable on its own (CDC), and the migration backfill only ran
-	// once, so a row without a type would stay undecodable.
+// Append inserts one event and returns its database-generated id. The id is read back
+// with RETURNING inside the caller's transaction: it is never derived from a sequence
+// value, and ids say nothing about commit order across transactions.
+func (r *eventRepo) Append(ctx context.Context, e eventsourcing.Event) (int64, error) {
+	// Every row must be decodable on its own (rebuilds read rows without the aggregate).
 	if e.AggregateType == "" {
-		return fmt.Errorf("append event: aggregate %s version %d: aggregate type is required", e.AggregateID, e.Version)
+		return 0, fmt.Errorf("append event: aggregate %s version %d: aggregate type is required", e.AggregateID, e.Version)
 	}
 	eData, err := r.serialize.Marshal(e.Data)
 	if err != nil {
-		return fmt.Errorf("serialize event data: %w", err)
+		return 0, fmt.Errorf("serialize event data: %w", err)
 	}
 	eMetadata, err := r.serialize.Marshal(e.Metadata)
 	if err != nil {
-		return fmt.Errorf("serialize event metadata: %w", err)
+		return 0, fmt.Errorf("serialize event metadata: %w", err)
 	}
 	schemaVersion := e.SchemaVersion
 	if schemaVersion == 0 {
 		schemaVersion = eventsourcing.DefaultSchemaVersion
 	}
-	err = r.db.WithContext(ctx).Exec(`
-		INSERT INTO es_event(aggregate_id, aggregate_type, event_type, version, schema_version, data, metadata, created_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.AggregateID, e.AggregateType, e.EventType, e.Version, schemaVersion, eData, eMetadata, e.CreatedAt).Error
+	var id int64
+	err = r.db.WithContext(ctx).Raw(`
+		INSERT INTO event_store.es_event(aggregate_id, aggregate_type, event_type, version, schema_version, data, metadata, created_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		RETURNING id`,
+		e.AggregateID, e.AggregateType, e.EventType, e.Version, schemaVersion, eData, eMetadata, e.CreatedAt).
+		Scan(&id).Error
 	if err != nil {
 		if isDuplicateKey(err) {
-			return fmt.Errorf("%w: aggregate %s version %d: %w", ErrDuplicateEvent, e.AggregateID, e.Version, err)
+			return 0, fmt.Errorf("%w: aggregate %s version %d: %w", ErrDuplicateEvent, e.AggregateID, e.Version, err)
 		}
-		return fmt.Errorf("append event: %w", err)
+		return 0, fmt.Errorf("append event: %w", err)
 	}
-	return nil
+	return id, nil
 }
 
 // decode fills evt.Data and evt.Metadata from the stored JSON, using the serializer's

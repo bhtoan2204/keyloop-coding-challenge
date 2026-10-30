@@ -67,7 +67,7 @@ func listVehiclesSQL(f query.VehicleFilter) (string, []interface{}) {
 		args = append(args, f.After.StockedOn.String(), f.After.VehicleID)
 	}
 	args = append(args, f.Limit)
-	sqlText := `SELECT ` + vehicleColumns + ` FROM inventory_vehicle WHERE ` + strings.Join(where, " AND ") +
+	sqlText := `SELECT ` + vehicleColumns + ` FROM read_model.inventory_vehicle WHERE ` + strings.Join(where, " AND ") +
 		` ORDER BY ` + order + ` LIMIT ?`
 	return sqlText, args
 }

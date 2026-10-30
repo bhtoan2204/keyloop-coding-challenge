@@ -35,12 +35,14 @@ func (r *aggregateRepo) CreateIfNotExist(ctx context.Context, id, typ string) er
 	return nil
 }
 
+// insertAggregate creates the stream row if it is missing. ON CONFLICT DO NOTHING makes
+// a concurrent creator wait for the first one's commit instead of failing; the version
+// CAS that follows then decides the winner.
 func (r *aggregateRepo) insertAggregate(ctx context.Context, id, typ string) error {
-	stmt := `INSERT INTO es_aggregate(id, version, aggregate_type) VALUES(?, 0, ?) ON CONFLICT(id) DO NOTHING`
-	if r.db.Dialector.Name() == "mysql" {
-		stmt = `INSERT INTO es_aggregate(id, version, aggregate_type) VALUES(?, 0, ?) ON DUPLICATE KEY UPDATE id = id`
-	}
-	return r.db.WithContext(ctx).Exec(stmt, id, typ).Error
+	return r.db.WithContext(ctx).Exec(
+		`INSERT INTO event_store.es_aggregate(id, version, aggregate_type) VALUES(?, 0, ?) ON CONFLICT(id) DO NOTHING`,
+		id, typ,
+	).Error
 }
 
 func (r *aggregateRepo) FindAggregate(ctx context.Context, id string) (int, string, error) {
@@ -56,7 +58,7 @@ func (r *aggregateRepo) FindAggregate(ctx context.Context, id string) (int, stri
 
 func (r *aggregateRepo) aggregateByID(ctx context.Context, id string) (int, string, bool, error) {
 	rows, err := r.db.WithContext(ctx).Raw(
-		`SELECT version, aggregate_type FROM es_aggregate WHERE id = ?`, id,
+		`SELECT version, aggregate_type FROM event_store.es_aggregate WHERE id = ?`, id,
 	).Rows()
 	if err != nil {
 		return 0, "", false, err
@@ -80,7 +82,7 @@ func (r *aggregateRepo) CheckAndUpdateVersion(ctx context.Context, agg eventsour
 	newVersion := root.Version()
 
 	query := r.db.WithContext(ctx).Exec(`
-		UPDATE es_aggregate
+		UPDATE event_store.es_aggregate
 		SET version = ?
 		WHERE id = ? AND version = ?
 	`, newVersion, aggregateID, expectedVersion)
@@ -97,8 +99,8 @@ func (r *aggregateRepo) CheckAndUpdateVersion(ctx context.Context, agg eventsour
 func (r *aggregateRepo) ReadSnapshot(ctx context.Context, aggregateID string, agg eventsourcing.Aggregate) (bool, error) {
 	rows, err := r.db.WithContext(ctx).Raw(`
 		SELECT a.version, eas.version, eas.data
-		FROM es_aggregate_snapshot eas
-		JOIN es_aggregate a ON eas.aggregate_id = a.id
+		FROM event_store.es_aggregate_snapshot eas
+		JOIN event_store.es_aggregate a ON eas.aggregate_id = a.id
 		WHERE eas.aggregate_id = ?
 			AND eas.version <= a.version
 		ORDER BY eas.version DESC
@@ -139,7 +141,7 @@ func (r *aggregateRepo) CreateSnapshot(ctx context.Context, agg eventsourcing.Ag
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
 	err = r.db.WithContext(ctx).Exec(`
-		INSERT INTO es_aggregate_snapshot (aggregate_id, version, data)
+		INSERT INTO event_store.es_aggregate_snapshot (aggregate_id, version, data)
 		VALUES(?, ?, ?)`, root.AggregateID(), root.Version(), data).Error
 	if err != nil {
 		return fmt.Errorf("insert snapshot: %w", err)

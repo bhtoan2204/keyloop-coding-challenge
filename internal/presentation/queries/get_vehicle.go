@@ -23,8 +23,8 @@ func (h *handlers) getVehicle(w http.ResponseWriter, r *http.Request) {
 		httpkit.WriteError(w, r, h.log, err)
 		return
 	}
-	// The ETag is the read-model version: it can lag the write side until the projector
-	// has applied the latest events.
+	// The ETag is the projected version, committed together with the events, so it is
+	// usable for If-Match immediately.
 	w.Header().Set("ETag", strconv.Quote(strconv.Itoa(res.Vehicle.Version)))
 	httpkit.WriteJSON(w, http.StatusOK, toVehicleDetailResponse(res))
 }

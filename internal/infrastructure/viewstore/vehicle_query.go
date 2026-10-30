@@ -8,7 +8,7 @@ import (
 )
 
 func (p *Postgres) GetVehicle(ctx context.Context, dealershipID, vehicleID string) (*query.Vehicle, error) {
-	rows, err := p.db.WithContext(ctx).Raw(`SELECT `+vehicleColumns+` FROM inventory_vehicle WHERE vehicle_id = ? AND dealership_id = ?`,
+	rows, err := p.db.WithContext(ctx).Raw(`SELECT `+vehicleColumns+` FROM read_model.inventory_vehicle WHERE vehicle_id = ? AND dealership_id = ?`,
 		vehicleID, dealershipID).Rows()
 	if err != nil {
 		return nil, fmt.Errorf("get vehicle: %w", err)

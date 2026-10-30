@@ -69,7 +69,7 @@ func TestReadAllRejectsUndecodableRows(t *testing.T) {
 	agg := newQty(t, "a")
 	addQty(t, agg, 1)
 	mustSave(t, store, agg)
-	mustExec(t, db, `UPDATE es_event SET schema_version = 2 WHERE aggregate_id = 'a'`)
+	mustExec(t, db, `UPDATE event_store.es_event SET schema_version = 2 WHERE aggregate_id = 'a'`)
 	err := repos.New(db, serializer).EventStore().ReadAll(context.Background(), 10, func(eventsourcing.Event) error { return nil })
 	if err == nil {
 		t.Fatal("expected an error for an unsupported schema version")

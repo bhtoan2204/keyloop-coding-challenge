@@ -8,9 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
+
+	"keyloop-coding-challenge/internal/testsupport/sqlitetest"
 
 	"keyloop-coding-challenge/internal/application/command"
 	"keyloop-coding-challenge/internal/domain"
@@ -21,9 +22,7 @@ import (
 	"keyloop-coding-challenge/internal/infrastructure/referencedata"
 	"keyloop-coding-challenge/package/eventsourcing"
 
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // now is 2026-10-29 in London and 2026-10-30 in Sydney.
@@ -67,13 +66,7 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	name := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
-	db, err := gorm.Open(sqlite.Open("file:"+name+"?mode=memory&cache=shared"), &gorm.Config{Logger: logger.Discard})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sqlDB, _ := db.DB()
-	t.Cleanup(func() { _ = sqlDB.Close() })
+	db := sqlitetest.Open(t)
 	if err := repos.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +102,7 @@ func (f *fixture) stock(t *testing.T, id string, ageDays int) {
 func (f *fixture) eventTypes(t *testing.T, id string) []string {
 	t.Helper()
 	var types []string
-	if err := f.db.Raw(`SELECT event_type FROM es_event WHERE aggregate_id = ? ORDER BY version`, id).Scan(&types).Error; err != nil {
+	if err := f.db.Raw(`SELECT event_type FROM event_store.es_event WHERE aggregate_id = ? ORDER BY version`, id).Scan(&types).Error; err != nil {
 		t.Fatal(err)
 	}
 	return types
@@ -134,7 +127,7 @@ func TestStockVehicle(t *testing.T) {
 		t.Fatalf("business date %s changed=%v", res.BusinessDate, res.Changed)
 	}
 	var md string
-	if err := f.db.Raw(`SELECT metadata FROM es_event WHERE aggregate_id = ?`, v.VehicleID()).Scan(&md).Error; err != nil {
+	if err := f.db.Raw(`SELECT metadata FROM event_store.es_event WHERE aggregate_id = ?`, v.VehicleID()).Scan(&md).Error; err != nil {
 		t.Fatal(err)
 	}
 	if md != `{"actor_id":"manager-42","correlation_id":"req-1"}` {

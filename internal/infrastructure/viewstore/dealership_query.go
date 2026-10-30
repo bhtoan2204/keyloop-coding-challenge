@@ -12,7 +12,7 @@ import (
 
 func (p *Postgres) DealershipLocation(ctx context.Context, dealershipID string) (*time.Location, error) {
 	var zone string
-	err := p.db.WithContext(ctx).Raw(`SELECT timezone FROM dealership WHERE dealership_id = ?`, dealershipID).Row().Scan(&zone)
+	err := p.db.WithContext(ctx).Raw(`SELECT timezone FROM event_store.dealership WHERE dealership_id = ?`, dealershipID).Row().Scan(&zone)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", query.ErrDealershipNotFound, dealershipID)
 	}

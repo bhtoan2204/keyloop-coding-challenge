@@ -403,3 +403,87 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
   - **Docker Compose v2.** Not installed: `docker` and `docker-compose` here are Podman and podman-compose wrappers. `docker compose up -d --build` therefore remains unverified on Docker. Under podman-compose it is known not to work, because of the `--requires` limitation found in Phase 6.
   - **No video was recorded.**
 - **Not done by the AI:** no commit or push.
+
+## Phase 7: PostgreSQL-only simplification (2026-10-30, branch `phase7-postgres-only`, uncommitted)
+
+- **Decision (developer):** replace `MySQL → Debezium → Kafka → projector → PostgreSQL` with one PostgreSQL database (schemas `event_store`, `read_model`), keeping ES/CQRS. The read model is projected synchronously, in the command's transaction. The developer wrote the brief; the AI implemented it.
+- **What was delegated to the AI:**
+  - **Implementation:** the save transaction, migrations, roles, the legacy read-model upgrade, the import script, the test port and the cleanup.
+  - **Documentation:** a helper agent updated the docs from a fact sheet; the AI reviewed its diff.
+  - **Review:** three read-only reviewer agents (Go, Event Sourcing, Security).
+- **Implemented:**
+  - **Save transaction (one `WithTransaction`):**
+    - shared projection advisory lock first;
+    - `es_aggregate` create, then compare-and-swap on the version;
+    - `INSERT … RETURNING id`, with the ids written back to the events;
+    - `Projection.Apply` on the same `*gorm.DB`, with no savepoint; a read model that is already ahead fails the save;
+    - snapshot, then commit;
+    - `Root.Update` runs after the commit; a nested save is refused.
+  - **Rebuild:** exclusive try-lock, then TRUNCATE and replay of `event_store` in the same transaction.
+  - **Migrations:** versioned, transactional per version, under advisory locks (the bootstrap `CREATE SCHEMA` included, after a concurrency test reproduced a 23505 race on `pg_namespace`).
+  - **Legacy upgrade:** moves the four Phase 4–6 tables with `SET SCHEMA`; drops nothing.
+  - **Roles:** app writer, reader and rebuild roles.
+  - **Import:** an explicit MySQL import script (`deploy/import/mysql-history.sh`).
+- **Removed** (`git rm`, after the PostgreSQL replacements passed):
+  - the `application/messaging`, `infrastructure/kafka`, `internal/pipeline` and `testsupport/mysqltest` packages;
+  - the projector probes and consumer metrics;
+  - `deploy/mysql` and `deploy/debezium`;
+  - the MySQL integration tests;
+  - the old projector-role test, replaced by `TestDeployedRolesHaveLeastPrivilege`.
+
+  `go mod tidy` dropped the MySQL driver, `gorm.io/driver/mysql`, franz-go and kmsg.
+- **Coverage kept:** the MySQL command-lifecycle, rejection, concurrent-proposal and failed-transaction tests were ported to PostgreSQL. The failed transaction now uses `lock_timeout` and also asserts the read model is unchanged. New tests:
+  - `TestReadAfterWriteIsImmediate`;
+  - projection-failure rollback with the pending events kept;
+  - a read model ahead of the event store fails the save;
+  - rebuild alongside concurrent commands;
+  - legacy upgrade: rows kept, atomic failure, partial layout refused;
+  - roles.
+
+  e2e now asserts immediate visibility instead of polling.
+- **Mutation check:** with the store ignoring projection errors, `TestReadModelAheadOfEventStoreFailsTheSave` failed (caught). The trigger-based rollback test still passed under that mutation, because PostgreSQL refuses to commit an aborted transaction. So that guarantee comes from the database, not only the store.
+- **Import verified manually:**
+  - the pre-Phase-7 binary was built from `git archive HEAD` and run against a throwaway MySQL 8.4 to write real history (including a note with tab, newline, backslash and Unicode);
+  - imported rows were byte-identical to MySQL, ids included;
+  - the next new event got id 15, after the imported 1..14;
+  - a gap, a time-zone conflict, an unmigrated target, a populated target and a non-empty export directory were each refused, with nothing written.
+- **Review findings:** none critical or major. Fixed:
+  - role and database name validation in compose and `make pg-grants`;
+  - `NOREPLICATION NOBYPASSRLS` added to the role scripts;
+  - import: `set -f`, EXPORT_DIR must be empty, the time-zone conflict check, and password-safe examples;
+  - a `t.Fatal` called from a goroutine (new `send` helper);
+  - a weak rollback assertion;
+  - a SQLite URI sanitiser;
+  - an ignored `DROP OWNED` error;
+  - documentation of the rebuild blocking and of the orphaned legacy read model.
+
+  One reviewer claim was rejected: that commands wait on the projection lock without limit. The `httpkit` middleware gives every request a 10 s context deadline. The other docs-agent mismatches were resolved in the code comments or documented as the code behaves.
+- **Left as reported:**
+  - `Migrate` has no ctx parameter;
+  - the projection is optional in the store constructor (only `cmd/api` wires it);
+  - the per-aggregate advisory lock is redundant in the command path;
+  - the MySQL export does not use one consistent snapshot (writers must be stopped; the verification catches mismatches);
+  - postgres images are tag-pinned only;
+  - `sslmode=disable` is dev-only.
+- **AI mistakes:**
+  - (1) `pkill -f "new-inventory api"` matched the AI's own shell again (exit 144) — the same class of error as the earlier `pgrep` incident.
+  - (2) The documented `docker compose run --rm rebuild` did not work under podman-compose (profile service). The clean-copy start found it, and every mention became `--profile tools run --rm --no-deps rebuild`.
+  - (3) The brief given to the docs agent wrongly said SQLSTATE 23505 maps to a concurrency conflict. The agent documented the code instead.
+  - (4) The guard hook blocked writing a `.env` even in scratch, as intended. The verify stack used exported variables.
+- **Verified (this session):**
+  - **Static checks:** `gofmt -l .` empty; `go vet` clean for the default, `integration` and `e2e` tags; `make check` exit 0 (26 ok packages).
+  - **Integration:** `make test-integration` exit 0 (134 PASS, 0 FAIL, 0 SKIP); the integration suite under `-race`: all packages ok.
+  - **Dependencies:** `govulncheck ./...` "No vulnerabilities found"; `go mod verify` ok.
+  - **Clean-copy stack:** a copy of the working tree with no `.env`, its own Compose project and ports. Results:
+    - `make stack-up` exit 0 (44 s), and exit 0 again on the populated volume;
+    - `make e2e` PASS;
+    - rebuild through Compose left an identical list;
+    - a restart of api and postgres kept the data;
+    - the API sessions are only `inventory_app` and `inventory_reader`; the roles have no superuser, replication or bypass-RLS rights;
+    - an invalid role name was refused by the grant job.
+- **Not verified:**
+  - Docker Compose v2 itself (the machine has the Podman wrappers);
+  - an import from the real old dev volumes (their credentials were lost earlier, so the developer must supply them);
+  - snapshots in the import (the runtime snapshot interval is 0, so the export had none);
+  - no video.
+- **Not done by the AI:** no commit, no push. The existing `keyloop_*` containers and volumes were left untouched. Throwaway resources (`keyloop-p7-pg`, `keyloop-p7-mysql`, the `keyloop-p7-verify` project) were the AI's own and were removed after verification.

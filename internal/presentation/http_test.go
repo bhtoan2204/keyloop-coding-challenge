@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"keyloop-coding-challenge/internal/testsupport/sqlitetest"
+
 	"keyloop-coding-challenge/internal/application/command"
 	"keyloop-coding-challenge/internal/domain/aggregates"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore"
@@ -23,9 +25,7 @@ import (
 	"keyloop-coding-challenge/internal/presentation"
 	"keyloop-coding-challenge/package/eventsourcing"
 
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -37,14 +37,12 @@ func (fixedClock) Now() time.Time { return time.Date(2026, 10, 29, 12, 0, 0, 0, 
 
 func newServer(t *testing.T) (*httptest.Server, *gorm.DB) {
 	t.Helper()
-	name := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
-	db, err := gorm.Open(sqlite.Open("file:"+name+"?mode=memory&cache=shared"), &gorm.Config{Logger: logger.Discard})
-	if err != nil {
+	db := sqlitetest.Open(t)
+	if err := repos.Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	sqlDB, _ := db.DB()
-	t.Cleanup(func() { _ = sqlDB.Close() })
-	if err := repos.Migrate(db); err != nil {
+	sqlDB, err := db.DB()
+	if err != nil {
 		t.Fatal(err)
 	}
 	serializer := eventsourcing.NewSerializer()
@@ -72,9 +70,18 @@ type reply struct {
 
 func do(t *testing.T, srv *httptest.Server, c call) reply {
 	t.Helper()
-	req, err := http.NewRequest(c.method, srv.URL+c.path, strings.NewReader(c.body))
+	r, err := send(srv, c)
 	if err != nil {
 		t.Fatal(err)
+	}
+	return r
+}
+
+// send is do without the test handle, for goroutines (t.Fatal must not be called there).
+func send(srv *httptest.Server, c call) (reply, error) {
+	req, err := http.NewRequest(c.method, srv.URL+c.path, strings.NewReader(c.body))
+	if err != nil {
+		return reply{}, err
 	}
 	if c.body != "" {
 		req.Header.Set("Content-Type", "application/json")
@@ -89,13 +96,13 @@ func do(t *testing.T, srv *httptest.Server, c call) reply {
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatal(err)
+		return reply{}, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	out := reply{status: resp.StatusCode, header: resp.Header, rawBody: string(raw)}
 	_ = json.Unmarshal(raw, &out.body)
-	return out
+	return out, nil
 }
 
 func (r reply) code() string { s, _ := r.body["code"].(string); return s }
@@ -144,7 +151,7 @@ func TestWriteAPIHappyPath(t *testing.T) {
 	}
 
 	var md string
-	if err := db.Raw(`SELECT metadata FROM es_event WHERE aggregate_id = 'v1' AND version = 1`).Scan(&md).Error; err != nil {
+	if err := db.Raw(`SELECT metadata FROM event_store.es_event WHERE aggregate_id = 'v1' AND version = 1`).Scan(&md).Error; err != nil {
 		t.Fatal(err)
 	}
 	if md != `{"actor_id":"manager-42","correlation_id":"req-abc"}` {
@@ -228,7 +235,7 @@ func (s stubService) SellVehicle(context.Context, command.SellVehicle, command.M
 }
 
 func TestInfrastructureErrorsAreMappedWithoutLeakingDetails(t *testing.T) {
-	secret := "Error 1045: Access denied for user 'root'@'10.0.0.1' (using password: YES) SELECT * FROM es_event"
+	secret := "Error 1045: Access denied for user 'root'@'10.0.0.1' (using password: YES) SELECT * FROM event_store.es_event"
 	cases := []struct {
 		name   string
 		err    error

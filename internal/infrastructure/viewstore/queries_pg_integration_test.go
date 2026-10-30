@@ -14,6 +14,7 @@ import (
 	"keyloop-coding-challenge/internal/application/query"
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/events"
+	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/internal/infrastructure/projection"
 	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
 	"keyloop-coding-challenge/internal/infrastructure/viewstore"
@@ -43,6 +44,9 @@ type fixture struct {
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	db, dsn := pgtest.NewDatabase(t)
+	if err := repos.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
 	if err := viewstore.Migrate(db); err != nil {
 		t.Fatal(err)
 	}

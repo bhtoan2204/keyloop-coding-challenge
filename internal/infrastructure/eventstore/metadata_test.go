@@ -33,7 +33,7 @@ func TestSaveWithMetadataPersistsAndReplays(t *testing.T) {
 		}
 	}
 	var raw string
-	if err := db.Raw(`SELECT metadata FROM es_event WHERE aggregate_id = ? AND version = 1`, "inv").Scan(&raw).Error; err != nil {
+	if err := db.Raw(`SELECT metadata FROM event_store.es_event WHERE aggregate_id = ? AND version = 1`, "inv").Scan(&raw).Error; err != nil {
 		t.Fatal(err)
 	}
 	if raw != `{"actor_id":"manager-42","correlation_id":"req-1"}` {

@@ -12,9 +12,7 @@ import (
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
 	"keyloop-coding-challenge/package/eventsourcing"
 
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 type qtyEvent struct {
@@ -195,7 +193,7 @@ func TestReplayErrors(t *testing.T) {
 		agg := newQty(t, "inv")
 		addQty(t, agg, 1)
 		mustSave(t, store, agg)
-		if err := db.Exec(`UPDATE es_event SET event_type = ? WHERE aggregate_id = ?`, "MissingEvent", "inv").Error; err != nil {
+		if err := db.Exec(`UPDATE event_store.es_event SET event_type = ? WHERE aggregate_id = ?`, "MissingEvent", "inv").Error; err != nil {
 			t.Fatal(err)
 		}
 		err := store.Get(context.Background(), "inv", &qtyAggregate{})
@@ -209,11 +207,11 @@ func TestReplayErrors(t *testing.T) {
 		agg := newQty(t, "inv")
 		addQty(t, agg, 1)
 		mustSave(t, store, agg)
-		if err := db.Exec(`UPDATE es_aggregate SET version = 3 WHERE id = ?`, "inv").Error; err != nil {
+		if err := db.Exec(`UPDATE event_store.es_aggregate SET version = 3 WHERE id = ?`, "inv").Error; err != nil {
 			t.Fatal(err)
 		}
-		if err := db.Exec(`INSERT INTO es_event(aggregate_id, event_type, version, data, metadata, created_at) VALUES(?, ?, ?, ?, ?, ?)`,
-			"inv", "qtyEvent", 3, `{"delta":1}`, "null", 1).Error; err != nil {
+		if err := db.Exec(`INSERT INTO event_store.es_event(aggregate_id, aggregate_type, event_type, version, data, metadata, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+			"inv", "qtyAggregate", "qtyEvent", 3, `{"delta":1}`, "null", 1).Error; err != nil {
 			t.Fatal(err)
 		}
 		err := store.Get(context.Background(), "inv", &qtyAggregate{})
@@ -227,7 +225,7 @@ func TestReplayErrors(t *testing.T) {
 		agg := newQty(t, "inv")
 		addQty(t, agg, 1)
 		mustSave(t, store, agg)
-		if err := db.Exec(`UPDATE es_aggregate SET version = 3 WHERE id = ?`, "inv").Error; err != nil {
+		if err := db.Exec(`UPDATE event_store.es_aggregate SET version = 3 WHERE id = ?`, "inv").Error; err != nil {
 			t.Fatal(err)
 		}
 		err := store.Get(context.Background(), "inv", &qtyAggregate{})
@@ -307,7 +305,7 @@ func TestSnapshotIntervalChange(t *testing.T) {
 	if versions := snapshotVersions(t, db, "inv"); !reflect.DeepEqual(versions, []int{2, 5}) {
 		t.Fatalf("snapshots after tighter interval: %v", versions)
 	}
-	if err := db.Exec(`DELETE FROM es_event WHERE aggregate_id = ?`, "inv").Error; err != nil {
+	if err := db.Exec(`DELETE FROM event_store.es_event WHERE aggregate_id = ?`, "inv").Error; err != nil {
 		t.Fatal(err)
 	}
 	final := mustLoad(t, tight, "inv")
@@ -389,16 +387,17 @@ func TestDuplicateEventVersion(t *testing.T) {
 
 	es := repos.New(db, serializer).EventStore()
 	duplicate := eventsourcing.Event{AggregateID: "inv", AggregateType: "qtyAggregate", Version: 1, EventType: "qtyEvent", Data: &qtyEvent{Delta: 9}, CreatedAt: 1}
-	if err := es.Append(context.Background(), duplicate); !errors.Is(err, eventstore.ErrDuplicateEvent) {
+	if _, err := es.Append(context.Background(), duplicate); !errors.Is(err, eventstore.ErrDuplicateEvent) {
 		t.Fatalf("duplicate: %v", err)
 	}
 
 	err := es.WithTransaction(context.Background(), func(tx repos.EventStore) error {
 		next := eventsourcing.Event{AggregateID: "inv", AggregateType: "qtyAggregate", Version: 2, EventType: "qtyEvent", Data: &qtyEvent{Delta: 1}, CreatedAt: 1}
-		if err := tx.Append(context.Background(), next); err != nil {
+		if _, err := tx.Append(context.Background(), next); err != nil {
 			return err
 		}
-		return tx.Append(context.Background(), duplicate)
+		_, err := tx.Append(context.Background(), duplicate)
+		return err
 	})
 	if !errors.Is(err, eventstore.ErrDuplicateEvent) {
 		t.Fatalf("duplicate in transaction: %v", err)
@@ -417,32 +416,6 @@ func newStore(t *testing.T, interval int) (*gorm.DB, eventsourcing.Serializer, e
 	}
 	store := eventstore.NewAggregateStoreWithSnapshotInterval(repos.New(db, serializer), interval)
 	return db, serializer, store
-}
-
-// openDB returns a migrated database for one test. The default is in-memory SQLite;
-// building with -tags integration switches it to a throwaway MySQL database
-// (see mysql_integration_test.go), so the same tests verify both engines.
-var openDB = openSQLiteDB
-
-func openSQLiteDB(t *testing.T) *gorm.DB {
-	t.Helper()
-	name := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
-	dsn := "file:" + name + "?mode=memory&cache=shared"
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Discard})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	sqlDB.SetMaxOpenConns(2)
-	sqlDB.SetMaxIdleConns(2)
-	if err := repos.Migrate(db); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = sqlDB.Close() })
-	return db
 }
 
 func newQty(t *testing.T, id string) *qtyAggregate {
@@ -480,7 +453,7 @@ func mustLoad(t *testing.T, store eventstore.AggregateStore, id string) *qtyAggr
 func eventVersions(t *testing.T, db *gorm.DB, id string) []int {
 	t.Helper()
 	var rows []struct{ Version int }
-	if err := db.Raw(`SELECT version FROM es_event WHERE aggregate_id = ? ORDER BY version ASC`, id).Scan(&rows).Error; err != nil {
+	if err := db.Raw(`SELECT version FROM event_store.es_event WHERE aggregate_id = ? ORDER BY version ASC`, id).Scan(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
 	versions := make([]int, len(rows))
@@ -493,7 +466,7 @@ func eventVersions(t *testing.T, db *gorm.DB, id string) []int {
 func snapshotVersions(t *testing.T, db *gorm.DB, id string) []int {
 	t.Helper()
 	var rows []struct{ Version int }
-	if err := db.Raw(`SELECT version FROM es_aggregate_snapshot WHERE aggregate_id = ? ORDER BY version ASC`, id).Scan(&rows).Error; err != nil {
+	if err := db.Raw(`SELECT version FROM event_store.es_aggregate_snapshot WHERE aggregate_id = ? ORDER BY version ASC`, id).Scan(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
 	versions := make([]int, len(rows))
@@ -506,7 +479,7 @@ func snapshotVersions(t *testing.T, db *gorm.DB, id string) []int {
 func snapshotData(t *testing.T, db *gorm.DB, id string, version int) string {
 	t.Helper()
 	var row struct{ Data string }
-	if err := db.Raw(`SELECT data FROM es_aggregate_snapshot WHERE aggregate_id = ? AND version = ?`, id, version).Scan(&row).Error; err != nil {
+	if err := db.Raw(`SELECT data FROM event_store.es_aggregate_snapshot WHERE aggregate_id = ? AND version = ?`, id, version).Scan(&row).Error; err != nil {
 		t.Fatal(err)
 	}
 	return row.Data
@@ -514,7 +487,7 @@ func snapshotData(t *testing.T, db *gorm.DB, id string, version int) string {
 
 func deleteEventsUpTo(t *testing.T, db *gorm.DB, id string, version int) {
 	t.Helper()
-	if err := db.Exec(`DELETE FROM es_event WHERE aggregate_id = ? AND version <= ?`, id, version).Error; err != nil {
+	if err := db.Exec(`DELETE FROM event_store.es_event WHERE aggregate_id = ? AND version <= ?`, id, version).Error; err != nil {
 		t.Fatal(err)
 	}
 }

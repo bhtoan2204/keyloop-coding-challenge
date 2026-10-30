@@ -15,6 +15,4 @@ type (
 	QueryService = queries.Service
 	// ReadinessCheck reports whether the process's dependencies are reachable.
 	ReadinessCheck = probes.ReadinessCheck
-	// ConsumerStatus is implemented by (*messaging.Consumer).Status.
-	ConsumerStatus = probes.ConsumerStatus
 )

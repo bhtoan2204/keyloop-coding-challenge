@@ -4,6 +4,8 @@ Backend for a dealership inventory dashboard. It lists each dealership's vehicle
 
 The detailed design notes this document summarises are in `docs/01`–`08`. The API contract is [`api/openapi.yaml`](../api/openapi.yaml).
 
+**History.** Until Phase 7 the system ran a MySQL event store, Debezium, Kafka and a separate projector process that fed a PostgreSQL read model. The developer decided to replace that with one PostgreSQL database (§15). The earlier design and the reasons it was chosen remain in `docs/02`, `04`, `05` and `07`, marked as superseded.
+
 ## 1. Requirements and assumptions
 
 | ID | Requirement (from the challenge PDF) | Where it is met |
@@ -12,9 +14,9 @@ The detailed design notes this document summarises are in `docs/01`–`08`. The 
 | B2 | Filter by make, model and age | `make`, `model` (exact, case-insensitive), `min_age_days`, `max_age_days` (inclusive) |
 | B3 | Aging (> 90 days in stock) identified **automatically** | `is_aging` is computed at request time from `stocked_on` and the dealership's business date: no job, no stored flag |
 | B4 | Aging stock shown **prominently** | `aging=true` filter, oldest-first default sort, `GET …/inventory/summary` (in stock, aging, aging without action) |
-| B5 | A manager logs and persists a status / proposed action per aging vehicle | `POST …/actions`, `PUT …/actions/{id}`, `POST …/cancel` as events in MySQL |
+| B5 | A manager logs and persists a status / proposed action per aging vehicle | `POST …/actions`, `PUT …/actions/{id}`, `POST …/cancel` as events in `event_store.es_event` |
 | B6 | Current action and its history | `current_action` on reads; `GET …/actions` (audit trail with actor and correlation ID) |
-| B7 | "Real-time" overview | Read model updated by CDC, median ≈ 0.5 s on one host (§12); aging needs no refresh |
+| B7 | "Real-time" overview | The read model is updated in the command's own transaction: a query after a command already sees it. Aging needs no refresh. |
 
 **Assumptions** (`docs/01` §3):
 
@@ -25,7 +27,7 @@ The detailed design notes this document summarises are in `docs/01`–`08`. The 
 - **Tenancy.** Every request is scoped by the dealership in the URL. A vehicle of another dealership returns 404.
 - **Vehicle source.** Vehicles enter only through the API (no DMS integration). `stocked_on` is a business fact and may be in the past.
 
-**Self-imposed (not required by the PDF), justified below:** Event Sourcing and CQRS, a MySQL event store, Debezium/Kafka change data capture, and a PostgreSQL read model.
+**Self-imposed (not required by the PDF), justified below:** Event Sourcing and CQRS, with the event store and the read model as two schemas of one PostgreSQL database.
 
 ## 2. Architecture
 
@@ -38,41 +40,35 @@ flowchart LR
     H[presentation<br/>commands · queries · probes]
     C[application/command<br/>load → rule → save, retry]
     Q[application/query<br/>aging at request time]
+    S[eventstore.AggregateStore<br/>+ CommandProjection]
   end
-  subgraph Write["Write side — MySQL 8.4"]
-    ES[(es_aggregate · es_event<br/>append-only)]
+  subgraph PG["PostgreSQL 17 — one database"]
+    ES[(event_store<br/>es_aggregate · es_event · dealership)]
+    RM[(read_model<br/>inventory_vehicle · vehicle_action_history<br/>projection_aggregate)]
   end
-  subgraph CDC["Change feed"]
-    DBZ[Debezium MySQL connector<br/>Kafka Connect]
-    K[(Kafka topic<br/>key = aggregate_id, 3 partitions)]
-  end
-  subgraph Proj["inventory projector (Go)"]
-    M[application/messaging<br/>decode · order · repair · commit]
-    P[projection.Apply<br/>one PG transaction per event]
-  end
-  subgraph Read["Read side — PostgreSQL 17"]
-    RM[(inventory_vehicle · vehicle_action_history<br/>projection_aggregate)]
-  end
-  UI -- POST/PUT --> H --> C --> ES
-  UI -- GET --> H --> Q --> RM
-  ES -- binlog --> DBZ --> K --> M --> P --> RM
-  M -. gap repair / startup sync .-> ES
+  R[rebuild-projections<br/>one-shot, recovery]
+  UI -- POST/PUT --> H --> C --> S
+  S -- "one transaction: CAS + append + projection" --> ES
+  S --> RM
+  UI -- GET --> H --> Q -- read-only role --> RM
+  R -. replay in one transaction .-> ES
+  R -.-> RM
 ```
 
 | Component | Role | Technology and why |
 |---|---|---|
-| API (`cmd api`) | REST commands and queries, problem+json errors, probes, metrics, OpenAPI | Go stdlib `net/http` routing. No framework is needed for 9 endpoints. |
+| API (`cmd api`) | REST commands and queries, problem+json errors, probes, metrics, OpenAPI | Go stdlib `net/http` routing. No framework is needed for 9 endpoints. Two connection pools: commands as the writer role, queries as the read-only role. |
 | Command service | Loads the aggregate, applies the business rule at the dealership business date, saves with optimistic concurrency, retries on conflict | The `package/eventsourcing` framework already in the repository is extended rather than replaced. |
-| Event store | `es_aggregate` (version CAS) and `es_event` (append-only, `UNIQUE(aggregate_id, version)`) | MySQL 8.4: transactional, row-based binlog for CDC. This was the existing GORM store. |
-| Debezium + Kafka | Streams committed `es_event` rows in commit order, keyed by vehicle | The binlog is the outbox, so events and their publication commit atomically without a dual write. Kafka gives per-key ordering, replay and consumer groups. |
-| Projector (`cmd projector`) | Applies the change feed to the read model; bootstraps and recovers from MySQL | A separate process that scales independently of the API. franz-go is a pure-Go Kafka client with manual offset control. |
-| Read model | Denormalised current state, action history, applied version per vehicle | PostgreSQL 17: keyset pagination, partial-index-friendly queries, read-only role for the API. |
+| Event store (`event_store` schema) | `es_aggregate` (version CAS) and `es_event` (append-only, `UNIQUE(aggregate_id, version)`), `dealership` reference data | PostgreSQL through GORM with raw SQL (the existing store). |
+| Command projection | Applies the command's events to the read model inside the save transaction | The same `Projection.Apply` and `VehicleProjector` a rebuild uses. |
+| Read model (`read_model` schema) | Denormalised current state, action history, applied version per vehicle | Keyset pagination, index-friendly queries, read-only role for queries. |
+| Rebuild (`cmd rebuild-projections`) | Replaces the read model with a replay of the whole event store | One transaction under an exclusive advisory lock, as a separate rebuild role. |
 
 **Packages** follow `presentation → application → domain`. Infrastructure implements ports declared by the application:
 
 - `internal/domain`: aggregate, events, `Date`, aging rule. No I/O.
-- `internal/application`: `command`, `query`, `messaging`.
-- `internal/infrastructure`: `eventstore`, `viewstore`, `projection`, `kafka`, `referencedata`.
+- `internal/application`: `command`, `query`.
+- `internal/infrastructure`: `eventstore` (+ `repos`, `commandstore`), `viewstore`, `projection`, `referencedata`.
 - `internal/presentation`: `commands`, `queries`, `probes`, `apidocs`, `httpkit`.
 
 A test pins the presentation sub-package dependency direction.
@@ -85,7 +81,8 @@ sequenceDiagram
   participant API as presentation/commands
   participant Svc as command.Service
   participant Agg as VehicleInventoryAggregate
-  participant Store as AggregateStore (MySQL)
+  participant Store as AggregateStore
+  participant PG as PostgreSQL
   Client->>API: POST …/actions (X-Actor-Id, If-Match?)
   API->>API: strict JSON, validate headers, map to command
   API->>Svc: ProposeAction(target, meta)
@@ -94,8 +91,10 @@ sequenceDiagram
     Svc->>Svc: check dealership ownership, If-Match
     Svc->>Agg: ProposeAction(cmd, business date)
     Agg->>Agg: invariants → ApplyChange(event)
-    Svc->>Store: SaveWithMetadata — one transaction
-    Note over Store: CAS es_aggregate.version → INSERT es_event(s)
+    Svc->>Store: SaveWithMetadata
+    Store->>PG: BEGIN
+    Note over Store,PG: 1 projection lock (shared)<br/>2 create es_aggregate if missing<br/>3 CAS es_aggregate.version<br/>4 INSERT es_event … RETURNING id<br/>5 Projection.Apply → read_model<br/>6 optional snapshot
+    Store->>PG: COMMIT
     alt version changed concurrently
       Store-->>Svc: ErrConcurrencyConflict → reload and re-run
     end
@@ -104,25 +103,28 @@ sequenceDiagram
   API-->>Client: 201, ETag "n", Location, state at business date
 ```
 
-- The business date is resolved once per command from the dealership's time zone (MySQL `dealership` reference table). The domain never calls `time.Now()`.
+- The business date is resolved once per command from the dealership's time zone (`event_store.dealership`). The domain never calls `time.Now()`.
 - Metadata stored with every event: `actor_id` (`X-Actor-Id`), `correlation_id` (`X-Request-Id`) and, when valid, `traceparent`.
-- The response is the **write-side** state. The acting manager therefore never sees read-model lag on their own command.
+- The generated `es_event.id` values are written back into the events before they are projected, so the history's `event_id` is the real database id.
+- Pending events are acknowledged (`Update()`) only after the commit. A save inside an outer transaction is refused (`ErrNestedSave`), so a save always owns its commit.
 
 ## 4. Event Store design
 
 ```
-es_aggregate(id PK, version, aggregate_type)                    -- one row per vehicle: the concurrency token
-es_event(id AUTO_INCREMENT PK, aggregate_id, aggregate_type, event_type, version,
-         schema_version, data JSON-as-TEXT, metadata, created_at,
-         UNIQUE(aggregate_id, version))                        -- append-only history
-es_aggregate_snapshot(aggregate_id, version, data)              -- supported, disabled for vehicles (interval 0)
+event_store.es_aggregate(id PK, version, aggregate_type)          -- one row per vehicle: the concurrency token
+event_store.es_event(id BIGINT GENERATED BY DEFAULT AS IDENTITY PK, aggregate_id, aggregate_type, event_type,
+                     version, schema_version, data JSON-as-TEXT, metadata, created_at,
+                     UNIQUE(aggregate_id, version))                -- append-only history
+event_store.es_aggregate_snapshot(aggregate_id, version, data)     -- supported, disabled for vehicles (interval 0)
+event_store.dealership(dealership_id PK, name, timezone)           -- canonical reference data
 ```
 
-- **Atomic save:** the CAS `UPDATE es_aggregate SET version = new WHERE id = ? AND version = expected`, all `INSERT es_event` rows and an optional snapshot run in **one** transaction.
-- **Append-only:** the application user has `INSERT, SELECT` on `es_event` only, with no `UPDATE`/`DELETE` (`deploy/mysql/grants.sql`, tested).
-- **Event names are Go type names and are frozen:** `VehicleStockedEvent`, `VehicleActionProposedEvent`, `VehicleActionRevisedEvent`, `VehicleActionCancelledEvent`, `VehicleSoldEvent`.
+- **Atomic save:** the CAS `UPDATE es_aggregate SET version = new WHERE id = ? AND version = expected`, all `INSERT es_event` rows, the read-model update and an optional snapshot run in **one** transaction.
+- **Append-only:** the application writer has `SELECT, INSERT` on `es_event` only, with no `UPDATE`/`DELETE`/`TRUNCATE` (`deploy/postgres/app-grants.sql`, tested).
+- **Event names are Go type names and are frozen:** `VehicleStockedEvent`, `VehicleActionProposedEvent`, `VehicleActionRevisedEvent`, `VehicleActionCancelledEvent`, `VehicleSoldEvent`. Payloads and the serializer did not change in Phase 7.
 - **Schema evolution:** payloads carry `schema_version`, and readers reject versions they do not know rather than guess. Changes must be additive; a breaking change needs a new schema version and an upcaster.
-- **Migrations:** versioned and additive (v1 original DDL, v2 `aggregate_type` and `schema_version`, v3 dealership reference data), serialised with `GET_LOCK`. A database newer than the binary is refused.
+- **Migrations:** versioned per schema (`event_store` v1 tables, v2 dealership), one transaction per version, serialised with an advisory lock. A database newer than the binary is refused.
+- **Identity `BY DEFAULT`:** lets the one-off MySQL import keep the original event ids ([mysql-import.md](mysql-import.md)); the sequence is then moved past them.
 - **Snapshots:** the framework supports them, and the round trip is tested through the real store. Vehicles keep them off because their streams are short (stock, a few actions, sale).
 
 ## 5. Aggregate modelling
@@ -142,79 +144,64 @@ Versions run contiguously from 1. Aging is a **pure function** of `stocked_on`, 
 ## 6. CQRS read model
 
 ```
-dealership(dealership_id, name, timezone)                                     -- reference copy
-inventory_vehicle(vehicle_id PK, dealership_id, vin, make, model, model_year, stocked_on,
-                  status, sold_on, action_* (current action), version, last_event_id, updated_at)
-vehicle_action_history(vehicle_id, version PK, event_id, action_id, change, action_type,
-                       note, reason, actor_id, correlation_id, occurred_at)
-projection_aggregate(aggregate_id PK, version, last_event_id)                 -- applied version per vehicle
-projection_run(kind, started_at, finished_at, events_read, events_applied)    -- sync/rebuild audit
+read_model.inventory_vehicle(vehicle_id PK, dealership_id FK → event_store.dealership, vin, make, model,
+                             model_year, stocked_on, status, sold_on, action_* (current action),
+                             version, last_event_id, updated_at)
+read_model.vehicle_action_history(vehicle_id, version PK, event_id, action_id, change, action_type,
+                                  note, reason, actor_id, correlation_id, occurred_at)
+read_model.projection_aggregate(aggregate_id PK, version, last_event_id, updated_at)  -- applied version per vehicle
+read_model.projection_run(run_id, kind, started_at, finished_at, events_read, events_applied)  -- rebuild audit
 ```
 
-- **Writes:** only the projection writes, as the projection-writer role `inventory_projector` (no superuser, no schema changes). The API reads as a role with `SELECT` on four tables. Migrations alone use the admin account.
+- **The CQRS split remains:** a separate write model (event store) and read model, separate pools and roles. It is synchronous now, not asynchronous.
+- **Writes:** only `Projection.Apply` writes the projected tables: inside a command's save transaction (as the application writer) or inside a rebuild (as `inventory_rebuild`). Queries read as `inventory_reader`, which has `SELECT` on the read-model tables and `event_store.dealership` only. Only `migrate` changes the schema.
 - **Queries:**
   - age and aging are computed in Go with the domain rule at the business date;
   - the filters are translated to sargable `stocked_on` bounds;
   - the summary uses the same cutoff as the list (tested equal).
 - **Pagination** is keyset on `(stocked_on, vehicle_id)`. The cursor is opaque and pins `as_of` and a fingerprint of the filters, so a changed filter or a midnight crossing returns `400 INVALID_CURSOR` instead of skipping or repeating rows.
+- **Upgrade of earlier data:** `migrate` moves a Phase 4–6 read model from `public` into `read_model` in place (rows, indexes and sequences kept, nothing dropped; a partial layout is refused).
 
-## 7. Debezium and Kafka pipeline
+## 7. Projection inside the command transaction
 
-- **Capture:** the connector (`deploy/debezium/es-event-connector.json`) captures `inventory.es_event` only.
-  - Key: `aggregate_id`. Values: JSON without schemas. Only those settings and the full envelope (no unwrap SMT).
-  - The snapshot is ordered by `(aggregate_id, version)`, with `snapshot.mode=when_needed`.
-  - `skipped.operations=none`, so updates, deletes and truncates of the append-only table are **emitted and detected**, not dropped.
-- **Topic:** `inventory.inventory.es_event`, 3 partitions, 7-day retention. One vehicle's events share a partition and keep commit order. Connect producers run with `acks=all` and `max.in.flight=1`.
-- **Consumer** (`internal/application/messaging`, transport `internal/infrastructure/kafka`):
-  1. Decode the key and the envelope; accept only `op` `c`/`r` on `es_event`, with the key equal to the row.
-  2. Deserialise with the same serializer registrations as the event store.
-  3. Apply through `Projection.Apply`.
-  4. Commit the Kafka offset only after the PostgreSQL commit.
-  5. Process partitions in parallel, records within a partition strictly in order.
-  6. Block rebalances between poll and commit.
-- **Poison and errors:** a failing record halts its partition (rewind and backoff, never skip); poison is logged at ERROR and makes the process not ready. Details: `docs/05` §7.
+- **Same code as a rebuild.** `CommandProjection` (`internal/infrastructure/projection/command_projection.go`) wraps the command's `*gorm.DB` transaction in a `viewstore.Postgres` and calls `Projection.Apply` for each event, with no savepoints.
+- **Version check per vehicle:** `Projection.Apply` takes a transaction-scoped advisory lock on the vehicle and reads its applied version:
+  - `version = applied + 1`: state, history and the applied version are written;
+  - `version > applied + 1`: `ErrVersionGap`, the save fails;
+  - `version ≤ applied`: the read model is **ahead** of the event store (for example restored separately). The command save fails with `ErrVersionGap` instead of committing over the divergence; run a rebuild.
+- **Any projection error rolls back the whole save:** the events, the CAS and the read model. The pending events stay on the aggregate (tested).
+- **Lock order:** every save takes the projection advisory lock (`pg_advisory_xact_lock_shared(52003, 0)`) before it touches any event-store row; a rebuild takes the same lock exclusively. All writers therefore acquire locks in the same order.
 
 ## 8. Data consistency model
 
 | Side | Guarantee |
 |---|---|
-| Write (MySQL) | Strongly consistent per vehicle: serialised by the version CAS. Command responses show committed state. |
-| Read (PostgreSQL) | **Eventually consistent**, monotonic per vehicle: the version check means a row never moves backwards. No cross-vehicle snapshot consistency. |
-| Read-your-writes | By version comparison: the command response carries `version`; a GET may briefly show an older one. |
+| Write (`event_store`) | Strongly consistent per vehicle: serialised by the version CAS. Command responses show committed state. |
+| Read (`read_model`) | Updated in the same transaction as the events: no event commits without its read-model update and vice versa. |
+| Read-your-writes | Immediate. Queries use a separate read-only pool against the same primary, so a GET after a command's response sees its version; the detail `ETag` can be used for `If-Match` at once. |
 | Aging | Never stale: computed per request from immutable `stocked_on`. |
 
-**At-least-once end to end; idempotent by version.** `Projection.Apply` locks the vehicle with `pg_advisory_xact_lock`, which also covers a vehicle with no row yet, and reads its applied version:
-
-- `version ≤ applied`: a duplicate, skipped;
-- `version = applied + 1`: applied, and state, history and the applied version commit in one transaction;
-- otherwise: a gap (§10).
-
-Exactly-once across MySQL → Kafka → PostgreSQL is **not** claimed.
+The read model is no longer eventually consistent. Cross-vehicle snapshot consistency within one query follows PostgreSQL's READ COMMITTED statement snapshot.
 
 ## 9. Concurrency and optimistic locking
 
 - **Writers of one vehicle race on the `es_aggregate` CAS.** The loser gets `ErrConcurrencyConflict`; the service reloads and re-runs the command (3 attempts), so the rule is re-evaluated on fresh state. It is never a blind re-insert.
-- **The unique `(aggregate_id, version)` is the second guard.**
-- **A MySQL deadlock was found and fixed.** `INSERT IGNORE` + CAS under concurrent creation produced error 1213, reproduced by tests and fixed with `INSERT … ON DUPLICATE KEY UPDATE`. Lock waits and deadlocks map to a retryable error.
-- **Tested on MySQL 8.4:** N goroutines saving the same vehicle → exactly one winner, contiguous versions. 16 concurrent `ProposeAction` requests over HTTP (5 rounds) → exactly one 201 and 15 × `409 ACTION_ALREADY_ACTIVE` per round.
+- **Creation of a new vehicle:** `INSERT … ON CONFLICT (id) DO NOTHING` makes a concurrent creator wait for the first one's commit; the CAS then decides the winner.
+- **The unique `(aggregate_id, version)` is the second guard.** A violation there is reported as `ErrDuplicateEvent` (not retried); the CAS normally prevents it.
+- **Retryable PostgreSQL errors:** `40001` serialization failure, `40P01` deadlock, `55P03` lock not available → `ErrRetryable`; the transaction was rolled back, so a reload-and-retry is safe.
+- **Covered by PostgreSQL 17 integration tests:** N goroutines saving the same vehicle → exactly one winner, contiguous versions; concurrent `ProposeAction` requests over HTTP → exactly one 201 and `409 ACTION_ALREADY_ACTIVE` for the rest.
 - **`If-Match`** gives clients an explicit precondition. A stale ETag returns `412 VERSION_MISMATCH` even when it is discovered during a retry, and takes precedence over a conflict.
-- **Projector concurrency:**
-  - a shared projection lock for each event transaction, and an exclusive one for sync and rebuild runs;
-  - per-vehicle advisory locks;
-  - partitions processed in parallel, never two goroutines on one partition (fetches are merged per partition).
+- **Rebuild versus commands:** commands hold the projection lock shared from before the CAS until commit; a rebuild needs it exclusively (`pg_try_advisory_xact_lock`). A rebuild is refused while commands are in flight or another rebuild runs; commands that arrive during a rebuild wait for it to commit (tested with interleaved commands).
 
 ## 10. Idempotency, retries and recovery
 
 | Boundary | Behaviour |
 |---|---|
 | HTTP command | **No `Idempotency-Key`** (cut for time). Most retries are safe by business rule: re-stocking the same `vehicle_id` gives 409, proposing while active gives 409, an identical revision records nothing. `If-Match` makes a retry conditional. A `503` means the outcome is unknown: read the vehicle before retrying. |
-| Command service | Bounded reload-and-retry on optimistic conflicts and retryable MySQL errors only. |
-| Debezium | At-least-once; resumes from its binlog offset; re-snapshots `when_needed`. Duplicates are skipped by version. |
-| Projector | Offset committed after the PG commit. A crash before the PG commit re-applies; a crash after it re-reads and skips. A failing record is retried in place with backoff; other partitions continue. |
-| Gap in the feed | Versions `1…v−1` are read from MySQL (`ReadStream`) and applied first. If MySQL lacks them too, the partition halts (poison). |
-| Startup | `Runner.Sync` applies everything committed before the projector joins its group, from one consistent MySQL snapshot. |
-| Kafka retention / log truncation | franz-go reports data loss; the consumer re-syncs from MySQL before continuing. |
-| Rebuild | `rebuild-projections` truncates and replays the full MySQL history in one transaction under the exclusive lock, safe while the projector runs. |
+| Command service | Bounded reload-and-retry on optimistic conflicts and retryable PostgreSQL errors only. Connection loss, server shutdown, `57014` query cancelled and context cancellation are **not** retried: around a commit the outcome is unknown. |
+| Projection failure | The whole save rolls back (events, CAS, read model); the command fails and nothing is reported as success. |
+| Read model lost or diverged | `rebuild-projections`: one transaction, exclusive lock, `TRUNCATE` of the projected tables, keyset-batched replay of all of `event_store` in the same transaction, a `projection_run` row, commit. Any failure rolls back everything, leaving the old read model. Running it twice gives the same read model. |
+| Earlier MySQL history | Explicit one-off import ([mysql-import.md](mysql-import.md)) into an empty `event_store`, then a rebuild. |
 
 ## 11. Aging calculations and indexing
 
@@ -224,7 +211,7 @@ Exactly-once across MySQL → Kafka → PostgreSQL is **not** claimed.
   - `aging=true` → `status = 'IN_STOCK' AND stocked_on <= business_date − 91`;
   - `min_age_days` → `stocked_on <= bd − min`;
   - `max_age_days` → `stocked_on >= bd − max`.
-- **Indexes:** `(dealership_id, status, stocked_on, vehicle_id)` serves the default list, aging, both sorts and keyset paging; `(dealership_id, status, lower(make), lower(model), stocked_on, vehicle_id)` serves make/model filters. Index use was verified with `EXPLAIN` on 5,000 rows.
+- **Indexes:** `(dealership_id, status, stocked_on, vehicle_id)` serves the default list, aging, both sorts and keyset paging; `(dealership_id, status, lower(make), lower(model), stocked_on, vehicle_id)` serves make/model filters. Index use is checked with `EXPLAIN` in an integration test.
 - **Boundary tests:** 89/90/91 days, leap years, the year boundary, time zones (London / Sydney) and DST, in the domain, the SQL and the end-to-end flow.
 
 ## 12. Failure scenarios
@@ -232,85 +219,81 @@ Exactly-once across MySQL → Kafka → PostgreSQL is **not** claimed.
 | Scenario | Effect | Handling |
 |---|---|---|
 | Two managers act on the same vehicle | One wins | Loser retried on fresh state → 409 (rule) or success; `If-Match` → 412 |
-| MySQL unavailable | Commands fail | `503 UNAVAILABLE` + `Retry-After`; API `/readyz` 503 |
-| PostgreSQL unavailable | Queries fail; projector retries the record | Queries return `500 INTERNAL` (only a request timeout maps to 503); projector partition halted (not ready) until PG returns; nothing skipped |
-| Kafka down | No propagation | Projector `/readyz` 503 (verified by stopping Kafka: 503 at once, 200 again 11 s after restart); commands still succeed |
-| Connector restarted, paused or re-created | Possible replays | Resumes from stored offset; replays skipped (pipeline test) |
-| Projector crash before/after PG commit | Re-delivery | Rolled back and re-applied / skipped by version (tests on real Kafka) |
-| Unknown event type, newer schema, malformed record | Cannot be applied | Partition halts (poison), ERROR log, not ready. Runbook: deploy a build that knows it. Never skipped. |
-| `es_event` truncated or rows updated | History rewritten outside the app | Detected (`op` `t`/`u`/`d`) → halt; rebuild after repair (pipeline test) |
-| Read model lost or corrupted | Stale or empty reads | `make rebuild-projections` from MySQL |
+| PostgreSQL unavailable | Commands and queries fail | Commands: `503 UNAVAILABLE` + `Retry-After`. Queries: `500 INTERNAL` (only a request timeout maps to 503). `/readyz` 503. |
+| Lock wait / deadlock on every attempt | Command not applied | `503 UNAVAILABLE`; nothing committed, no read-model change (tested with `lock_timeout`) |
+| Projection error (bug, FK violation, unknown event) | Command not applied | Whole transaction rolled back; `500 INTERNAL`; events and read model unchanged |
+| Read model ahead of the event store (separate restore) | Commands on affected vehicles fail | Save fails with `ErrVersionGap`; run `rebuild-projections` |
+| Rebuild running | Commands and queries wait | They continue after the rebuild commits. Requests that wait longer than the 10 s request deadline end with `503 UNAVAILABLE` (commands) or `500`. A rebuild is refused (`ErrRunInProgress`) while another rebuild or any command holds the projection lock. |
+| Rebuild fails (unknown event type, newer schema, gap) | Nothing changes | Rolled back; old read model kept. Deploy a build that knows the event, or repair history. |
+| Read model lost or corrupted | Stale or empty reads | `make rebuild-projections` / `docker compose --profile tools run --rm --no-deps rebuild` |
 
-Measured on this machine (WSL2, rootless Podman, single host): command → row visible through the API in 376–493 ms over 20 commands (median 478 ms). This is not a load test.
+No load test was run; no latency figures are claimed.
 
 ## 13. Security considerations
 
 - **No authentication.** `X-Actor-Id` is an unauthenticated, demo-only identity: required on commands, validated against a safe charset, stored for audit, **never** used for authorization. Production would use an authenticated principal (OIDC/JWT) and per-dealership authorisation.
-- **Least privilege:**
-  - the API writes as a MySQL user without `UPDATE`/`DELETE` on `es_event` and reads PostgreSQL as a read-only role;
-  - the Debezium account has only replication privileges plus `SELECT` on `es_event`;
-  - the projector and `sync-projections`/`rebuild-projections` write PostgreSQL as `inventory_projector` (`deploy/postgres/projector-grants.sql`). It is not a superuser and not the owner. It has `SELECT, INSERT, UPDATE, TRUNCATE` on the three projected tables, `SELECT, INSERT` on `projection_run`, and nothing on `dealership` or the migration table. An integration test runs rebuild, sync and live apply as this role and checks that schema changes, reference-data writes, `DELETE`, `COPY … TO PROGRAM` and `CREATE ROLE` are refused;
-  - only `migrate` (and the grant jobs) use the superuser that the postgres image creates.
-- **Least-privilege gaps (known issues):**
-  - the projector reads MySQL as the application user, which can `INSERT` events;
-  - MySQL `root` is reachable from the Compose network (`root@'%'`).
-- **Grant scripts:** the init jobs refuse empty passwords and anything other than letters and digits, because passwords are substituted into SQL. Each run re-applies the password (`ALTER USER` / `ALTER ROLE`), so rotating it in `.env` takes effect. Root's password reaches the mysql client through `MYSQL_PWD`, not the command line.
+- **Least privilege** (`deploy/postgres`, applied by `make pg-grants` / the `postgres-grants` job; tested in `postgres_roles_integration_test.go`):
+  - **admin** (`POSTGRES_USER`, the superuser the postgres image creates): only `migrate` and the grant jobs;
+  - **writer `inventory_app`** (`app-grants.sql`): `SELECT/INSERT/UPDATE` on `es_aggregate`; `SELECT/INSERT` on `es_event` plus its identity sequence, never `UPDATE/DELETE/TRUNCATE`; `SELECT/INSERT` on snapshots; `SELECT` on `dealership`; `SELECT/INSERT/UPDATE` on `inventory_vehicle` and `projection_aggregate`; `SELECT/INSERT` on `vehicle_action_history`; no DDL, `NOSUPERUSER`;
+  - **reader `inventory_reader`** (`grants.sql`): `SELECT` on `inventory_vehicle`, `vehicle_action_history`, `projection_run` and `event_store.dealership`; it cannot read `es_event`;
+  - **rebuild `inventory_rebuild`** (`rebuild-grants.sql`): `SELECT` on `es_event`; `SELECT/INSERT/UPDATE/TRUNCATE` on the three projected tables; `SELECT/INSERT` on `projection_run`; it cannot write events.
+- **Known gap:** the writer can update the read model directly; that is what lets the projection run in the command transaction.
+- **Grant scripts:** the init jobs refuse empty passwords and anything other than letters and digits, because passwords are substituted into SQL. Each run re-applies the password (`ALTER ROLE`), so rotating it in `.env` takes effect.
 - **Input handling:**
   - strict JSON: `application/json` only, 64 KiB limit, unknown fields and trailing data rejected;
   - unknown or repeated query parameters are rejected;
   - all SQL is parameterised, and sort/filter choices map to fixed SQL;
   - cursors are not signed, but they only select rows the caller could request directly.
 - **Error exposure:** 500s carry no internal detail, only a `request_id` that matches the log line.
-- **Secrets:** only in `.env` (git-ignored). The image contains no credentials. Connect reads the Debezium password from its environment (`${env:…}`), so it is not stored in the connector config.
-- **Containers:** distroless static image as `nonroot`, base images pinned by digest; every port published on 127.0.0.1 only. The infrastructure images in Compose are pinned by tag only (`mysql:8.4` and `postgres:17` float), and there are no resource limits.
-- **Swagger UI** (`/docs`) loads its assets from jsDelivr, pinned to one version, with Subresource Integrity and a strict Content-Security-Policy (no `unsafe-eval`; the one inline script is allowed by hash). The page was checked to render in headless Chromium without violations.
-- **Metrics labels are bounded** (route patterns, and methods outside the standard set fold into `OTHER`), so clients cannot grow the series count.
-- **Unauthenticated infrastructure:** Kafka, Connect and the projector's `/status` and `/metrics` have no authentication, which is acceptable only on a private network.
-- **Dependencies:** `govulncheck ./...` reports **no vulnerabilities** (reachable or imported) after the final hardening.
-  - **Go toolchain:** `go.mod` pins `toolchain go1.26.10` (the language minimum stays `go 1.26.5`), so tests and the image use the same patched release. The image builds from `golang:1.26.10-alpine3.24`. This fixed 15 reachable standard-library findings.
-  - **`pgx/v5`** 5.6.0 → 5.9.2: GO-2026-5004. The vulnerable call path was reachable in principle, but the code never uses the simple protocol or dollar-quoted literals.
-  - **`golang.org/x/text`** 0.40.0 → 0.41.0: GO-2026-6629.
-  - **`filippo.io/edwards25519`** 1.1.0 → 1.1.1: GO-2026-4503. Imported via the MySQL driver; not reachable.
-  - **All are the minimum fixing versions.** None is a major upgrade.
+- **Secrets:** only in `.env` (git-ignored). The image contains no credentials.
+- **Containers:** distroless static image as `nonroot`, Go base images pinned by digest; every port published on 127.0.0.1 only. `postgres:17` in Compose is pinned by tag only, and there are no resource limits.
+- **Swagger UI** (`/docs`) loads its assets from jsDelivr, pinned to one version, with Subresource Integrity and a strict Content-Security-Policy (no `unsafe-eval`; the one inline script is allowed by hash).
+- **Metrics labels are bounded** (route patterns, and methods outside the standard set fold into `OTHER`), so clients cannot grow the series count. `/metrics` is unauthenticated, acceptable only on a private network.
+- **Dependencies:** the final hardening before Phase 7 removed every `govulncheck` finding with minimum patch upgrades (Go toolchain 1.26.10, `pgx/v5` 5.9.2, `golang.org/x/text` 0.41.0; details in `docs/ai-log.md`). Phase 7 removed the MySQL driver and the Kafka client from `go.mod` and added no module. A `govulncheck` run after Phase 7 is not recorded here.
 
 ## 14. Observability
 
 - **Logs:** structured JSON (`log/slog`).
   - Every HTTP request logs one line with request ID, route pattern, status, duration and sanitised actor.
-  - Errors are logged with their problem code.
-  - The projector logs bootstrap, gap repairs, poison records (ERROR) and rebalances.
-- **Correlation:** `X-Request-Id` is accepted or generated, echoed in the response, written to the event metadata as `correlation_id`, and returned in action history and problem bodies. A request can be followed from the API log to MySQL to the read model. A valid `traceparent` is stored too.
-- **Metrics (Prometheus, `GET /metrics` on both processes):**
-  - API: `inventory_http_requests_total{method,route,status}`, `inventory_http_request_duration_seconds{method,route}`, and `inventory_http_problems_total{route,code}` (command success and failure by business outcome, e.g. `VEHICLE_NOT_AGING`). Plus Go and process metrics.
-  - Projector: `inventory_projection_events_applied_total`, `…_duplicates_skipped_total`, `…_gap_events_repaired_total`, `…_record_failures_total`, `…_ready`, `…_phase{phase}`, `…_partition_halted{topic,partition}`, `…_partition_last_offset`, and `…_last_change_lag_seconds` (apply time minus the MySQL commit time Debezium reports; clocks of different hosts).
-- **Health:**
-  - API `/readyz` checks MySQL and PostgreSQL.
-  - Projector `/readyz` is 503 while bootstrapping, while the broker is unreachable or while a partition is halted. `/status` gives the detail.
-- **Not included:** OpenTelemetry tracing and dashboards and alerts. The trace context is accepted and stored, but no spans are exported. A Prometheus server is not part of the Compose file.
+  - Errors are logged with their problem code; command retries after a retryable save failure are logged at WARN.
+  - `rebuild-projections` logs events read, events applied and duration.
+- **Correlation:** `X-Request-Id` is accepted or generated, echoed in the response, written to the event metadata as `correlation_id`, and returned in action history and problem bodies. A valid `traceparent` is stored too.
+- **Metrics (Prometheus, `GET /metrics`):** `inventory_http_requests_total{method,route,status}`, `inventory_http_request_duration_seconds{method,route}`, and `inventory_http_problems_total{route,code}` (command success and failure by business outcome, e.g. `VEHICLE_NOT_AGING`). Plus Go and process metrics. Command latency includes the projection.
+- **Health:** `/healthz` is liveness; `/readyz` pings the writer and the reader pools.
+- **Not included:** OpenTelemetry tracing, dashboards and alerts. The trace context is accepted and stored, but no spans are exported. A Prometheus server is not part of the Compose file.
 
 ## 15. Scalability trade-offs
 
-- **API:** stateless and horizontally scalable. Commands touch one vehicle's stream (a short, indexed range read), and queries are single-dealership index scans with keyset pagination (no `OFFSET`, no count).
-- **Write contention** is per vehicle only; different vehicles never conflict.
-- **Projector:** scales by consumer-group members up to the partition count (3). A halted partition holds back every vehicle on it (strict order). Raising the partition count changes key → partition and loses in-order delivery for existing keys; correctness then rests on gap repair and duplicate skipping.
-- **Startup sync and rebuild** are O(total events) and hold the exclusive projection lock. That is fine for the assumed scale (thousands of vehicles per dealership); at larger scale use a checkpointed catch-up and a shadow-table rebuild.
-- **Single-node infrastructure** in Compose: Kafka with replication factor 1 and one Connect worker. Production needs replication and managed brokers.
-- **Event Sourcing cost:** two databases and a CDC pipeline for a CRUD-sized domain. Justified by the audit trail (B6), safe concurrent actions, and a read model that can be rebuilt or reshaped from history. For this scope alone a single PostgreSQL with an audit table would suffice; this is a deliberate, self-imposed demonstration (`docs/02`).
+**Why PostgreSQL only (Phase 7).** The developer decided to drop the CDC pipeline because its operational cost outweighed its benefit at this scale, and because immediate read-after-write matters for the manager UI.
+
+| Gave up | Gained |
+|---|---|
+| Independent scaling and decoupling of the read side (a projector scaled by partitions, isolated from command latency) | The events and their read-model update are atomic: no lag, no drift, no gap repair |
+| Separate write and read engines | Immediate read-after-write; the `ETag` from a GET is usable at once |
+| A change feed other consumers could subscribe to | One database to run, secure and back up; far fewer moving parts (no MySQL, Kafka, Connect, projector) |
+| | Simpler tests: one engine, no pipeline harness |
+
+Costs accepted:
+
+- **The projection is on the command's critical path.** Latency and lock scope per command grow with projection cost. For one vehicle row and one history row this is small; a heavy projector would need to move out again.
+- **A rebuild blocks commands for its duration** (they wait on the shared lock), and its `TRUNCATE` makes queries wait until it commits. It is O(total events): fine for the assumed scale (thousands of vehicles per dealership); at larger scale use a shadow-table rebuild.
+- **Everything is on one PostgreSQL primary:** a single point of failure; scale vertically first. Read replicas could take the queries later, but a replica reintroduces lag for the reads routed to it, so this is not done.
+- **API:** stateless and horizontally scalable. Commands touch one vehicle's stream (a short, indexed range read), and queries are single-dealership index scans with keyset pagination (no `OFFSET`, no count). Write contention is per vehicle only, apart from the shared projection lock, which commands share with each other and only a rebuild takes exclusively.
+- **Event Sourcing cost:** for this scope alone a single PostgreSQL with an audit table would suffice. Event Sourcing is kept for the audit trail (B6), safe concurrent actions, and a read model that can be rebuilt or reshaped from history; it is self-imposed (`docs/02`).
 
 ## 16. Limitations and future improvements
 
 - **Security:** no authentication or authorisation; `X-Actor-Id` is trusted.
 - **Idempotency:** no `Idempotency-Key`; retries rely on business-rule idempotency and `If-Match`.
 - **VIN uniqueness among in-stock vehicles** (planned D4) is not enforced. Two vehicles can be stocked with the same VIN.
-- **Reference data is duplicated:** dealership data is seeded in MySQL and PostgreSQL. Adding a dealership requires both.
 - **No correction events:** for example a wrong `stocked_on` cannot be corrected (planned `VehicleStockInDateCorrected`).
-- **Read-model version:** the detail `ETag` can lag the write side briefly. A `412` from it is resolved by re-reading.
-- **Least privilege for the projector's MySQL access:** it should use a read-only MySQL user; it reads `es_event` as the application user today.
-- **Query outages:** queries map a read-model outage to `500 INTERNAL`, not `503`; only a timeout gives `503`.
-- **Connector configuration:** `deploy/debezium/es-event-connector.json` hard-codes the `inventory` database and the `debezium` user. Changing `MYSQL_DATABASE` or `DEBEZIUM_MYSQL_USER` in `.env` therefore also requires editing it.
-- **Compose images:** the infrastructure images are pinned by tag, not by digest, and have no resource limits.
+- **Query outages:** queries map a database outage to `500 INTERNAL`, not `503`; only a timeout gives `503`.
+- **Rebuild:** blocks commands while it runs; no shadow-table or online rebuild.
+- **Single database:** no replica, no failover in Compose; backups are not automated.
+- **MySQL history:** an existing MySQL event store is imported only by the explicit script ([mysql-import.md](mysql-import.md)); it needs the old MySQL credentials.
+- **Compose images:** `postgres:17` is pinned by tag, not by digest, and has no resource limits.
 - **Observability gaps:** no tracing export, no alert rules, no Grafana dashboard.
-- **Tested scope:** a single host; no load or soak test; Kafka retention expiry not reproduced on the real stack.
+- **Tested scope:** a single host; no load or soak test.
 - **Compose ordering on Podman:** `docker compose up` relies on Compose v2's `depends_on: service_completed_successfully`. `make stack-up` runs the init steps explicitly and works on both Docker Compose and podman-compose. Only podman-compose was available for verification.
 
 ## 17. How GenAI contributed

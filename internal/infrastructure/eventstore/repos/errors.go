@@ -5,10 +5,11 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 )
 
@@ -27,59 +28,84 @@ var (
 	// with the serializer (written by a newer release, or a missing registration).
 	ErrUnknownEventType = errors.New("unknown event type")
 
-	// ErrRetryable marks a transient database failure (deadlock, lock wait timeout).
-	// The transaction was rolled back; the caller may reload the aggregate and re-run
-	// the command. It is not an optimistic concurrency conflict.
+	// ErrRetryable marks a transient database failure (deadlock, serialization failure,
+	// lock not available). The transaction was rolled back; the caller may reload the
+	// aggregate and re-run the command. It is not an optimistic concurrency conflict.
 	ErrRetryable = errors.New("retryable database error")
 )
 
-// MySQL server error numbers handled explicitly.
+// PostgreSQL SQLSTATE codes handled explicitly.
 const (
-	mysqlDuplicateEntry  = 1062
-	mysqlLockWaitTimeout = 1205
-	mysqlDeadlock        = 1213
+	sqlstateUniqueViolation      = "23505"
+	sqlstateSerializationFailure = "40001"
+	sqlstateDeadlockDetected     = "40P01"
+	sqlstateLockNotAvailable     = "55P03"
+	sqlstateQueryCanceled        = "57014"
+	sqlstateAdminShutdown        = "57P01"
+	sqlstateCrashShutdown        = "57P02"
+	sqlstateCannotConnectNow     = "57P03"
+	sqlstateClassConnection      = "08"
 )
 
-func mysqlErrorNumber(err error) (uint16, bool) {
-	var myErr *mysql.MySQLError
-	if errors.As(err, &myErr) {
-		return myErr.Number, true
+func pgCode(err error) (string, bool) {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code, true
 	}
-	return 0, false
+	return "", false
 }
 
+// isDuplicateKey reports a unique violation. Callers decide what it means in their
+// context (a duplicate event version is not by itself a concurrency conflict).
 func isDuplicateKey(err error) bool {
 	if err == nil {
 		return false
 	}
-	if n, ok := mysqlErrorNumber(err); ok {
-		return n == mysqlDuplicateEntry
+	if code, ok := pgCode(err); ok {
+		return code == sqlstateUniqueViolation
 	}
 	if errors.Is(err, gorm.ErrDuplicatedKey) {
 		return true
 	}
 	// SQLite (tests) has no typed error here without importing the cgo driver.
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "unique constraint failed") ||
-		strings.Contains(msg, "duplicate entry") ||
-		strings.Contains(msg, "duplicate key")
+	return strings.Contains(strings.ToLower(err.Error()), "unique constraint failed")
 }
 
-// classifyTxError marks deadlocks and lock wait timeouts as ErrRetryable and leaves
-// every other error (conflicts, constraint violations, connection and context errors)
-// unchanged, so callers can still match them with errors.Is/As.
+// classifyTxError marks deadlocks, serialization failures and lock-not-available as
+// ErrRetryable: PostgreSQL rolled the transaction back, so nothing was committed and a
+// reload-and-retry is safe. Every other error is returned unchanged.
 func classifyTxError(err error) error {
-	if n, ok := mysqlErrorNumber(err); ok && (n == mysqlDeadlock || n == mysqlLockWaitTimeout) {
+	code, ok := pgCode(err)
+	if !ok {
+		return err
+	}
+	switch code {
+	case sqlstateSerializationFailure, sqlstateDeadlockDetected, sqlstateLockNotAvailable:
 		return fmt.Errorf("%w: %w", ErrRetryable, err)
 	}
 	return err
 }
 
-// IsUnavailable reports errors that mean the database could not be reached or the
-// connection broke mid-request. When it happens around COMMIT the outcome is unknown,
-// so callers must not retry automatically.
+// IsUnavailable reports errors that mean the database could not be reached, the
+// connection broke, the server is shutting down or a statement was cancelled. Around
+// COMMIT the outcome is then unknown, so callers must not retry automatically.
 func IsUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
 	var netErr net.Error
-	return errors.Is(err, driver.ErrBadConn) || errors.Is(err, mysql.ErrInvalidConn) ||
-		errors.Is(err, sql.ErrConnDone) || errors.As(err, &netErr)
+	var connectErr *pgconn.ConnectError
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr) || errors.As(err, &connectErr) {
+		return true
+	}
+	code, ok := pgCode(err)
+	if !ok {
+		return false
+	}
+	switch code {
+	case sqlstateQueryCanceled, sqlstateAdminShutdown, sqlstateCrashShutdown, sqlstateCannotConnectNow:
+		return true
+	}
+	return strings.HasPrefix(code, sqlstateClassConnection)
 }

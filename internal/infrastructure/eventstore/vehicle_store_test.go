@@ -113,7 +113,7 @@ func TestVehicleLifecycleReplayFromStore(t *testing.T) {
 		t.Fatalf("stream columns %+v", got)
 	}
 	var snapshots int64
-	must(t, db.Raw(`SELECT COUNT(*) FROM es_aggregate_snapshot`).Scan(&snapshots).Error)
+	must(t, db.Raw(`SELECT COUNT(*) FROM event_store.es_aggregate_snapshot`).Scan(&snapshots).Error)
 	if snapshots != 0 {
 		t.Fatalf("interval 0 wrote %d snapshots", snapshots)
 	}
@@ -138,7 +138,7 @@ func TestVehicleSnapshotRestoreThenAppend(t *testing.T) {
 
 	// Privileged test connection: remove the events the snapshot covers so the load can
 	// only succeed through the snapshot.
-	must(t, db.Exec(`DELETE FROM es_event WHERE aggregate_id = ? AND version <= 2`, vehicleID).Error)
+	must(t, db.Exec(`DELETE FROM event_store.es_event WHERE aggregate_id = ? AND version <= 2`, vehicleID).Error)
 
 	restored := loadVehicle(t, store)
 	assertSameVehicle(t, restored, v)
@@ -149,7 +149,7 @@ func TestVehicleSnapshotRestoreThenAppend(t *testing.T) {
 		t.Fatalf("status=%s version=%d", final.Status(), final.Version())
 	}
 	var versions []int
-	must(t, db.Raw(`SELECT version FROM es_aggregate_snapshot WHERE aggregate_id = ? ORDER BY version`, vehicleID).Scan(&versions).Error)
+	must(t, db.Raw(`SELECT version FROM event_store.es_aggregate_snapshot WHERE aggregate_id = ? ORDER BY version`, vehicleID).Scan(&versions).Error)
 	if !reflect.DeepEqual(versions, []int{2, 4}) {
 		t.Fatalf("snapshot versions %v", versions)
 	}

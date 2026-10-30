@@ -1,7 +1,7 @@
 ---
 name: keyloop-plan
 description: Plan a change to the Keyloop inventory backend before any code is written — inspects git status and the real code, finds the affected existing components, proposes the minimal change, defines tests and acceptance criteria, and explains trade-offs. Use at the start of every phase or non-trivial task in this repository.
-argument-hint: "<phase or task, e.g. 'Phase 2: MySQL event store'>"
+argument-hint: "<phase or task, e.g. 'Phase 8: VIN reservation'>"
 disallowed-tools: Edit, Write, NotebookEdit
 ---
 # keyloop-plan
@@ -30,9 +30,9 @@ or self-imposed requirement each change serves.
 - New dependencies, schema changes or Docker changes only if this phase owns them (`docs/07`).
 
 ## 4. Tests and acceptance criteria
-For each step: the tests to add (unit / SQLite / `-tags integration` MySQL or Postgres), including
-edge cases — invariant rejections, transaction rollback, OCC conflicts, replay, snapshots,
-idempotent projection — and the observable acceptance criterion. Say which tests can fail
+For each step: the tests to add (unit / SQLite / `-tags integration` PostgreSQL), including
+edge cases — invariant rejections, transaction rollback (events, CAS and read model together),
+OCC conflicts, replay, snapshots, projection version check, rebuild equality — and the observable acceptance criterion. Say which tests can fail
 without the change and how to mutation-check the key rule.
 
 ## 5. Trade-offs and risks

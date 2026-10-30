@@ -1,6 +1,6 @@
 ---
 name: keyloop-review
-description: Review the current git diff of the Keyloop inventory backend for correctness, maintainability and architecture, with focus on Event Sourcing and CQRS (atomic appends, OCC, replay determinism, snapshot round-trip, projection idempotency). Reports critical/major/minor findings with file:line citations and never edits code. Use before the developer commits a phase.
+description: Review the current git diff of the Keyloop inventory backend for correctness, maintainability and architecture, with focus on Event Sourcing and CQRS (atomic append + read-model update, OCC, replay determinism, snapshot round-trip, projection version check, lock order). Reports critical/major/minor findings with file:line citations and never edits code. Use before the developer commits a phase.
 argument-hint: "[base ref, default HEAD]"
 disallowed-tools: Edit, Write, NotebookEdit
 ---
@@ -19,8 +19,10 @@ Base: `$ARGUMENTS` (if empty, use `HEAD`). Read-only: do not edit, stage, commit
   version kept; retries re-load and re-run; apply methods validate before mutating and are
   deterministic; typed payloads; frozen event/aggregate names; no derived values stored; snapshot
   JSON covers every state field.
-- **CQRS:** read model updated only by the projector; version check in the same Postgres tx; no
-  read-model writes from command handlers; consistency stated in API responses.
+- **CQRS:** the read model is written only through `Projection.Apply` (in the command's save
+  transaction via `CommandProjection`, or by `rebuild-projections`), never by handlers or ad-hoc
+  SQL; version check in that same transaction; projection lock taken before event-store row locks;
+  queries read `read_model` on the read-only pool; all table names schema-qualified.
 - **Architecture** (`.claude/rules/architecture.md`): reuse instead of parallel abstractions,
   package direction, no new deps/schema/Docker outside the planned phase.
 - **Maintainability / source organization** (`.claude/rules/source-organization.md`): one
