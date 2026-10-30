@@ -121,9 +121,117 @@ internal/infrastructure/      eventstore (event_store schema), projection (proje
                               viewstore (read_model: models, repositories, migrations), referencedata
 internal/presentation/        router + commands, queries, probes, apidocs over the shared httpkit
 internal/e2e/                 end-to-end test suite
-package/eventsourcing/        the event-sourcing framework the project started from (extended, not replaced)
+pkg/eventsourcing/            the event-sourcing framework the project started from (extended, not replaced)
 docs/                         design documents, curl examples, demo, AI log
 ```
+
+## Understanding the Codebase in 5 Minutes
+
+### Architecture at a glance
+
+The service is one Go binary (`cmd/`) with four layers:
+- `internal/domain`: business rules, no I/O;
+- `internal/application`: use cases and the ports they need;
+- `internal/infrastructure`: PostgreSQL implementations of those ports;
+- `internal/presentation`: HTTP.
+
+One PostgreSQL database holds two schemas:
+- **`event_store`**: the source of truth, an append-only history of events per vehicle;
+- **`read_model`**: tables shaped for the dashboard, derived from those events.
+
+```mermaid
+flowchart LR
+  HTTP[HTTP handlers<br/>presentation/commands, queries] --> CMD[command.Service]
+  HTTP --> QRY[query.Service]
+  CMD --> AGG[VehicleInventoryAggregate<br/>domain]
+  CMD --> ES[(event_store)]
+  ES -. same transaction .-> PROJ[VehicleProjector]
+  PROJ --> RM[(read_model)]
+  QRY --> RM
+```
+
+The write side and the read side share nothing but the database. Commands connect as the writer role (`inventory_app`); queries connect through a separate pool as the read-only role (`inventory_reader`).
+
+### Command flow: `POST …/vehicles/{vehicleId}/actions` (ProposeAction)
+
+1. **HTTP:** [`presentation/commands/propose_action.go`](internal/presentation/commands/propose_action.go) `proposeAction` decodes the body. It reads `X-Actor-Id`, `X-Request-Id` and `If-Match` through `commandInputs` ([`request_metadata.go`](internal/presentation/commands/request_metadata.go)) and builds a `command.ProposeAction`. Routes are in [`routes.go`](internal/presentation/commands/routes.go).
+2. **Application:** [`application/command/propose_action.go`](internal/application/command/propose_action.go) generates the action id and calls `execute` in [`execution.go`](internal/application/command/execution.go), the loop every command shares. `execute`:
+   - resolves the dealership time zone;
+   - loads the aggregate (replaying its events);
+   - checks `If-Match`;
+   - computes today's business date in the dealership's time zone;
+   - runs the domain method and saves;
+   - on a retryable conflict, reloads and re-runs, at most 3 times.
+3. **Domain:** `VehicleInventoryAggregate.ProposeAction` ([`domain/aggregates/vehicle_inventory_propose_action.go`](internal/domain/aggregates/vehicle_inventory_propose_action.go)):
+   - checks the invariants (in stock, aging > 90 days, no active action);
+   - records a `VehicleActionProposedEvent` with `ApplyChange` ([`pkg/eventsourcing/aggregate_root.go`](pkg/eventsourcing/aggregate_root.go));
+   - only `applyVehicleActionProposedEvent` mutates state, so replaying the history rebuilds the same state.
+4. **Event store:** `SaveWithMetadata` ([`infrastructure/eventstore/aggregate_store.go`](internal/infrastructure/eventstore/aggregate_store.go)) runs **one** transaction:
+   1. shared projection lock;
+   2. version compare-and-swap on `es_aggregate`;
+   3. `INSERT … RETURNING id` into `es_event` ([`repos/event.go`](internal/infrastructure/eventstore/repos/event.go));
+   4. projection;
+   5. commit.
+
+   Only after the commit does `root.Update()` clear the pending events.
+5. **Projection, same transaction:**
+   - [`projection/command_projection.go`](internal/infrastructure/projection/command_projection.go) hands the transaction to `Projection.Apply` ([`projection.go`](internal/infrastructure/projection/projection.go)), which checks that each event is the next version.
+   - Apply then calls `VehicleProjector` ([`projectors/projector_vehicle.go`](internal/infrastructure/projection/projectors/projector_vehicle.go)), a pure function from event to new row.
+6. **Read model:** [`viewstore/postgres.go`](internal/infrastructure/viewstore/postgres.go) writes through repositories built on that same transaction:
+   - `inventory_vehicle`;
+   - `vehicle_action_history`, keyed by the event's real `es_event.id`;
+   - `projection_aggregate`.
+
+   If anything fails, everything rolls back. On success the handler returns `201` with the committed vehicle. Errors become `problem+json` in [`httpkit/error_mapping.go`](internal/presentation/httpkit/error_mapping.go).
+
+### Query flow: `GET /v1/dealerships/{dealershipId}/vehicles` (ListInventory)
+
+1. **HTTP:** [`presentation/queries/list_inventory.go`](internal/presentation/queries/list_inventory.go) `parseListInventory` turns query parameters into a `query.ListInventory`.
+2. **Application:** `query.Service.ListInventory` ([`application/query/list_inventory.go`](internal/application/query/list_inventory.go)):
+   - validates the request into a `VehicleFilter` (the port types are in [`read_model.go`](internal/application/query/read_model.go));
+   - decodes the keyset cursor, which pins `as_of` and a filter fingerprint;
+   - resolves the business date;
+   - asks for `limit + 1` rows to learn whether another page exists.
+3. **Repository:** `viewstore.ReadModel` ([`read_model.go`](internal/infrastructure/viewstore/read_model.go)) delegates to `VehicleRepository.List` ([`repositories/vehicle_repository.go`](internal/infrastructure/viewstore/repositories/vehicle_repository.go)). `List` composes named GORM scopes from [`vehicle_filters.go`](internal/infrastructure/viewstore/repositories/vehicle_filters.go):
+   - `inDealership`, `withStatus`, `withMake`, `withModel`;
+   - `withAgeBounds`, `agingOnly`;
+   - `afterKeyset`, `orderByAge`.
+4. **PostgreSQL:** the age filters become range predicates on `stocked_on`, so the indexes from [`migrations/schema.go`](internal/infrastructure/viewstore/migrations/schema.go) apply. [`mappers.go`](internal/infrastructure/viewstore/repositories/mappers.go) converts the rows to `query.Vehicle`. `age_days` and `is_aging` are computed per request with the domain rule ([`application/query/vehicle.go`](internal/application/query/vehicle.go)), never stored.
+
+### Key files
+
+| File | Responsibility |
+|---|---|
+| [`cmd/api.go`](cmd/api.go) | Wires everything: the writer and reader pools, the event store with its projection, and both services. |
+| [`internal/domain/inventory.go`](internal/domain/inventory.go) | The aging rule (`AgingThresholdDays = 90`, `AgeInDays`). |
+| [`internal/domain/aggregates/vehicle_inventory.go`](internal/domain/aggregates/vehicle_inventory.go) | The aggregate's state and event dispatch; one file per command beside it. |
+| [`internal/domain/events/`](internal/domain/events/) | The five event payloads; their Go type names are stored and frozen. |
+| [`internal/application/command/execution.go`](internal/application/command/execution.go) | The load → decide → save → retry loop shared by all commands. |
+| [`internal/application/command/ports.go`](internal/application/command/ports.go), [`query/read_model.go`](internal/application/query/read_model.go), [`projection/ports.go`](internal/application/projection/ports.go) | Interfaces declared by the application and implemented in infrastructure. |
+| [`internal/infrastructure/eventstore/aggregate_store.go`](internal/infrastructure/eventstore/aggregate_store.go) | Load by replay; save in one transaction with the projection. |
+| [`internal/infrastructure/eventstore/repos/migrations.go`](internal/infrastructure/eventstore/repos/migrations.go) | `event_store` schema. |
+| [`internal/infrastructure/projection/projectors/projector_vehicle.go`](internal/infrastructure/projection/projectors/projector_vehicle.go) | Event → read-model row; also used by rebuilds. |
+| [`internal/infrastructure/projection/runner.go`](internal/infrastructure/projection/runner.go) | `rebuild-projections`: replays `event_store` into an emptied read model in one transaction. |
+| [`internal/infrastructure/viewstore/repositories/`](internal/infrastructure/viewstore/repositories/) | All read-model SQL: one repository per table group, list scopes and mappers. |
+| [`internal/presentation/router.go`](internal/presentation/router.go) | Composes the command, query, probe and docs routes with middleware. |
+| [`api/openapi.yaml`](api/openapi.yaml) | The HTTP contract; a test checks every operation is routed. |
+
+### Design decisions
+
+- **Event Sourcing instead of CRUD:**
+  - the requirement to *persist and read the history* of a manager's actions is the event stream itself;
+  - every change records who made it, when, and its correlation id;
+  - business rules are checked against state rebuilt from history.
+
+  CRUD would need a separate audit table that could drift from the current state.
+- **CQRS:**
+  - the write model is a per-vehicle aggregate guarded by optimistic concurrency;
+  - the dashboard needs dealership-wide filters, age sorting and keyset paging;
+  - separating them gives each side the schema and indexes it needs, and lets queries run as a role that cannot write.
+- **A single PostgreSQL database:**
+  - with both schemas in one database, a command's events and its read-model update commit in the same transaction, so reads are never stale and there is no pipeline to operate;
+  - the earlier MySQL → Debezium → Kafka design was dropped in Phase 7 ([docs/02 §9](docs/02-architecture-review.md));
+  - the cost is that projection work sits on each command's path, and a rebuild briefly blocks writes.
 
 ## Key behaviours and limitations
 
