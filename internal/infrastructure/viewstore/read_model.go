@@ -1,32 +1,51 @@
 package viewstore
 
-import "keyloop-coding-challenge/internal/application/query"
+import (
+	"context"
+	"time"
 
-var _ query.ReadModel = (*Postgres)(nil)
+	"gorm.io/gorm"
 
-func toQueryVehicle(r VehicleRow) query.Vehicle {
-	v := query.Vehicle{
-		VehicleID:    r.VehicleID,
-		DealershipID: r.DealershipID,
-		VIN:          r.VIN,
-		Make:         r.Make,
-		Model:        r.Model,
-		ModelYear:    r.ModelYear,
-		StockedOn:    r.StockedOn,
-		Status:       r.Status,
-		SoldOn:       r.SoldOn,
-		Version:      r.Version,
-		UpdatedAt:    r.UpdatedAt,
+	"keyloop-coding-challenge/internal/application/query"
+	"keyloop-coding-challenge/internal/domain"
+	"keyloop-coding-challenge/internal/infrastructure/viewstore/repositories"
+)
+
+var _ query.ReadModel = (*ReadModel)(nil)
+
+// ReadModel serves the query services from the read-only connection pool.
+type ReadModel struct {
+	vehicles    repositories.VehicleRepository
+	history     repositories.ActionHistoryRepository
+	summary     repositories.InventorySummaryRepository
+	dealerships repositories.DealershipRepository
+}
+
+func NewReadModel(db *gorm.DB) *ReadModel {
+	return &ReadModel{
+		vehicles:    repositories.NewVehicleRepository(db),
+		history:     repositories.NewActionHistoryRepository(db),
+		summary:     repositories.NewInventorySummaryRepository(db),
+		dealerships: repositories.NewDealershipRepository(db),
 	}
-	if r.ActionID != "" {
-		v.Action = &query.Action{
-			ID:         r.ActionID,
-			Type:       r.ActionType,
-			Note:       r.ActionNote,
-			ProposedAt: r.ActionProposedAt,
-			UpdatedAt:  r.ActionUpdatedAt,
-			UpdatedBy:  r.ActionUpdatedBy,
-		}
-	}
-	return v
+}
+
+func (m *ReadModel) DealershipLocation(ctx context.Context, dealershipID string) (*time.Location, error) {
+	return m.dealerships.Location(ctx, dealershipID)
+}
+
+func (m *ReadModel) ListVehicles(ctx context.Context, f query.VehicleFilter) ([]query.Vehicle, error) {
+	return m.vehicles.List(ctx, f)
+}
+
+func (m *ReadModel) GetVehicle(ctx context.Context, dealershipID, vehicleID string) (*query.Vehicle, error) {
+	return m.vehicles.InDealership(ctx, dealershipID, vehicleID)
+}
+
+func (m *ReadModel) ListHistory(ctx context.Context, vehicleID string, afterVersion, limit int) ([]query.HistoryEntry, error) {
+	return m.history.List(ctx, vehicleID, afterVersion, limit)
+}
+
+func (m *ReadModel) Summary(ctx context.Context, dealershipID string, businessDate domain.Date) (query.Summary, error) {
+	return m.summary.Summary(ctx, dealershipID, businessDate)
 }

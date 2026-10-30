@@ -1,4 +1,5 @@
-package viewstore
+// Package migrations creates and versions the read_model schema.
+package migrations
 
 import (
 	"fmt"
@@ -6,12 +7,8 @@ import (
 	"gorm.io/gorm"
 )
 
-// Advisory-lock class IDs used by the read model (two-int form avoids collisions).
-const (
-	lockClassMigrate    = 52001
-	lockClassAggregate  = 52002
-	lockClassProjection = 52003
-)
+// Advisory-lock class of read-model migrations (the runtime locks are in repositories).
+const lockClassMigrate = 52001
 
 type migration struct {
 	version int
@@ -23,7 +20,7 @@ var migrations = []migration{
 	{
 		version: 1,
 		name:    "read model tables",
-		apply:   createOrAdoptReadModelTables,
+		apply:   createReadModelTables,
 	},
 }
 
@@ -74,4 +71,31 @@ CREATE TABLE IF NOT EXISTS read_model.schema_migrations (
 		}
 	}
 	return nil
+}
+
+// createReadModelTables creates the projected tables. It needs event_store.dealership
+// (the foreign key target) and refuses a database that still has read-model tables in
+// public from an earlier layout: this build supports fresh installations only and never
+// moves, overwrites or drops existing data.
+func createReadModelTables(tx *gorm.DB) error {
+	var hasDealerships bool
+	if err := tx.Raw(`SELECT to_regclass('event_store.dealership') IS NOT NULL`).Scan(&hasDealerships).Error; err != nil {
+		return err
+	}
+	if !hasDealerships {
+		return fmt.Errorf("event_store.dealership is missing: migrate the event store first")
+	}
+	var earlier []string
+	err := tx.Raw(`SELECT name FROM unnest(ARRAY['inventory_vehicle', 'vehicle_action_history', 'projection_aggregate', 'projection_run']) AS name
+		WHERE to_regclass('public.' || name) IS NOT NULL ORDER BY name`).Scan(&earlier).Error
+	if err != nil {
+		return err
+	}
+	if len(earlier) > 0 {
+		return fmt.Errorf("public has read-model tables of an earlier layout %v: unsupported, start from an empty database or remove them by hand", earlier)
+	}
+	if err := tx.Exec(readModelTablesDDL).Error; err != nil {
+		return err
+	}
+	return tx.Exec(dealershipForeignKeyDDL).Error
 }

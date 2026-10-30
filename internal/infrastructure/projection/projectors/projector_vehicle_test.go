@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"keyloop-coding-challenge/internal/application/projection"
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/events"
 	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
-	"keyloop-coding-challenge/internal/infrastructure/viewstore"
 	"keyloop-coding-challenge/package/eventsourcing"
 )
 
@@ -28,7 +28,7 @@ func ev(version int, data interface{}) eventsourcing.Event {
 	}
 }
 
-func stockedRow() *viewstore.VehicleRow {
+func stockedRow() *projection.ProjectedVehicle {
 	r, _, err := projectors.ProjectVehicle(nil, ev(1, &events.VehicleStockedEvent{DealershipID: "d-001", VIN: "VIN",
 		Make: "Toyota", Model: "Corolla", ModelYear: 2023, StockedOn: domain.NewDate(2026, 7, 1)}))
 	if err != nil {
@@ -37,7 +37,7 @@ func stockedRow() *viewstore.VehicleRow {
 	return &r
 }
 
-func withAction() *viewstore.VehicleRow {
+func withAction() *projection.ProjectedVehicle {
 	r, _, err := projectors.ProjectVehicle(stockedRow(), ev(2, &events.VehicleActionProposedEvent{ActionID: "a1", ActionType: domain.ActionHold, Note: "n"}))
 	if err != nil {
 		panic(err)
@@ -85,7 +85,7 @@ func TestProjectVehicleRejectsInvalidInput(t *testing.T) {
 	soldRow, _, _ := projectors.ProjectVehicle(stockedRow(), ev(2, &events.VehicleSoldEvent{SoldOn: domain.NewDate(2026, 10, 20)}))
 	cases := []struct {
 		name    string
-		current *viewstore.VehicleRow
+		current *projection.ProjectedVehicle
 		data    interface{}
 		want    error
 	}{

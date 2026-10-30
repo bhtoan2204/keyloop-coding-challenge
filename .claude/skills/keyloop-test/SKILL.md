@@ -34,7 +34,8 @@ Check each item and answer covered / partly / missing with the test name:
 - OCC: concurrent saves → one winner, `ErrConcurrencyConflict` for the rest, contiguous versions.
 - Projections: version check (gap and read-model-ahead fail the save), unknown event, state+history+version
   with the events, immediate read-after-write, rebuild equality (also with concurrent commands).
-- Migrations and roles: concurrent `migrate`, legacy in-place upgrade, least-privilege roles.
+- Migrations and roles: fresh, repeated and concurrent `migrate`, rollback of a failed version, newer
+  version refused, an earlier `public` layout refused untouched; least-privilege roles.
 
 ## 3. Optional mutation check
 For a critical rule, on a scratch copy outside the repo (`git archive HEAD | tar -x -C <scratch>`

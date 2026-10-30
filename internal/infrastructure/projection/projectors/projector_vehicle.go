@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
+	"keyloop-coding-challenge/internal/application/projection"
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/events"
-	"keyloop-coding-challenge/internal/infrastructure/viewstore"
 	"keyloop-coding-challenge/package/eventsourcing"
 )
 
@@ -24,7 +24,7 @@ var (
 // VehicleProjector maintains inventory_vehicle and vehicle_action_history.
 type VehicleProjector struct{}
 
-func (p *VehicleProjector) Handle(ctx context.Context, store viewstore.ViewStore, ev eventsourcing.Event) error {
+func (p *VehicleProjector) Handle(ctx context.Context, store projection.Store, ev eventsourcing.Event) error {
 	current, err := store.Vehicle(ctx, ev.AggregateID)
 	if err != nil {
 		return err
@@ -46,15 +46,15 @@ func (p *VehicleProjector) Handle(ctx context.Context, store viewstore.ViewStore
 
 // ProjectVehicle computes the next row (and history entry, if any) from the current
 // row and one event. It is pure, so it is deterministic on replay.
-func ProjectVehicle(current *viewstore.VehicleRow, ev eventsourcing.Event) (viewstore.VehicleRow, *viewstore.HistoryRow, error) {
+func ProjectVehicle(current *projection.ProjectedVehicle, ev eventsourcing.Event) (projection.ProjectedVehicle, *projection.ActionHistoryEntry, error) {
 	at := time.Unix(ev.CreatedAt, 0).UTC()
 	actor := metadataString(ev.Metadata, "actor_id")
 	correlation := metadataString(ev.Metadata, "correlation_id")
 	inconsistent := func(format string, args ...interface{}) error {
 		return fmt.Errorf("%w: %s v%d %s: %s", ErrInconsistent, ev.AggregateID, ev.Version, ev.EventType, fmt.Sprintf(format, args...))
 	}
-	history := func(r viewstore.VehicleRow, change, actionID string, t domain.ActionType, note, reason string) *viewstore.HistoryRow {
-		return &viewstore.HistoryRow{
+	history := func(r projection.ProjectedVehicle, change, actionID string, t domain.ActionType, note, reason string) *projection.ActionHistoryEntry {
+		return &projection.ActionHistoryEntry{
 			VehicleID:     r.VehicleID,
 			Version:       ev.Version,
 			EventID:       ev.ID,
@@ -73,13 +73,13 @@ func ProjectVehicle(current *viewstore.VehicleRow, ev eventsourcing.Event) (view
 	case *events.VehicleStockedEvent, *events.VehicleActionProposedEvent, *events.VehicleActionRevisedEvent,
 		*events.VehicleActionCancelledEvent, *events.VehicleSoldEvent:
 	default:
-		return viewstore.VehicleRow{}, nil, fmt.Errorf("%w: %s (%T)", ErrUnsupportedEvent, ev.EventType, ev.Data)
+		return projection.ProjectedVehicle{}, nil, fmt.Errorf("%w: %s (%T)", ErrUnsupportedEvent, ev.EventType, ev.Data)
 	}
 	if e, ok := ev.Data.(*events.VehicleStockedEvent); ok {
 		if current != nil {
-			return viewstore.VehicleRow{}, nil, inconsistent("vehicle already projected")
+			return projection.ProjectedVehicle{}, nil, inconsistent("vehicle already projected")
 		}
-		return viewstore.VehicleRow{
+		return projection.ProjectedVehicle{
 			VehicleID:    ev.AggregateID,
 			DealershipID: e.DealershipID,
 			VIN:          e.VIN,
@@ -94,14 +94,14 @@ func ProjectVehicle(current *viewstore.VehicleRow, ev eventsourcing.Event) (view
 		}, nil, nil
 	}
 	if current == nil {
-		return viewstore.VehicleRow{}, nil, inconsistent("vehicle not projected")
+		return projection.ProjectedVehicle{}, nil, inconsistent("vehicle not projected")
 	}
 	if current.Status != domain.StatusInStock {
-		return viewstore.VehicleRow{}, nil, inconsistent("vehicle is %s", current.Status)
+		return projection.ProjectedVehicle{}, nil, inconsistent("vehicle is %s", current.Status)
 	}
 	r := *current
 	r.Version, r.LastEventID, r.UpdatedAt = ev.Version, ev.ID, at
-	var h *viewstore.HistoryRow
+	var h *projection.ActionHistoryEntry
 
 	switch e := ev.Data.(type) {
 	case *events.VehicleActionProposedEvent:
@@ -138,7 +138,7 @@ func ProjectVehicle(current *viewstore.VehicleRow, ev eventsourcing.Event) (view
 	return r, h, nil
 }
 
-func clearAction(r *viewstore.VehicleRow) {
+func clearAction(r *projection.ProjectedVehicle) {
 	r.ActionID, r.ActionType, r.ActionNote, r.ActionUpdatedBy = "", "", "", ""
 	r.ActionProposedAt, r.ActionUpdatedAt = time.Time{}, time.Time{}
 }

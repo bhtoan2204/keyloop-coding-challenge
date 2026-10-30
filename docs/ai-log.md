@@ -487,3 +487,63 @@ Factual, append-only record of what the AI assistant (Claude Code, model Claude 
   - snapshots in the import (the runtime snapshot interval is 0, so the export had none);
   - no video.
 - **Not done by the AI:** no commit, no push. The existing `keyloop_*` containers and volumes were left untouched. Throwaway resources (`keyloop-p7-pg`, `keyloop-p7-mysql`, the `keyloop-p7-verify` project) were the AI's own and were removed after verification.
+
+## Phase 7.1: cleanup and repository structure (2026-10-30, branch `phase7-postgres-only`, base `df2440a`, uncommitted)
+
+- **Request (developer):**
+  - remove the one-off MySQL import and the legacy read-model upgrade, which the Phase 7 entry above records as implemented; the assessment needs only fresh installations;
+  - restructure the read side around consumer-owned ports and cohesive repositories;
+  - compose the list query from reusable scopes;
+  - add reusability rules.
+
+  The AI implemented it.
+- **Baseline before editing:** unit tests ok; integration 134 PASS / 0 FAIL / 0 SKIP on a throwaway PostgreSQL 17.
+- **Removed, `git rm`:**
+  - `deploy/import/mysql-history.sh` and `docs/mysql-import.md` (no runtime code used them);
+  - `viewstore/legacy_upgrade.go` and its three tests;
+  - the old viewstore files whose code moved (`viewstore.go`, `projection_writes.go`, `*_query.go`, `vehicle_rows.go`, `list_vehicles_query.go` and its test, now in `repositories/vehicle_filters_test.go`).
+- **Changed:**
+  - **Migrations:** an earlier `public` read-model layout is now refused by `migrate` and left untouched (it used to be adopted).
+  - **Ports and models:** `internal/application/projection` (`Store`, `ProjectedVehicle`, `ActionHistoryEntry`) replaces `viewstore.ViewStore`, `VehicleRow` and `HistoryRow`.
+  - **`viewstore` split:**
+    - `models` (GORM rows plus a `DATE` type);
+    - `repositories` (Vehicle, ActionHistory, InventorySummary, Projection, Dealership, plus scopes and mappers);
+    - `migrations`;
+    - the root composes them (`Postgres`, `ReadModel`, `RunExclusive`, `Migrate`).
+  - **List query:** built from named GORM scopes instead of `[]string` predicates.
+  - **Rules:** `CLAUDE.md`, `.claude/rules/source-organization.md` and the review and test skills gained the reusability, separation-of-concerns, query-construction and anti-overengineering rules.
+- **Behaviour preserved, with evidence:**
+  - every pre-existing test still passes; only the three legacy-upgrade tests were removed;
+  - the plan shapes of the six representative list queries are identical before and after: the old explain test was run from `git archive HEAD` against the same fixture and its normalised plans diffed;
+  - the transaction path is unchanged (projection lock, CAS, `RETURNING id`, projection on the same `*gorm.DB`, commit, `Update`).
+- **New tests:**
+  - current-layout migrations: fresh, re-run keeping data, concurrent callers, failed version rolled back, newer version refused, earlier `public` layout refused untouched;
+  - transaction-bound repository writes, round-tripped in an `America/Los_Angeles` session;
+  - mappers and the `DATE` type;
+  - `TestApplicationOwnsItsPorts` and `TestViewstorePackageDependencies`;
+  - single-status grouping of the age branch.
+- **Mutation checks:**
+  - a one-day shift of the aging cutoff failed 3 tests;
+  - a GORM import in `application/projection` failed the layer test;
+  - OR-joining the single age branch failed `TestMakeModelAgeAndStatusFilters` and the SQL-shape test.
+- **AI mistakes:**
+  - (1) The first `models.Date` comment claimed that a `time.Time` bound to a `DATE` parameter could shift by a day in the session time zone. Its own mutation test disproved this: pgx v5 encodes only the calendar fields. The comment was corrected and the type kept as a plain calendar date.
+  - (2) Moving two writes to GORM silently changed `projection_aggregate.updated_at` and `projection_run.finished_at` from the database's `now()` to the application clock. The Event Sourcing reviewer caught it; both are raw SQL again with `now()`, exactly as before.
+  - (3) An intent-to-add `git add -N` was run on new files (index only, no commit).
+- **Review results:**
+  - **Security:** none critical or major.
+  - **Event Sourcing:** none critical or major; it found the timestamp change above.
+  - **Go:** reported a "critical" cross-dealership leak, claiming that a one-element `clause.Or` would be OR-joined to the dealership predicate. Rendering the SQL showed it is AND-joined and parenthesised in GORM 1.31.2, and the integration filter tests pass, so the finding was rejected as stated. The fragility was real: the scope now passes a single branch without `Or`, and tests pin both shapes. Its other minors were also fixed: a stale comment, `toModelDate` ignoring a parse error, and test variables shadowing `min`/`max`.
+- **Environment:** rootless podman's `pasta` could not copy this WSL host's IPv6 routes ("Too many routes to duplicate"). The throwaway PostgreSQL ran with `--network pasta:-4`; the Compose verification used a scratch `CONTAINERS_CONF_OVERRIDE` setting `pasta_options = ["-4"]`. No project or system configuration was changed.
+- **Verified (this session):**
+  - `gofmt -l .` empty; `go vet` clean (default, `integration` and `e2e` tags); `make check` exit 0;
+  - `make test-integration` exit 0 (144 PASS, 0 FAIL, 0 SKIP); integration under `-race` exit 0;
+  - **Clean-copy stack:** a copy of the working tree with no `.env`, under its own Compose project:
+    - `make stack-up` exit 0, re-run exit 0, and exit 0 again on a fresh volume after the fixes;
+    - `make e2e` PASS;
+    - a Compose rebuild left the list unchanged;
+    - a restart kept the data;
+    - the API sessions are only `inventory_app` and `inventory_reader`;
+    - no MySQL, Kafka or Debezium appears in Compose, the Makefile, `.env.example`, the Dockerfile or the module graph.
+- **Not verified:** Docker Compose v2 itself (only the Podman wrappers are here).
+- **Not done by the AI:** no commit, no push. The user's existing `keyloop_*` volumes and containers were not touched; the throwaway `keyloop-p71-pg` container and the `keyloop-p71-verify` project were the AI's own and were removed afterwards.

@@ -1,4 +1,4 @@
-package viewstore
+package migrations
 
 // readModelTablesDDL creates the projected tables. There is deliberately no is_aging or
 // days_in_stock column: both change daily and are computed at query time from
@@ -55,7 +55,7 @@ CREATE TABLE read_model.projection_aggregate (
 	updated_at    TIMESTAMPTZ NOT NULL
 );
 
--- One row per rebuild ('sync' rows may exist from the earlier asynchronous design).
+-- One row per completed rebuild.
 CREATE TABLE read_model.projection_run (
 	run_id         BIGSERIAL PRIMARY KEY,
 	kind           TEXT NOT NULL CHECK (kind IN ('sync', 'rebuild')),

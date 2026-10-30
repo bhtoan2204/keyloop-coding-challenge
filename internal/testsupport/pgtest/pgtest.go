@@ -19,8 +19,8 @@ import (
 )
 
 // NewDatabase creates a throwaway, empty database and returns an owner connection and
-// its URL. The database is dropped afterwards. Callers apply viewstore.Migrate (this
-// package does not import viewstore, so viewstore's own tests can use it).
+// its URL. The database is dropped afterwards. Callers apply repos.Migrate and
+// viewstore.Migrate (this package imports neither, so their own tests can use it).
 func NewDatabase(t *testing.T) (*gorm.DB, string) {
 	t.Helper()
 	admin := os.Getenv("PG_TEST_DSN")

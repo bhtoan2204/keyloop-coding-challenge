@@ -55,7 +55,7 @@ func newFixture(t *testing.T) *fixture {
 	return &fixture{
 		store: store,
 		proj:  projection.NewProjection(store, &projectors.VehicleProjector{}),
-		svc:   query.NewService(store, clock{&n}),
+		svc:   query.NewService(viewstore.NewReadModel(db), clock{&n}),
 		now:   &n,
 		dsn:   dsn,
 	}
@@ -252,7 +252,7 @@ func TestKeysetPaginationOverManyRowsWithDuplicateSortKeys(t *testing.T) {
 	// Second pass without index scans: rows then come from a sequential scan and an
 	// explicit sort, so only the ORDER BY (with its vehicle_id tie-breaker) decides the
 	// order of equal stock dates, not the index's physical order.
-	noIndex := query.NewService(viewstore.NewPostgres(pgtest.Open(t, f.dsn+"&enable_indexscan=off&enable_bitmapscan=off")), clock{f.now})
+	noIndex := query.NewService(viewstore.NewReadModel(pgtest.Open(t, f.dsn+"&enable_indexscan=off&enable_bitmapscan=off")), clock{f.now})
 	for pass, svc := range []*query.Service{f.svc, noIndex} {
 		for _, desc := range []bool{false, true} {
 			want := append([]key(nil), all...)

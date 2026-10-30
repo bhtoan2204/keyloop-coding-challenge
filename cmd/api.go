@@ -64,7 +64,7 @@ func runAPI(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	defer readerDB.Close()
-	queries := query.NewService(viewstore.NewPostgres(reader), command.SystemClock{})
+	queries := query.NewService(viewstore.NewReadModel(reader), command.SystemClock{})
 	ready := func(ctx context.Context) error {
 		if err := writerDB.PingContext(ctx); err != nil {
 			return err

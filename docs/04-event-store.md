@@ -193,7 +193,7 @@ Since Phase 7 the event store is the schema `event_store` of the single PostgreS
 | 2 | `dealership(dealership_id PK, name, timezone)`, seeded `d-001` (Europe/London) and `d-002` (Australia/Sydney) with `ON CONFLICT DO NOTHING`. The canonical reference data: the command side reads the time zone here, and the read model's foreign key and queries point here too. |
 
 - The PostgreSQL schema starts at version 1: the MySQL v1–v3 steps (additive columns, backfill) are not replayed. Their end state is the v1 DDL above plus v2.
-- `id` is `BY DEFAULT` so the one-off MySQL import can keep the original ids; it then moves the sequence past them ([mysql-import.md](mysql-import.md)).
+- `id` is an identity column (`BY DEFAULT`, kept from Phase 7, when a one-off MySQL import used explicit ids; that import was removed in Phase 7.1). The application never supplies an id; it reads the generated one back with `RETURNING`.
 - Every table name in SQL is schema-qualified. The unit tests run the same SQL on SQLite with an attached database named `event_store` (`internal/testsupport/sqlitetest`); `migrations.go` keeps a SQLite variant with the same tables, columns and unique constraints.
 
 ### 9.2 Migrator (`repos/migrate.go`)

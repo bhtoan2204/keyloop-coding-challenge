@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+
+	"keyloop-coding-challenge/internal/infrastructure/viewstore/repositories"
 )
 
 // ErrRunInProgress: another rebuild holds the projection lock, or a command save holds it shared.
@@ -19,15 +21,16 @@ func (p *Postgres) RunExclusive(ctx context.Context, kind string, truncate bool,
 	fn func(tx *Postgres) (read, applied int, err error)) (read, applied int, err error) {
 	started := time.Now()
 	err = p.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var locked bool
-		if err := tx.Raw(`SELECT pg_try_advisory_xact_lock(?, 0)`, lockClassProjection).Row().Scan(&locked); err != nil {
+		runs := repositories.NewProjectionRepository(tx)
+		locked, err := runs.TryLockExclusive(ctx)
+		if err != nil {
 			return err
 		}
 		if !locked {
 			return ErrRunInProgress
 		}
 		if truncate {
-			if err := tx.Exec(`TRUNCATE read_model.vehicle_action_history, read_model.inventory_vehicle, read_model.projection_aggregate`).Error; err != nil {
+			if err := runs.Truncate(ctx); err != nil {
 				return err
 			}
 		}
@@ -41,8 +44,7 @@ func (p *Postgres) RunExclusive(ctx context.Context, kind string, truncate bool,
 		if fnErr != nil {
 			return fnErr
 		}
-		return tx.Exec(`INSERT INTO read_model.projection_run(kind, started_at, finished_at, events_read, events_applied)
-			VALUES (?, ?, now(), ?, ?)`, kind, started, read, applied).Error
+		return runs.RecordRun(ctx, kind, started, read, applied)
 	})
 	if err != nil {
 		return 0, 0, err

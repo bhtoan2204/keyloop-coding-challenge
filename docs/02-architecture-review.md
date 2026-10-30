@@ -156,10 +156,10 @@ To add, each when its phase starts: `gorm.io/driver/mysql` (Phase 1), a Postgres
 
 **What changed.**
 
-- The event store moved from MySQL into schema `event_store` (`es_aggregate`, `es_event`, `es_aggregate_snapshot`, `dealership`); the read model moved into schema `read_model` of the same database (default name `inventory_read`, kept so an existing volume is upgraded in place).
+- The event store moved from MySQL into schema `event_store` (`es_aggregate`, `es_event`, `es_aggregate_snapshot`, `dealership`); the read model moved into schema `read_model` of the same database (default name `inventory_read`).
 - Each command save is one transaction: shared projection advisory lock → create-if-missing → version CAS → `INSERT es_event … RETURNING id` → `Projection.Apply` on the same transaction → optional snapshot → commit (04 §9, 05 §8).
 - Removed: MySQL, Debezium, Kafka Connect, Kafka, the `projector` process, `sync-projections`, `/status`, `internal/application/messaging`, `internal/infrastructure/kafka`, the pipeline tests.
-- Kept unchanged: the domain, event names and payloads, the serializer, `AggregateStore` with its CAS and unique key, the `Projection`/`Projector`/`ViewStore` abstractions, the REST contract (except its consistency statements), the CQRS split (separate models, pools and roles).
+- Kept unchanged: the domain, event names and payloads, the serializer, `AggregateStore` with its CAS and unique key, the `Projection`/`Projector` abstractions and the read-model write port (`ViewStore`, moved to `application/projection.Store` in Phase 7.1), the REST contract (except its consistency statements), the CQRS split (separate models, pools and roles).
 
 **Why the §1 argument no longer applies.** §1 chose Debezium over polling because `AUTO_INCREMENT` ids are not assigned in commit order. With the projection inside the command transaction there is no poller and no feed: the read model commits with the events. The rebuild reads `event_store` while holding the projection lock exclusively, and commands hold it shared from before their CAS until commit, so no event can commit during a rebuild and its reads are a consistent snapshot.
 
@@ -171,4 +171,4 @@ To add, each when its phase starts: `gorm.io/driver/mysql` (Phase 1), a Postgres
 
 Costs accepted: the projection runs on the command's critical path (latency and lock scope grow with projection cost); a rebuild blocks commands for its duration; everything is on one PostgreSQL primary (single point of failure; scale vertically, read replicas later — a replica would reintroduce lag for reads routed to it, so it is not done).
 
-**Existing data.** `migrate` upgrades the Phase 4–6 PostgreSQL read model in place. The MySQL event history is imported only by an explicit one-off script ([mysql-import.md](mysql-import.md)).
+**Existing data.** Phase 7 shipped an in-place upgrade of the Phase 4–6 read model and a one-off MySQL import script. Phase 7.1 removed both at the developer's request: the assessment needs a fresh installation only, and `migrate` now refuses (without touching it) a database that still has the earlier `public` layout.

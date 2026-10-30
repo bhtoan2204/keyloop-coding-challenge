@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	ports "keyloop-coding-challenge/internal/application/projection"
 	"keyloop-coding-challenge/internal/infrastructure/projection/projectors"
-	"keyloop-coding-challenge/internal/infrastructure/viewstore"
 	"keyloop-coding-challenge/package/eventsourcing"
 )
 
@@ -28,11 +28,11 @@ type Projection interface {
 }
 
 type projectionPipeline struct {
-	store  viewstore.ViewStore
+	store  ports.Store
 	stages [][]projectors.Projector
 }
 
-func NewProjection(store viewstore.ViewStore, projs ...projectors.Projector) Projection {
+func NewProjection(store ports.Store, projs ...projectors.Projector) Projection {
 	return &projectionPipeline{
 		store: store,
 		stages: [][]projectors.Projector{
@@ -49,7 +49,7 @@ func (p *projectionPipeline) Apply(ctx context.Context, ev eventsourcing.Event) 
 		return false, fmt.Errorf("%w: %s v%d has schema version %d", ErrUnsupportedSchemaVersion, ev.AggregateID, ev.Version, ev.SchemaVersion)
 	}
 	applied := false
-	err := p.store.WithTransaction(ctx, func(tx viewstore.ViewStore) error {
+	err := p.store.WithTransaction(ctx, func(tx ports.Store) error {
 		current, err := tx.LockAggregate(ctx, ev.AggregateID)
 		if err != nil {
 			return err
@@ -79,7 +79,7 @@ func (p *projectionPipeline) Apply(ctx context.Context, ev eventsourcing.Event) 
 
 // runStage runs the stage's projectors one after another: they share one database
 // transaction, which must not be used concurrently.
-func (p *projectionPipeline) runStage(ctx context.Context, tx viewstore.ViewStore, stage []projectors.Projector, ev eventsourcing.Event) error {
+func (p *projectionPipeline) runStage(ctx context.Context, tx ports.Store, stage []projectors.Projector, ev eventsourcing.Event) error {
 	for _, proj := range stage {
 		if err := proj.Handle(ctx, tx, ev); err != nil {
 			return fmt.Errorf("projector %T: %w", proj, err)

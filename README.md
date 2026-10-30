@@ -20,7 +20,6 @@ Until Phase 7 the design used a MySQL event store, Debezium, Kafka and a separat
 | [api/openapi.yaml](api/openapi.yaml) | API contract (OpenAPI 3.1); also served at `/openapi.yaml` and as Swagger UI at `/docs` |
 | [docs/curl-examples.md](docs/curl-examples.md) | Copy-paste requests for every endpoint and error |
 | [docs/demo.md](docs/demo.md) | Demo script and 5–10 minute video outline |
-| [docs/mysql-import.md](docs/mysql-import.md) | One-off import of an event history from the earlier MySQL event store |
 | [docs/ai-log.md](docs/ai-log.md) | Factual log of the AI collaboration (source of the narrative below) |
 | `docs/01`–`08` | Detailed requirements, domain, event store, read model, API and observability notes (02, 04, 05 and 07 keep the earlier MySQL/Kafka design as history) |
 
@@ -63,7 +62,7 @@ make e2e           # optional: the full business flow against the running stack 
 
 `make stack-up` runs the one-shot init services one at a time, which works with Docker Compose and podman-compose alike. With Docker Compose v2, `docker compose up -d --build` does the same through `depends_on` conditions. That path is unverified: only podman-compose was available here, and podman cannot start a container whose `depends_on` target has already exited. Every init step is idempotent, so `make stack-up` can be re-run.
 
-**Existing data.** The database keeps its earlier name (`inventory_read`), so `migrate` upgrades a Phase 4–6 `postgres-data` volume in place: it moves the old read-model tables into the `read_model` schema with their rows and drops nothing. Volumes of the earlier MySQL/Kafka stack (`mysql-data`, `kafka-data`) are no longer declared in Compose but are never deleted. Their event history is **not** imported automatically; see [docs/mysql-import.md](docs/mysql-import.md). On such an upgraded volume the Phase 6 role `inventory_projector` still exists, and its grants moved with the tables. It has no `USAGE` on `read_model`, so it cannot reach them, but nothing uses it any more. Remove it by hand once you no longer need to roll back: `DROP OWNED BY inventory_projector; DROP ROLE inventory_projector;`, run as the admin role.
+**Fresh installations only.** `migrate` creates both schemas on an empty database. A database that still has read-model tables in `public` from an earlier layout is refused with an error and left untouched (nothing is moved or dropped); start from a new volume instead. Earlier MySQL/Kafka volumes are not used and are never deleted by this project.
 
 The image (`Dockerfile`):
 
@@ -102,7 +101,8 @@ What the suites cover:
 - **Atomicity:** a failed projection or a lock timeout rolls back the events, the version CAS and the read model together; nothing is reported as success.
 - **Read-after-write:** a GET right after a command returns the new version; history `event_id` equals `es_event.id`.
 - **Rebuild:** equals the read model the commands produced, also with commands running concurrently.
-- **Migrations:** concurrent callers, in-place upgrade of the Phase 4–6 layout (rows kept, atomic failure, partial layout refused).
+- **Migrations:** fresh layout, idempotent re-runs keeping data, concurrent callers, rollback of a failed version, newer version refused, an earlier `public` layout refused untouched.
+- **Read-model repositories:** mapping and NULL/date/UTC round trips, transaction-bound writes that roll back together, list SQL composed only of bound parameters with the planned indexes usable.
 - **Least privilege:** the deployed roles can do their job and nothing more.
 - **Error and HTTP mapping; the OpenAPI contract against the routes; package dependency direction.**
 
@@ -114,10 +114,11 @@ Test results are recorded per phase in [docs/ai-log.md](docs/ai-log.md).
 api/                          OpenAPI 3.1 contract (embedded and served by the API)
 cmd/                          one binary: api, migrate, rebuild-projections, healthcheck
 deploy/postgres/              role grants: application writer, read-only, rebuild
-deploy/import/                one-off MySQL history import (docs/mysql-import.md)
 internal/domain/              VehicleInventoryAggregate, events, Date and aging rule (no I/O)
-internal/application/         command (write use cases), query (read use cases)
-internal/infrastructure/      eventstore (event_store schema), viewstore + projection (read_model schema), referencedata
+internal/application/         command (write use cases), query (read use cases), projection (read-model write port);
+                              each declares the ports it needs
+internal/infrastructure/      eventstore (event_store schema), projection (projectors, rebuild),
+                              viewstore (read_model: models, repositories, migrations), referencedata
 internal/presentation/        router + commands, queries, probes, apidocs over the shared httpkit
 internal/e2e/                 end-to-end test suite
 package/eventsourcing/        the event-sourcing framework the project started from (extended, not replaced)
@@ -210,9 +211,25 @@ After the CDC pipeline was working and tested, **the developer decided** to drop
   - each command now appends its events and updates the read model in one transaction, and the API answers only after that commit;
   - rebuilds take an exclusive lock that commands share, so a rebuild sees a consistent snapshot.
 - **Removed only after the replacement was proven:** the old MySQL and pipeline tests were replaced first by PostgreSQL tests of the new guarantees (atomic rollback, immediate read-after-write, event ids in history, rebuild alongside concurrent commands, least-privilege roles, upgrade of the earlier read-model tables). The obsolete code and dependencies were deleted after that.
-- **Existing history:** it is not converted automatically. An explicitly invoked import script ([docs/mysql-import.md](docs/mysql-import.md)) copies the MySQL history with its ids. It was checked byte for byte against history written by the pre-Phase-7 binary.
+- **Existing history:** it was not converted automatically. An explicitly invoked import script copied the MySQL history with its ids and was checked byte for byte against history written by the pre-Phase-7 binary. The developer later removed it (Phase 7.1), together with the in-place upgrade of the earlier read model, because the assessment needs only a fresh installation.
 - **AI mistakes this phase:**
   - a `pkill -f` pattern again matched the AI's own shell;
   - a compose command for the rebuild job did not work under podman-compose. It was found by the clean-copy start and corrected in the docs.
 
   Both are in [docs/ai-log.md](docs/ai-log.md).
+
+### Phase 7.1: cleanup and repository structure
+
+The developer then asked for a cleanup:
+
+- **Removed:** the one-off MySQL import and the legacy read-model upgrade. A database with the earlier `public` layout is now refused, not adopted.
+- **Ports in the application layer:** the read-model write port (`projection.Store`) and its models moved from infrastructure to `internal/application/projection`, next to `command.VehicleStore` and `query.ReadModel`.
+- **Viewstore split** into:
+  - persistence `models`;
+  - one repository per table group, all built on the caller's transaction;
+  - explicit mappers;
+  - `migrations`.
+- **List query:** now composed from named GORM scopes instead of concatenated predicates.
+
+The SQL, the indexes it can use, the REST contract and the single-transaction guarantee are unchanged, and the existing tests pass. The AI's mistake this phase: a justification comment ("a `time.Time` bound to a `DATE` column could shift by a day") was disproved by its own mutation test. pgx encodes the date fields only, so the comment was corrected (see [docs/ai-log.md](docs/ai-log.md)).
+

@@ -35,6 +35,14 @@ Base: `$ARGUMENTS` (if empty, use `HEAD`). Read-only: do not edit, stage, commit
   imports; small exported APIs; public entry points kept stable (aliases/facades).
   For structural refactors, confirm no behaviour change (same exported API, events, SQL, HTTP
   contracts, tests and assertions).
+- **Repositories and reuse** (`.claude/rules/source-organization.md` "Reusability", "Separation of
+  concerns", "Query construction", "Anti-overengineering"): port interfaces declared by their
+  application consumer, implemented in infrastructure; no GORM/SQL types in application models;
+  persistence models only in `viewstore/models`; explicit mappers; every repository of one write built
+  on the same transaction handle, never beginning/committing itself or using the root pool; list
+  queries composed from named scopes with bound parameters and fixed ordering (check `EXPLAIN` when a
+  predicate changes); shared predicates/helpers reused rather than duplicated; no generic CRUD
+  repository, reflection mapping, `any`-typed APIs or adapter layers without a real responsibility.
 - **Tests:** do new behaviours have failing-without-change tests? Were any assertions weakened?
 - **Docs:** deviations from `docs/` recorded; `docs/ai-log.md` factual.
 

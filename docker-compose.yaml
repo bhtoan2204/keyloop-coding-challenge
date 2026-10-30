@@ -8,9 +8,6 @@
 #
 # Configuration and secrets come from .env (see .env.example); none are baked into the
 # image. Every published port is bound to 127.0.0.1 only.
-#
-# Volumes of the earlier MySQL/Kafka stack (mysql-data, kafka-data) are no longer
-# declared but are NOT removed: see docs/mysql-import.md for importing that history.
 name: keyloop
 
 # api and rebuild reuse the image built for migrate (the first app service started).

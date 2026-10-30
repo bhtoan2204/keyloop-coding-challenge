@@ -61,7 +61,7 @@ func newPostgresAPI(t *testing.T, appParams map[string]string) *postgresAPI {
 		eventstore.WithProjection(projection.NewCommandProjection(&projectors.VehicleProjector{})),
 	)
 	commands := command.NewService(commandstore.New(store), referencedata.NewDealerships(app), fixedClock{}, discard)
-	queries := query.NewService(viewstore.NewPostgres(reader), fixedClock{})
+	queries := query.NewService(viewstore.NewReadModel(reader), fixedClock{})
 	sqlDB, err := app.DB()
 	if err != nil {
 		t.Fatal(err)

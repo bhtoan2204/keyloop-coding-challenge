@@ -30,7 +30,7 @@ type VehicleFilter struct {
 	Limit      int
 }
 
-// ReadModel is the read-side persistence port (implemented by viewstore.Postgres).
+// ReadModel is the read-side persistence port (implemented by viewstore.ReadModel).
 type ReadModel interface {
 	DealershipLocation(ctx context.Context, dealershipID string) (*time.Location, error)
 	ListVehicles(ctx context.Context, f VehicleFilter) ([]Vehicle, error)

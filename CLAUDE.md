@@ -32,10 +32,18 @@ Implemented and tested (runtime: PostgreSQL 17 + the `api` process + one-shot in
 - `internal/application/command`: command service (load → dealership ownership → If-Match → domain command at the
   dealership business date → `SaveWithMetadata`; reload-and-retry ≤ 3 on retryable errors, never on unavailable).
   `internal/infrastructure/referencedata`: dealership time zones from `event_store.dealership`.
-- Read side: `internal/infrastructure/viewstore` (`read_model` schema + migrations, incl. in-place upgrade of the
-  Phase 4–6 `public` layout, `legacy_upgrade.go`), `internal/infrastructure/projection` (`Projection.Apply`,
-  `VehicleProjector`, `CommandProjection` for the save transaction, `Runner.Rebuild`), `internal/application/query`,
-  `presentation/queries` (4 GET endpoints). The read model is updated atomically with the events: read-after-write is immediate.
+- Read side (Phase 7.1 layout):
+  - `internal/application/projection`: the projection write port `Store` and its models
+    (`ProjectedVehicle`, `ActionHistoryEntry`). `internal/application/query`: `ReadModel` port.
+  - `internal/infrastructure/viewstore`: `Postgres` (implements `projection.Store`, transaction-bound;
+    `RunExclusive` for rebuilds) and `ReadModel` (implements `query.ReadModel`), both composing
+    `viewstore/repositories` (Vehicle, ActionHistory, InventorySummary, Projection, Dealership; list query from
+    named GORM scopes in `vehicle_filters.go`; mappers in `mappers.go`) over `viewstore/models` (GORM row types,
+    `models.Date`). `viewstore/migrations`: `read_model` v1 for a fresh database only; an earlier `public`
+    layout is refused, never adopted.
+  - `internal/infrastructure/projection` (`Projection.Apply`, `VehicleProjector`, `CommandProjection` for the save
+    transaction, `Runner.Rebuild`), `presentation/queries` (4 GET endpoints). The read model is updated atomically
+    with the events: read-after-write is immediate.
 - `cmd`: `api`, `migrate`, `rebuild-projections` (one transaction, exclusive projection lock, rebuild role), `healthcheck URL`.
 - Roles (`deploy/postgres`): admin (`POSTGRES_USER`, migrate/grants only), writer `inventory_app` (`app-grants.sql`,
   append-only `es_event`), reader `inventory_reader` (`grants.sql`), rebuild `inventory_rebuild` (`rebuild-grants.sql`).
@@ -43,10 +51,10 @@ Implemented and tested (runtime: PostgreSQL 17 + the `api` process + one-shot in
   (`make stack-up`), `api/openapi.yaml` (embedded; `/openapi.yaml`, `/docs`; `openapi_contract_test.go`), Prometheus
   `/metrics` (`inventory_http_*`), `internal/e2e` (`make e2e`, asserts immediate read-after-write).
   Submission docs: `README.md` (AI Collaboration Narrative), `docs/system-design.md`, `docs/demo.md`, `docs/curl-examples.md`.
-- One-off MySQL history import: `deploy/import/mysql-history.sh` (`docs/mysql-import.md`); explicit, never automatic.
 
 Removed in Phase 7: MySQL, Debezium, Kafka, Kafka Connect, the `projector` process, `sync-projections`, `/status`,
-`internal/application/messaging`, `internal/infrastructure/kafka`, `internal/pipeline`.
+`internal/application/messaging`, `internal/infrastructure/kafka`, `internal/pipeline`. Removed in Phase 7.1: the one-off
+MySQL history import and the in-place upgrade of the Phase 4–6 `public` read model (fresh installations only).
 Not implemented: Idempotency-Key, authentication, VIN uniqueness (D4), OpenTelemetry export.
 `.env` is git-ignored; copy `.env.example`.
 
@@ -58,10 +66,11 @@ Not implemented: Idempotency-Key, authentication, VIN uniqueness (D4), OpenTelem
 | Load/save aggregates | `eventstore.AggregateStore` (`NewAggregateStoreWithSnapshotInterval`), `SaveWithMetadata` |
 | Store port for commands | `command.VehicleStore`, implemented by `eventstore/commandstore` (maps store errors to `command.Err*`) |
 | Transactions on the write side | `repos.EventStore.WithTransaction` |
-| Projection | `projection.Projection` + `projectors.Projector` + `viewstore.ViewStore` (narrow refactor per `docs/05` §4.1) |
+| Projection | `projection.Projection` + `projectors.Projector` over the application port `application/projection.Store` |
+| Read-model persistence | `viewstore/repositories` (one repository per table group, built on the caller's `*gorm.DB`), `viewstore/models`, mappers in `repositories/mappers.go`; compose them in `viewstore.Postgres` / `viewstore.ReadModel` |
+| List filters | named scopes in `repositories/vehicle_filters.go` (add a scope, do not concatenate SQL) |
 | Read model in the command transaction | `eventstore.TransactionalProjection` via `eventstore.WithProjection`, implemented by `projection.CommandProjection` |
 | Rebuild | `projection.Runner.Rebuild` over `viewstore.Postgres.RunExclusive` and `repos.EventStore.ReadAll` |
-| Empty packages to fill | `internal/application/*`, `internal/presentation`, `cmd/main.go` |
 | Leave unwired, do not delete | `projectors/projector_outbox.go`, `internal/infrastructure/cache`, `package/redis` |
 
 ## Source organization
@@ -84,7 +93,15 @@ Follow `.claude/rules/source-organization.md`:
 - `internal/presentation` → `internal/application` only. No domain logic in handlers or SQL. Layout: root
   `router.go` composes `commands` (write endpoints), `queries` (read endpoints) and `probes` (healthz/readyz/
   metrics) over the shared transport `httpkit`; `application_ports.go` keeps the public type names as aliases.
-- Add an interface only where there is a second implementation (real DB + test fake). No generic frameworks.
+- Repository and port interfaces belong to their consumer: `command.VehicleStore`, `query.ReadModel`,
+  `projection.Store` live in `internal/application`; infrastructure implements them (pinned by
+  `internal/application/layer_dependencies_test.go`). Persistence models (`viewstore/models`) and SQL stay in
+  infrastructure; application models never import GORM. `viewstore` children never import the root
+  (`viewstore/package_dependencies_test.go`).
+- Every repository of one command write is built on the SAME transaction handle; repositories never begin or
+  commit a transaction and never fall back to the root pool.
+- Add an interface only where there is a second implementation (real DB + test fake) or a consumer that owns
+  the contract. No generic frameworks, no generic CRUD `Repository[T]`.
 
 ## Event Sourcing / CQRS here
 - Write: command method validates → `ApplyChange` → `Transition` → `applyX` mutates state (apply methods re-check

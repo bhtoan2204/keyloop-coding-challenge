@@ -551,19 +551,19 @@ Data-loss resync (§7.4) is the same sync as mechanism 1, run while consuming.
 
 The developer decided to replace the CDC pipeline with a synchronous projection in one PostgreSQL database (02 §9, D16). The projection code itself (`Projection.Apply`, `VehicleProjector`, `ViewStore`) is the same one the CDC consumer and the rebuild used; only who calls it, and in which transaction, changed.
 
-### 8.1 Schema (`internal/infrastructure/viewstore/{schema.go,read_model_ddl.go,legacy_upgrade.go}`)
+### 8.1 Schema (`internal/infrastructure/viewstore/migrations/{migrate.go,schema.go}`)
 
 Schema `read_model`, in the same database as `event_store`:
 
 - `inventory_vehicle` (as §6.2), with its foreign key `dealership_id → event_store.dealership`: there is one dealership table now, not one per database;
 - `vehicle_action_history` (PK `(vehicle_id, version)`, `event_id` = `es_event.id`);
 - `projection_aggregate(aggregate_id, version, last_event_id, updated_at)`;
-- `projection_run(run_id, kind, started_at, finished_at, events_read, events_applied)` (old `sync` rows may remain from the earlier design);
+- `projection_run(run_id, kind, started_at, finished_at, events_read, events_applied)`, one row per rebuild;
 - `read_model.schema_migrations`.
 
 Migrations: versioned, one transaction per version, under `pg_advisory_xact_lock(52001, 0)` (also the bootstrap `CREATE SCHEMA`), and a database newer than the build is refused. They run after the event-store migrations (the foreign key needs `event_store.dealership`).
 
-**Upgrade in place of the Phase 4–6 layout.** If `public` holds all four earlier tables (`inventory_vehicle`, `vehicle_action_history`, `projection_aggregate`, `projection_run`), `migrate` moves them with `ALTER TABLE … SET SCHEMA read_model` (rows, indexes and sequences kept) and re-points the dealership foreign key at `event_store.dealership`. `public.dealership` and `public.rm_schema_migrations` are left untouched; nothing is dropped. A partial earlier layout is refused rather than guessed at. The upgrade runs in the migration transaction, so a failure (for example a projected dealership missing from `event_store.dealership`) leaves the database unchanged. Tested in `legacy_upgrade_pg_integration_test.go`.
+**Fresh installations only (Phase 7.1).** Phase 7 could adopt the Phase 4–6 tables from `public`; Phase 7.1 removed that upgrade. If any of the earlier read-model tables exists in `public`, version 1 fails with an error and the database is left as it was: nothing is moved, overwritten or dropped. Tested in `viewstore/migrations/migrate_pg_integration_test.go` (fresh layout, re-run keeps data, concurrent callers, failed version rolls back, newer version refused, earlier layout refused).
 
 ### 8.2 Command path (`projection/command_projection.go`, `eventstore/transactional_projection.go`)
 
@@ -581,7 +581,7 @@ Migrations: versioned, one transaction per version, under `pg_advisory_xact_lock
 
 Commands: projection lock (shared) → `es_aggregate` row (insert/CAS) → per-vehicle advisory lock and read-model rows. Rebuild: projection lock (exclusive, try-lock) → `TRUNCATE` → read-model rows. Both take the projection lock first, so a rebuild never waits for event-store rows held by a command, and no cycle can form between them.
 
-### 8.4 Rebuild (`projection/runner.go`, `viewstore/projection_runs.go`, `cmd/projections.go`)
+### 8.4 Rebuild (`projection/runner.go`, `viewstore/rebuild_run.go`, `cmd/projections.go`)
 
 `rebuild-projections` (`make rebuild-projections`, `docker compose --profile tools run --rm --no-deps rebuild`) runs as the rebuild role `inventory_rebuild` in ONE transaction:
 
@@ -592,7 +592,7 @@ Commands: projection lock (shared) → `es_aggregate` row (insert/CAS) → per-v
 
 Any failure rolls back everything, so the old read model stays. Because commands hold the shared lock from before their CAS until commit, no event can commit while the rebuild holds the exclusive lock, so its READ COMMITTED batch reads see one stable history. Running it again gives the same read model. `TRUNCATE` takes an exclusive table lock, so queries also wait until the rebuild commits and never see a partial model.
 
-Use it for recovery, after the one-off MySQL import ([mysql-import.md](mysql-import.md)), or after changing a projector.
+Use it for recovery, or after adding or changing a projector: the event history is the source of truth, so a new read model is filled by replaying it.
 
 ### 8.5 Consistency model
 
@@ -616,7 +616,9 @@ None is a superuser or can change the schema; only `migrate` (admin) does.
 - `projection/command_projection_pg_integration_test.go`: a projection failure rolls back the events and the CAS and keeps the pending events; a read model ahead of the event store fails the save; a rebuild interleaved with concurrent commands.
 - `presentation/postgres_read_after_write_integration_test.go`: a GET right after each command returns the projected version equal to the aggregate version, and history `event_id` equals `es_event.id`.
 - `presentation/postgres_*_integration_test.go`: command lifecycle, rejections (incl. the 89/90/91-day boundary), concurrent proposals, a failed transaction under `lock_timeout` → 503 with no events and no read-model change, rebuild equality, least-privilege roles.
-- `viewstore/legacy_upgrade_pg_integration_test.go`: upgrade preserves rows, fails atomically, refuses a partial layout.
+- `viewstore/migrations/migrate_pg_integration_test.go`: the current-layout migration tests above.
+- `viewstore/projection_store_pg_integration_test.go`: repository writes bound to one transaction roll back together; values (dates, NULLs, UTC times) round-trip, also in a session time zone west of UTC.
+- `viewstore/repositories/explain_pg_integration_test.go`: the planned indexes are usable by the composed list query.
 - `internal/e2e`: the business flow against a running stack asserts immediate read-after-write (no polling).
 
 ### 8.8 Limitations
@@ -625,3 +627,42 @@ None is a superuser or can change the schema; only `migrate` (admin) does.
 - A rebuild blocks commands (and queries) for its duration; it is O(total events). No shadow-table rebuild.
 - One PostgreSQL primary for everything. Read replicas are not used, because a replica would reintroduce lag for the reads routed to it.
 - No change feed for other consumers.
+
+## 9. Phase 7.1: package structure of the read side (current)
+
+Phase 7.1 changed the structure only: the SQL semantics, the indexes, the transactions and the REST behaviour are unchanged.
+
+### 9.1 Who owns which contract
+
+| Contract | Owner (consumer) | Implementation |
+|---|---|---|
+| `command.VehicleStore` | `internal/application/command` | `eventstore/commandstore` over `AggregateStore` |
+| `query.ReadModel` | `internal/application/query` | `viewstore.ReadModel` |
+| `projection.Store` (+ `ProjectedVehicle`, `ActionHistoryEntry`) | `internal/application/projection` (used by the projectors and `Projection.Apply`) | `viewstore.Postgres` |
+
+The application packages import no infrastructure, GORM, driver or HTTP package (`internal/application/layer_dependencies_test.go`). The domain has no read-model port: the dashboard storage is not a domain concern.
+
+### 9.2 `internal/infrastructure/viewstore`
+
+```
+viewstore/
+  postgres.go        Postgres: projection.Store, transaction-bound (joined/exclusive modes)
+  rebuild_run.go     RunExclusive: exclusive lock, truncate, run record, one transaction
+  read_model.go      ReadModel: query.ReadModel
+  migrate.go         Migrate facade
+  models/            GORM row types of read_model (InventoryVehicle, VehicleActionHistory,
+                     ProjectionAggregate) and the DATE column type
+  repositories/      VehicleRepository, ActionHistoryRepository, InventorySummaryRepository,
+                     ProjectionRepository (bookkeeping + advisory locks), DealershipRepository;
+                     vehicle_filters.go (list scopes), mappers.go (models <-> application models)
+  migrations/        read_model versions (fresh installations only)
+```
+
+- **Transactions:** a repository runs every statement on the `*gorm.DB` it was built with and never begins or commits. `Postgres` builds its repositories on its own handle, so inside a command's save (`viewstore.InTransaction(tx)`) or a rebuild (`RunExclusive`) every write uses that one transaction. Writes on a store that is not bound to a transaction are refused (`ErrNotInTransaction`).
+- **Models and mapping:** three representations, each with a boundary: domain values (`domain.Date`, statuses); application models (`query.Vehicle`, `projection.ProjectedVehicle`); persistence rows (`models.*`, with SQL NULL types). `repositories/mappers.go` converts between them explicitly: zero dates/times/strings ↔ NULL, timestamps returned in UTC, `DATE` as a calendar date (`models.Date`, bound as text).
+- **List query composition:** `listVehicles` chains named scopes: `inDealership`, `withStatus`, `withMake`, `withModel`, `withAgeBounds` (an OR of an in-stock range on `stocked_on` and a sold `sold_on - stocked_on` branch, grouped under the dealership scope), `agingOnly`, `afterKeyset`, `orderByAge`; then `Limit`. Every value is a bound parameter and the ordering is one of two fixed strings. `agingCutoff` is shared with the summary query. Statements whose exact PostgreSQL form matters stay raw SQL: the advisory locks, `TRUNCATE`, the applied-version upsert and the run record (both keep the database's `now()`), and the summary's `FILTER` aggregates. The SQL is the same as before (GORM adds only grouping parentheses); the EXPLAIN test checks the planned indexes against the exact rendered statement.
+
+### 9.3 Adding a read model
+
+Add a projector (implementing `projectors.Projector` over `projection.Store`, or a new port if it needs other tables), its persistence model and repository, and a `read_model` migration; then run `rebuild-projections` to fill it from the event history.
+

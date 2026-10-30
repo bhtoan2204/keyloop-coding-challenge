@@ -171,9 +171,21 @@ The chain is **MySQL write side → commands → read model → business E2E**. 
 - One transaction per command save: projection lock, CAS, append with `RETURNING id`, projection, optional snapshot (`eventstore.WithProjection`, `projection.CommandProjection`).
 - `rebuild-projections` in one transaction under the exclusive projection lock, as a new rebuild role.
 - Roles: writer `inventory_app`, reader `inventory_reader`, rebuild `inventory_rebuild` (`deploy/postgres/*.sql`); `inventory_projector` and all MySQL accounts removed.
-- `migrate`: `event_store` v1–v2 and `read_model` v1, including the in-place upgrade of the Phase 4–6 `public` tables.
+- `migrate`: `event_store` v1–v2 and `read_model` v1, including the in-place upgrade of the Phase 4–6 `public` tables (removed in Phase 7.1).
 - Removed: MySQL, Debezium, Kafka, Kafka Connect, `projector`, `sync-projections`, `/status`, `inventory_projection_*` metrics, `internal/application/messaging`, `internal/infrastructure/kafka`, `internal/pipeline`, `make test-pipeline` and the MySQL/CDC make targets. Old volumes (`mysql-data`, `kafka-data`) are no longer declared but not deleted.
-- Explicit one-off import of the MySQL history: `deploy/import/mysql-history.sh` ([mysql-import.md](mysql-import.md)).
+- Explicit one-off import of the MySQL history: `deploy/import/mysql-history.sh` (removed in Phase 7.1).
 - REST contract unchanged except its consistency statements; `internal/e2e` asserts immediate read-after-write.
 
 **Never cut (updated):** B1–B7; PostgreSQL OCC/concurrency tests; atomic rollback of events and read model together; projection version check; rebuild from the event store; aging boundary tests; README, SDD, AI narrative.
+
+### Phase 7.1: cleanup and repository structure
+
+**Request (developer):** remove the one-off MySQL import and the legacy read-model upgrade (fresh installations only), and restructure the read side around consumer-owned ports and cohesive repositories.
+
+**Delivered (uncommitted at the time of writing):**
+
+- Removed `deploy/import/mysql-history.sh`, `docs/mysql-import.md`, `viewstore/legacy_upgrade.go` and its tests; `migrate` now refuses an earlier `public` layout without touching it.
+- `internal/application/projection`: the projection write port `Store` with `ProjectedVehicle` and `ActionHistoryEntry` (formerly `viewstore.ViewStore`, `VehicleRow`, `HistoryRow`).
+- `viewstore` split into `models`, `repositories` (with list scopes and mappers) and `migrations`; the root composes them (`Postgres`, `ReadModel`, `RunExclusive`, `Migrate`). See 05 §9.
+- No change to SQL semantics, indexes, transactions, event schemas or the REST contract.
+

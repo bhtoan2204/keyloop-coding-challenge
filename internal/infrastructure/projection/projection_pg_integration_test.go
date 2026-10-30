@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	ports "keyloop-coding-challenge/internal/application/projection"
 	"keyloop-coding-challenge/internal/domain"
 	"keyloop-coding-challenge/internal/domain/events"
 	"keyloop-coding-challenge/internal/infrastructure/eventstore/repos"
@@ -457,7 +458,7 @@ func TestRunAndAppliersExcludeEachOther(t *testing.T) {
 	inTx, done := make(chan struct{}), make(chan struct{})
 	applierDone := make(chan error, 1)
 	go func() {
-		applierDone <- store.WithTransaction(ctx, func(tx viewstore.ViewStore) error {
+		applierDone <- store.WithTransaction(ctx, func(tx ports.Store) error {
 			if _, err := tx.LockAggregate(ctx, "v2"); err != nil {
 				return err
 			}

@@ -27,14 +27,13 @@ recommendation was **rejected by the developer** and is reversed below (D1, D2).
 | 02 | [Architecture review](02-architecture-review.md) | Codebase inventory (existing/partial/missing), reuse plan, risks, ADRs; §9 the Phase 7 decision |
 | 03 | [Domain model](03-domain-model.md) | `VehicleInventoryAggregate` on the existing `AggregateRoot`, invariants, events |
 | 04 | [Event store](04-event-store.md) | §9 current PostgreSQL `event_store` schema, write path, errors, migrations, roles; §1–8 the earlier MySQL store (superseded) |
-| 05 | [Read model & projection](05-read-model-and-projection.md) | §8 current transactional projection, rebuild, consistency, legacy upgrade; earlier CDC design (superseded) |
+| 05 | [Read model & projection](05-read-model-and-projection.md) | §8 current transactional projection, rebuild, consistency, §9 Phase 7.1 package structure; earlier CDC design (superseded) |
 | 06 | [API contracts](06-api-contracts.md) | REST endpoints, payloads, errors, pagination |
 | 07 | [Implementation plan](07-implementation-plan.md) | Minimal-change roadmap to 4 Nov, critical path, cut list, Phase 7 |
 | 08 | [Observability strategy](08-observability.md) | Logs, metrics, traces, health |
 | — | [System Design Document](system-design.md) | The submission SDD: architecture, flows, consistency, concurrency, failures, security, trade-offs, GenAI |
 | — | [curl examples](curl-examples.md) | Every endpoint and error, copy-paste ready |
 | — | [Demo / video outline](demo.md) | 5–10 minute walkthrough script |
-| — | [MySQL history import](mysql-import.md) | One-off import of the earlier MySQL event store into `event_store` |
 | — | [AI collaboration log](ai-log.md) | Factual record of AI contributions, corrections and verification |
 
 ## Decisions
