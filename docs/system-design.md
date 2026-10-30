@@ -58,7 +58,7 @@ flowchart LR
 | Component | Role | Technology and why |
 |---|---|---|
 | API (`cmd api`) | REST commands and queries, problem+json errors, probes, metrics, OpenAPI | Go stdlib `net/http` routing. No framework is needed for 9 endpoints. Two connection pools: commands as the writer role, queries as the read-only role. |
-| Command service | Loads the aggregate, applies the business rule at the dealership business date, saves with optimistic concurrency, retries on conflict | The `package/eventsourcing` framework already in the repository is extended rather than replaced. |
+| Command service | Loads the aggregate, applies the business rule at the dealership business date, saves with optimistic concurrency, retries on conflict | The `pkg/eventsourcing` framework already in the repository is extended rather than replaced. |
 | Event store (`event_store` schema) | `es_aggregate` (version CAS) and `es_event` (append-only, `UNIQUE(aggregate_id, version)`), `dealership` reference data | PostgreSQL through GORM with raw SQL (the existing store). |
 | Command projection | Applies the command's events to the read model inside the save transaction | The same `Projection.Apply` and `VehicleProjector` a rebuild uses. |
 | Read model (`read_model` schema) | Denormalised current state, action history, applied version per vehicle | Keyset pagination, index-friendly queries, read-only role for queries. |

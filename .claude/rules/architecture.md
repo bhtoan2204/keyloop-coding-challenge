@@ -11,7 +11,7 @@ paths:
   (`AggregateRoot`, `AggregateStore`, `repos.EventStore`, serializer, `Projection`, `Projector`,
   `ViewStore`). Extend it. Never create a parallel framework, store or aggregate base.
 - **Layers are fixed, files are not:** keep the layers `internal/{domain,application,infrastructure,presentation}`,
-  `package/eventsourcing` and `cmd`, and their dependency direction. The top-level `api` package only embeds
+  `pkg/eventsourcing` and `cmd`, and their dependency direction. The top-level `api` package only embeds
   the OpenAPI document (`go:embed` cannot reach parent directories); only `presentation/apidocs` imports it. Moving code between files of
   the same package is allowed and expected when it improves cohesion (see
   `.claude/rules/source-organization.md`). A new package needs a real boundary, must keep the
@@ -21,13 +21,13 @@ paths:
   import each other sideways (see "Package organization" in source-organization.md).
 - **Dependency direction:** presentation → application → domain. Infrastructure implements
   interfaces that application declares. `internal/domain/**` imports only the standard library,
-  `internal/domain`, `internal/domain/events` and `package/eventsourcing`.
+  `internal/domain`, `internal/domain/events` and `pkg/eventsourcing`.
 - **Domain purity:** no I/O, SQL, HTTP, logging or `time.Now()` in `internal/domain/**`. The
   business date and generated IDs come in through command parameters.
 - **Minimal change:** prefer a localized edit to a rewrite. A refactor needs a stated reason
   (failing test, reproduced bug, compatibility need, or a behaviour-preserving maintainability
   improvement under the source-organization rules) and keeps public APIs where possible.
-  `package/eventsourcing` changes require a failing test first.
+  `pkg/eventsourcing` changes require a failing test first.
 - **No speculative abstraction:** one implementation = no interface, unless a test fake needs it.
   No generic repositories, registries or plugin points.
 - **Explicit transactions:** write-side multi-step persistence goes through `WithTransaction`.

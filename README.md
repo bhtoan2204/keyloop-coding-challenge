@@ -263,7 +263,7 @@ This project was built with Claude Code (Claude Opus 5.5) as an implementation p
   - two read-only reviewer agents (Go, and Event Sourcing/CQRS);
   - a safety hook (`.claude/hooks/guard.py`) that denies edits to `.env` files and destructive git commands (`reset --hard`, `clean -f`, force push, …) and asks the developer before any commit or push. The AI committed nothing; the developer committed every phase.
 - **One phase at a time.** The AI inspected the real code, proposed a minimal-change plan and waited for approval. Then it implemented in small steps, ran the full test suite, ran an independent review, logged the result and stopped. The developer reviewed and committed each phase.
-- **Preserve, don't rewrite.** The AI's first design (in the planning docs) recommended replacing the existing event-sourcing framework. That claim was made **without running the existing tests**, and the developer **rejected** it. From then on the AI was required to extend `package/eventsourcing`, the GORM event store and the projection abstractions. This is why the design keeps components that a greenfield design might not choose.
+- **Preserve, don't rewrite.** The AI's first design (in the planning docs) recommended replacing the existing event-sourcing framework. That claim was made **without running the existing tests**, and the developer **rejected** it. From then on the AI was required to extend `pkg/eventsourcing`, the GORM event store and the projection abstractions. This is why the design keeps components that a greenfield design might not choose.
 
 ### Verification: how output was checked and refined
 
@@ -313,7 +313,7 @@ The developer's interventions are recorded too:
 
 After the CDC pipeline was working and tested, **the developer decided** to drop MySQL, Debezium, Kafka and the projector process and keep Event Sourcing and CQRS on **one PostgreSQL database**. At this scale the pipeline's operational cost outweighed its benefit, and a manager who records an action should see it immediately. The AI did not propose this change. It implemented the developer's brief:
 
-- **Kept as is:** the domain, the event names and payloads, `package/eventsourcing`, the serializer, GORM, the REST contract and the business rules.
+- **Kept as is:** the domain, the event names and payloads, `pkg/eventsourcing`, the serializer, GORM, the REST contract and the business rules.
 - **Changed:**
   - the event store moved to the `event_store` schema and the read model to `read_model`;
   - each command now appends its events and updates the read model in one transaction, and the API answers only after that commit;

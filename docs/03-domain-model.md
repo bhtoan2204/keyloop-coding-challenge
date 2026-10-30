@@ -20,7 +20,7 @@ The framework's pattern is kept as-is:
 
 ```
 command method (to add)        validate input + current state, compute event payload
-   └─ a.ApplyChange(a, &events.X{...})           // package/eventsourcing
+   └─ a.ApplyChange(a, &events.X{...})           // pkg/eventsourcing
          └─ a.Transition(event)                  // existing dispatch switch
                └─ applyX(payload) (to fill in)   // structural checks + state mutation
          event appended to pending list only if Transition succeeded (tested)

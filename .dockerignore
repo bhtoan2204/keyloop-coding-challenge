@@ -6,6 +6,6 @@
 !api/
 !cmd/
 !internal/
-!package/
+!pkg/
 **/*_test.go
 **/testdata/

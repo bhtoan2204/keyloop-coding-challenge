@@ -53,14 +53,14 @@ The process layout is unchanged in intent (D7): one image, `cmd/main.go` grows s
 
 ## 3. Current architecture inventory (working tree at `dde142b`, source identical to `7d04502`)
 
-Baseline verification (run 2026-10-29, Go 1.26.5): `go vet ./...` is clean. `go test ./...` passes **17 tests in 3 packages** (6 in `package/eventsourcing`, 1 in `internal/domain/aggregates`, 10 in `internal/infrastructure/eventstore`), with and without `-race`. All event-store tests run on **SQLite** (in-memory). No test touches MySQL.
+Baseline verification (run 2026-10-29, Go 1.26.5): `go vet ./...` is clean. `go test ./...` passes **17 tests in 3 packages** (6 in `package/eventsourcing` (since moved to `pkg/eventsourcing`), 1 in `internal/domain/aggregates`, 10 in `internal/infrastructure/eventstore`), with and without `-race`. All event-store tests run on **SQLite** (in-memory). No test touches MySQL.
 
 | Component | Path | State | Evidence / notes |
 |---|---|---|---|
-| `AggregateRoot` (ID, type, version/baseVersion, pending events, `ApplyChange`, `LoadFromHistory` with contiguity check, `Update`) | `package/eventsourcing/aggregate_root.go` | **Existing, tested** | 5 tests: pending versions, rejected event not pending, update, replay gap/apply error/id mismatch, `SetID` |
-| `Aggregate` / `BaseAggregate` interfaces (`Transition`, `RegisterEvents`) | `package/eventsourcing/aggregate.go` | **Existing** | |
-| `Event` envelope (`ID int64`, `AggregateID`, `Version`, `EventType`, `Data`, `Metadata`, `CreatedAt` unix s) | `package/eventsourcing/event.go` | **Existing**. No schema version or aggregate type field. | |
-| Serializer registry (key `<AggregateStructName>_<EventStructName>`, factory per pointer type, JSON) | `package/eventsourcing/serializer.go` | **Existing, tested** | 1 test |
+| `AggregateRoot` (ID, type, version/baseVersion, pending events, `ApplyChange`, `LoadFromHistory` with contiguity check, `Update`) | `pkg/eventsourcing/aggregate_root.go` | **Existing, tested** | 5 tests: pending versions, rejected event not pending, update, replay gap/apply error/id mismatch, `SetID` |
+| `Aggregate` / `BaseAggregate` interfaces (`Transition`, `RegisterEvents`) | `pkg/eventsourcing/aggregate.go` | **Existing** | |
+| `Event` envelope (`ID int64`, `AggregateID`, `Version`, `EventType`, `Data`, `Metadata`, `CreatedAt` unix s) | `pkg/eventsourcing/event.go` | **Existing**. No schema version or aggregate type field. | |
+| Serializer registry (key `<AggregateStructName>_<EventStructName>`, factory per pointer type, JSON) | `pkg/eventsourcing/serializer.go` | **Existing, tested** | 1 test |
 | `AggregateStore` (`Get` with snapshot + replay, `Save` in one tx: create-if-missing → CAS → append → optional snapshot) | `internal/infrastructure/eventstore/aggregate_store.go` | **Existing, tested on SQLite** | 10 tests: multi-event save, rollback, OCC, DB error ≠ conflict, replay errors, snapshots, interval change, metadata, guards, duplicate version |
 | Repos: `EventStore` interface, `aggregateRepo` (CAS, snapshot), `eventRepo` (append/get), `WithTransaction` | `internal/infrastructure/eventstore/repos/` | **Existing**. MySQL-specific SQL branches are present (`INSERT IGNORE`) but **never executed** in tests. | |
 | Schema + `Migrate` (`CREATE TABLE IF NOT EXISTS`, MySQL `schema.sql` / SQLite inline) | `repos/schema.go`, `repos/schema.sql` | **Existing, unversioned** | |
@@ -87,7 +87,7 @@ Baseline verification (run 2026-10-29, Go 1.26.5): `go vet ./...` is clean. `go 
 | C7 | "Parallel `errgroup` projectors break atomicity → single projector" | With one projector per stage the pipeline already takes the non-`errgroup` path (`len(stage) == 1`). | **Keep the pipeline.** Run it inside one ViewStore transaction (05 §4). Multi-projector stages are not used for the read model. |
 | C8 | Event table `event_store` with `event_id CHAR(36)`, `aggregate_version`, `payload JSON`, `occurred_at DATETIME(6)` | The real table is `es_event(id BIGINT AI, aggregate_id, event_type, version, data TEXT, metadata TEXT, created_at BIGINT)` | All docs now describe the **real** schema plus **additive** changes only (04). |
 | C9 | Domain written as pure decide/evolve functions on a new `Vehicle` type | The framework's pattern is: command method validates → `ApplyChange` → `Transition` mutates and records a pending event | **Use the framework's pattern** on `VehicleInventoryAggregate` (03). |
-| C10 | Package layout `internal/inventory/{domain,app,…}`, `package/` folded into `internal/` | Existing layout `internal/{domain,application,infrastructure,presentation}` + `package/eventsourcing` | **Keep the existing layout** and fill in the empty packages (07 §1). |
+| C10 | Package layout `internal/inventory/{domain,app,…}`, `package/` folded into `internal/` | Existing layout `internal/{domain,application,infrastructure,presentation}` + `pkg/eventsourcing` | **Keep the existing layout** and fill in the empty packages (07 §1). |
 | C11 | Testcontainers for all integration tests | The dev machine runs rootless Podman with no active Docker-compatible socket (checked 2026-10-29). Testcontainers would need extra setup. | MySQL/Postgres integration tests connect via a DSN env var to the Compose services, behind the `integration` build tag. Testcontainers is optional. |
 
 ## 5. Reuse plan

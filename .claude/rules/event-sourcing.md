@@ -1,6 +1,6 @@
 ---
 paths:
-  - "package/eventsourcing/**"
+  - "pkg/eventsourcing/**"
   - "internal/domain/**"
   - "internal/infrastructure/**"
   - "internal/application/**"

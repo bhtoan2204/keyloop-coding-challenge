@@ -9,7 +9,7 @@ RUN go mod download
 COPY api ./api
 COPY cmd ./cmd
 COPY internal ./internal
-COPY package ./package
+COPY pkg ./pkg
 # No cgo: the service needs no C library (SQLite is used by tests only), so the binary
 # runs on a distroless static base. Time zones are embedded (time/tzdata in cmd).
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/inventory ./cmd

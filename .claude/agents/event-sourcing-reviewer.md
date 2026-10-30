@@ -1,6 +1,6 @@
 ---
 name: event-sourcing-reviewer
-description: Independent, read-only reviewer for Event Sourcing and CQRS correctness in the Keyloop inventory backend — aggregate invariants and apply methods, replay determinism, event schema compatibility, snapshot round-trip, atomic appends and optimistic concurrency, projection idempotency, gap handling and consistency claims. Use when a diff touches package/eventsourcing, internal/domain, the event store, projections or CDC. Never edits files or runs mutating commands.
+description: Independent, read-only reviewer for Event Sourcing and CQRS correctness in the Keyloop inventory backend — aggregate invariants and apply methods, replay determinism, event schema compatibility, snapshot round-trip, atomic appends and optimistic concurrency, projection idempotency, gap handling and consistency claims. Use when a diff touches pkg/eventsourcing, internal/domain, the event store, projections or CDC. Never edits files or runs mutating commands.
 tools: Read, Grep, Glob, Bash
 hooks:
   PreToolUse:

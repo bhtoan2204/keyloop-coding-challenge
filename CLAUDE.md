@@ -20,7 +20,7 @@ Debezium → Kafka → projector → PostgreSQL; that history stays in `docs/02`
 
 ## Current state (check with `git log`, `go test ./...`)
 Implemented and tested (runtime: PostgreSQL 17 + the `api` process + one-shot init jobs `migrate`, `postgres-grants`):
-- `package/eventsourcing`: `AggregateRoot` (versions, pending events, `ApplyChange`, `LoadFromHistory`), `Event`, serializer registry.
+- `pkg/eventsourcing`: `AggregateRoot` (versions, pending events, `ApplyChange`, `LoadFromHistory`), `Event`, serializer registry.
 - `internal/domain`: `VehicleInventoryAggregate` (state, commands Stock/ProposeAction/ReviseAction/
   CancelAction/Sell, appliers, snapshot JSON), typed events, `Date`, `AgeInDays`, `IsAging`, domain errors.
 - `internal/infrastructure/eventstore`: `AggregateStore`. One transaction per save: projection lock (shared
@@ -87,7 +87,7 @@ Follow `.claude/rules/source-organization.md`:
 
 ## Package boundaries
 - `internal/domain/**`: no I/O, no SQL, no HTTP, no `time.Now()`. The business date is passed in by the caller.
-- `internal/domain/events` may import `internal/domain` only. `aggregates` imports `domain`, `events`, `package/eventsourcing`.
+- `internal/domain/events` may import `internal/domain` only. `aggregates` imports `domain`, `events`, `pkg/eventsourcing`.
 - `internal/application` orchestrates (load → command → save, retries, business date). Infrastructure implements its interfaces.
 - `internal/presentation` → `internal/application` only. No domain logic in handlers or SQL. Layout: root
   `router.go` composes `commands` (write endpoints), `queries` (read endpoints) and `probes` (healthz/readyz/
@@ -149,7 +149,7 @@ Integration tests fail (never skip) without `PG_TEST_DSN`; each creates and drop
   and a test that shows them. Behaviour-preserving moves between files of a package are fine (and expected
   when a file mixes responsibilities); a file may be removed once all its declarations have moved.
 - Never weaken an assertion just to make a test pass. Adapt a test only when it contradicts a valid invariant, and say so.
-- Do not modify `package/eventsourcing` unless a failing test reproduces a bug. Then make the smallest fix and keep the public API.
+- Do not modify `pkg/eventsourcing` unless a failing test reproduces a bug. Then make the smallest fix and keep the public API.
 - No `git reset --hard`, `git clean`, `git checkout -- .`, `git stash` or force-push. Do not edit `.git/` or real `.env*` files.
 - No new dependencies, schema changes or Docker changes outside the phase that plans them.
 - Never claim a test passed unless it was run in this session. Label unverified statements "unverified".

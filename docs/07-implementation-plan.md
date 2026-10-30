@@ -10,7 +10,7 @@ Principles: extend the existing packages instead of adding parallel ones, and va
 
 ```
 cmd/main.go                                   existing placeholder → subcommands api|projector|migrate|rebuild
-package/eventsourcing/                        existing framework (AggregateRoot, Event, serializer) — reuse
+pkg/eventsourcing/                            existing framework (AggregateRoot, Event, serializer) — reuse
   event.go                                    + AggregateType, SchemaVersion fields
 internal/
   domain/

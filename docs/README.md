@@ -11,7 +11,7 @@ Target completion of all deliverables: **Wednesday 4 November 2026.**
 ## Engineering direction
 
 **Preserve and incrementally improve the existing source code** (baseline commit `7d04502`).
-The existing event-sourcing framework (`package/eventsourcing`), GORM event store
+The existing event-sourcing framework (`pkg/eventsourcing`), GORM event store
 (`internal/infrastructure/eventstore`), snapshot support, aggregate-version CAS, serializer registry
 and projection abstractions are kept and extended. Refactoring is allowed where a test or a concrete
 technical limitation demands it, and each such refactor is recorded in the doc that motivates it.
